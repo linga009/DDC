@@ -23,10 +23,11 @@
 
 **Files:**
 - Create: `CMakeLists.txt` (repo root)
-- Create: `core/CMakeLists.txt`
 - Create: `.gitignore`
 - Create: `vendor/llama.cpp` (git submodule, pinned to tag `b10430`)
 - Test: none (this task's "test" is: the build configures and compiles llama.cpp successfully — verified in Step 6)
+
+Note: `core/CMakeLists.txt` is created in Task 2, not here — Task 1's root `CMakeLists.txt` only references `vendor/llama.cpp`.
 
 **Interfaces:**
 - Consumes: nothing (first task).
