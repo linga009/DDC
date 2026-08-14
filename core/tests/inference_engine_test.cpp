@@ -1,0 +1,26 @@
+#include "swarm/inference_engine.h"
+
+#include <gtest/gtest.h>
+
+#include <stdexcept>
+#include <string>
+
+#ifndef SWARM_TEST_MODEL_DIR
+#define SWARM_TEST_MODEL_DIR "models"
+#endif
+
+namespace {
+
+std::string test_model_path() {
+    return std::string(SWARM_TEST_MODEL_DIR) + "/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf";
+}
+
+}  // namespace
+
+TEST(InferenceEngine, ThrowsOnInvalidModelPath) {
+    EXPECT_THROW(swarm::InferenceEngine engine("does/not/exist.gguf"), std::runtime_error);
+}
+
+TEST(InferenceEngine, LoadsValidModel) {
+    EXPECT_NO_THROW(swarm::InferenceEngine engine(test_model_path()));
+}
