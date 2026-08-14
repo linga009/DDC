@@ -21,7 +21,7 @@ for the full design of where this is headed.
 ## Clone
 
 ```bash
-git clone --recurse-submodules <repo-url>
+git clone --recurse-submodules https://github.com/linga009/DDC.git
 ```
 
 If you already cloned without `--recurse-submodules`:
