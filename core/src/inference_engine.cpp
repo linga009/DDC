@@ -18,7 +18,7 @@ InferenceEngine::InferenceEngine(const std::string& model_path) {
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 2048;
-    ctx_params.n_batch = 512;
+    ctx_params.n_batch = 2048;
 
     ctx_ = llama_init_from_model(model_, ctx_params);
     if (ctx_ == nullptr) {
@@ -37,6 +37,8 @@ InferenceEngine::~InferenceEngine() {
 }
 
 std::string InferenceEngine::complete(const std::string& prompt, int n_predict) {
+    llama_memory_clear(llama_get_memory(ctx_), true);
+
     const llama_vocab* vocab = llama_model_get_vocab(model_);
 
     const int n_prompt_tokens = -llama_tokenize(
@@ -48,6 +50,11 @@ std::string InferenceEngine::complete(const std::string& prompt, int n_predict) 
             prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()),
             true, true) < 0) {
         throw std::runtime_error("failed to tokenize prompt");
+    }
+
+    if (prompt_tokens.size() > static_cast<size_t>(llama_n_batch(ctx_))) {
+        throw std::runtime_error("prompt too long: " + std::to_string(prompt_tokens.size()) +
+                                 " tokens exceeds batch size " + std::to_string(llama_n_batch(ctx_)));
     }
 
     llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();

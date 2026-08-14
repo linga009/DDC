@@ -32,3 +32,23 @@ TEST(InferenceEngine, GeneratesNonEmptyCompletion) {
 
     EXPECT_FALSE(result.empty());
 }
+
+TEST(InferenceEngine, ThrowsOnPromptExceedingBatchSize) {
+    swarm::InferenceEngine engine(test_model_path());
+
+    std::string long_prompt;
+    for (int i = 0; i < 3000; ++i) {
+        long_prompt += "hello ";
+    }
+
+    EXPECT_THROW(engine.complete(long_prompt, 8), std::runtime_error);
+}
+
+TEST(InferenceEngine, RepeatedCompleteCallsAreDeterministic) {
+    swarm::InferenceEngine engine(test_model_path());
+
+    std::string first = engine.complete("The capital of France is", 8);
+    std::string second = engine.complete("The capital of France is", 8);
+
+    EXPECT_EQ(first, second);
+}
