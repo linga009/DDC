@@ -52,3 +52,19 @@ TEST(InferenceEngine, RepeatedCompleteCallsAreDeterministic) {
 
     EXPECT_EQ(first, second);
 }
+
+TEST(InferenceEngine, ManyCallsDoNotExhaustContext) {
+    swarm::InferenceEngine engine(test_model_path());
+    // n_ctx is 2048. Each call to complete() below tokenizes to ~6 prompt
+    // tokens and generates up to 32 more, so without clearing the KV cache
+    // between calls, cumulative usage grows by ~38 tokens per call and
+    // would exhaust the 2048-token context (and complete() would start
+    // throwing "llama_decode failed") well before this loop finishes.
+    // Empirically confirmed: with the llama_memory_clear() fix reverted,
+    // this loop throws at iteration 55 of 70. The fix keeps each call's
+    // usage independent of prior calls, so all 70 iterations should
+    // complete without throwing.
+    for (int i = 0; i < 70; ++i) {
+        EXPECT_NO_THROW(engine.complete("The capital of France is", 32));
+    }
+}
