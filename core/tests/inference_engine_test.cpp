@@ -24,3 +24,11 @@ TEST(InferenceEngine, ThrowsOnInvalidModelPath) {
 TEST(InferenceEngine, LoadsValidModel) {
     EXPECT_NO_THROW(swarm::InferenceEngine engine(test_model_path()));
 }
+
+TEST(InferenceEngine, GeneratesNonEmptyCompletion) {
+    swarm::InferenceEngine engine(test_model_path());
+
+    std::string result = engine.complete("The capital of France is", 8);
+
+    EXPECT_FALSE(result.empty());
+}

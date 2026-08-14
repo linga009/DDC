@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <stdexcept>
+#include <vector>
 
 namespace swarm {
 
@@ -35,8 +36,56 @@ InferenceEngine::~InferenceEngine() {
     }
 }
 
-std::string InferenceEngine::complete(const std::string& /*prompt*/, int /*n_predict*/) {
-    throw std::runtime_error("not implemented yet");
+std::string InferenceEngine::complete(const std::string& prompt, int n_predict) {
+    const llama_vocab* vocab = llama_model_get_vocab(model_);
+
+    const int n_prompt_tokens = -llama_tokenize(
+        vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()), nullptr, 0, true, true);
+
+    std::vector<llama_token> prompt_tokens(n_prompt_tokens);
+    if (llama_tokenize(
+            vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()),
+            prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()),
+            true, true) < 0) {
+        throw std::runtime_error("failed to tokenize prompt");
+    }
+
+    llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
+    llama_sampler* sampler = llama_sampler_chain_init(sampler_params);
+    llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+
+    llama_batch batch = llama_batch_get_one(
+        prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()));
+
+    std::string result;
+    llama_token new_token;
+    int n_generated = 0;
+
+    while (n_generated < n_predict) {
+        if (llama_decode(ctx_, batch) != 0) {
+            llama_sampler_free(sampler);
+            throw std::runtime_error("llama_decode failed");
+        }
+
+        new_token = llama_sampler_sample(sampler, ctx_, -1);
+        if (llama_vocab_is_eog(vocab, new_token)) {
+            break;
+        }
+
+        char piece[128];
+        int n = llama_token_to_piece(vocab, new_token, piece, sizeof(piece), 0, true);
+        if (n < 0) {
+            llama_sampler_free(sampler);
+            throw std::runtime_error("failed to convert token to text");
+        }
+        result.append(piece, n);
+
+        batch = llama_batch_get_one(&new_token, 1);
+        n_generated += 1;
+    }
+
+    llama_sampler_free(sampler);
+    return result;
 }
 
 }  // namespace swarm
