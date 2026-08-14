@@ -8,5 +8,4 @@ target_compile_features(inference_engine PUBLIC cxx_std_17)
 add_executable(swarm-cli src/main.cpp)
 target_link_libraries(swarm-cli PRIVATE inference_engine)
 
-enable_testing()
 add_subdirectory(tests)
