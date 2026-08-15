@@ -36,8 +36,11 @@ async function fetchPeerCapacity(endpoint: string): Promise<number> {
       return 0;
     }
     const body = await res.json();
-    return typeof body.activeNodes === "number" ? body.activeNodes : 0;
-  } catch {
+    return typeof body.activeNodes === "number" && Number.isFinite(body.activeNodes) && body.activeNodes >= 0
+      ? body.activeNodes
+      : 0;
+  } catch (err) {
+    console.warn(`failed to fetch capacity from peer ${endpoint}:`, err);
     return 0;
   }
 }

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "../src/server.ts";
 import { NodeRegistry } from "../src/registry.ts";
 import { ModelCatalog, type CatalogEntry } from "../src/catalog.ts";
@@ -343,5 +344,51 @@ test("GET /catalog degrades gracefully when a registered peer is unreachable", a
     assert.equal(catalog.find((e: any) => e.id === "small").available, false);
   } finally {
     server.close();
+  }
+});
+
+test("GET /catalog treats a peer reporting negative activeNodes as contributing 0, not corrupting the aggregate", async () => {
+  const catalogEntries = [
+    { id: "small", displayName: "Small", minActiveNodes: 1 },
+  ];
+
+  // A misbehaving peer that reports a negative capacity.
+  const fakePeer = createHttpServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ activeNodes: -10 }));
+  });
+  await new Promise<void>(resolve => fakePeer.listen(0, "127.0.0.1", resolve));
+  const fakePeerAddress = fakePeer.address();
+  if (fakePeerAddress === null || typeof fakePeerAddress === "string") {
+    throw new Error("expected fake peer to bind a real port");
+  }
+  const fakePeerUrl = `http://127.0.0.1:${fakePeerAddress.port}`;
+
+  const { server, baseUrl } = await startTestServer(catalogEntries);
+  try {
+    // Give the local instance enough REAL local capacity to serve the
+    // model entirely on its own.
+    await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+    });
+
+    await fetch(`${baseUrl}/peers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: fakePeerUrl }),
+    });
+
+    const res = await fetch(`${baseUrl}/catalog`);
+    assert.equal(res.status, 200);
+    const catalog = await res.json();
+    // Local capacity alone (1) meets minActiveNodes (1). The malicious
+    // peer's -10 must contribute 0, not subtract from local truth and flip
+    // an available model to unavailable.
+    assert.equal(catalog.find((e: any) => e.id === "small").available, true);
+  } finally {
+    server.close();
+    fakePeer.close();
   }
 });
