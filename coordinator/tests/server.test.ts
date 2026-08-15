@@ -81,6 +81,34 @@ test("GET /nodes lists active nodes", async () => {
   }
 });
 
+test("POST /nodes/register with malformed JSON returns 400 and the server survives to handle further requests", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const badRes = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "not valid json{",
+    });
+    assert.equal(badRes.status, 400);
+    const badBody = await badRes.json();
+    assert.equal(typeof badBody.error, "string");
+
+    // Prove the process/server is still alive and functioning: a subsequent,
+    // well-formed request must still succeed rather than hanging or erroring
+    // due to a crashed/unhandled-rejection process.
+    const goodRes = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+    });
+    assert.equal(goodRes.status, 200);
+    const { nodeId } = await goodRes.json();
+    assert.equal(typeof nodeId, "string");
+  } finally {
+    server.close();
+  }
+});
+
 test("GET /catalog with zero active nodes only shows the zero-threshold model available", async () => {
   const { server, baseUrl } = await startTestServer();
   try {

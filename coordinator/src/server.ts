@@ -2,13 +2,22 @@ import { createServer as createHttpServer, IncomingMessage, ServerResponse } fro
 import { NodeRegistry, type DeviceTier } from "./registry.ts";
 import { ModelCatalog } from "./catalog.ts";
 
+class JsonParseError extends Error {}
+
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
     chunks.push(chunk as Buffer);
   }
   const raw = Buffer.concat(chunks).toString("utf-8");
-  return raw.length > 0 ? JSON.parse(raw) : {};
+  if (raw.length === 0) {
+    return {};
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new JsonParseError("request body is not valid JSON");
+  }
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -19,44 +28,52 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 
 export function createServer(registry: NodeRegistry, catalog: ModelCatalog) {
   return createHttpServer(async (req, res) => {
-    const method = req.method ?? "GET";
-    const url = new URL(req.url ?? "/", "http://localhost");
-    const parts = url.pathname.split("/").filter(Boolean);
+    try {
+      const method = req.method ?? "GET";
+      const url = new URL(req.url ?? "/", "http://localhost");
+      const parts = url.pathname.split("/").filter(Boolean);
 
-    if (method === "POST" && parts[0] === "nodes" && parts.length === 2 && parts[1] === "register") {
-      const body = (await readJsonBody(req)) as { endpoint?: string; deviceTier?: DeviceTier };
-      if (!body.endpoint || !body.deviceTier) {
-        sendJson(res, 400, { error: "endpoint and deviceTier are required" });
+      if (method === "POST" && parts[0] === "nodes" && parts.length === 2 && parts[1] === "register") {
+        const body = (await readJsonBody(req)) as { endpoint?: string; deviceTier?: DeviceTier };
+        if (!body.endpoint || !body.deviceTier) {
+          sendJson(res, 400, { error: "endpoint and deviceTier are required" });
+          return;
+        }
+        const nodeId = registry.register(body.endpoint, body.deviceTier);
+        sendJson(res, 200, { nodeId });
         return;
       }
-      const nodeId = registry.register(body.endpoint, body.deviceTier);
-      sendJson(res, 200, { nodeId });
-      return;
-    }
 
-    if (method === "POST" && parts[0] === "nodes" && parts.length === 3 && parts[2] === "heartbeat") {
-      const ok = registry.heartbeat(parts[1]);
-      if (!ok) {
-        res.writeHead(404);
+      if (method === "POST" && parts[0] === "nodes" && parts.length === 3 && parts[2] === "heartbeat") {
+        const ok = registry.heartbeat(parts[1]);
+        if (!ok) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.writeHead(204);
         res.end();
         return;
       }
-      res.writeHead(204);
+
+      if (method === "GET" && parts[0] === "nodes" && parts.length === 1) {
+        sendJson(res, 200, registry.listActive());
+        return;
+      }
+
+      if (method === "GET" && parts[0] === "catalog" && parts.length === 1) {
+        sendJson(res, 200, catalog.availability(registry.listActive().length));
+        return;
+      }
+
+      res.writeHead(404);
       res.end();
-      return;
+    } catch (err) {
+      if (err instanceof JsonParseError) {
+        sendJson(res, 400, { error: err.message });
+        return;
+      }
+      sendJson(res, 500, { error: "internal server error" });
     }
-
-    if (method === "GET" && parts[0] === "nodes" && parts.length === 1) {
-      sendJson(res, 200, registry.listActive());
-      return;
-    }
-
-    if (method === "GET" && parts[0] === "catalog" && parts.length === 1) {
-      sendJson(res, 200, catalog.availability(registry.listActive().length));
-      return;
-    }
-
-    res.writeHead(404);
-    res.end();
   });
 }
