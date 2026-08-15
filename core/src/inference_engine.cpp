@@ -274,8 +274,15 @@ SpeculativeResult InferenceEngine::complete_speculative(
         llama_sampler_free(draft_sampler);
 
         // --- Target: clear, decode tokens_so_far + draft_tokens as ONE batch
-        //     with logits requested at every position -- this single call is
-        //     the round-trip reduction.
+        //     -- this single call is the round-trip reduction. Only the last
+        //     lookahead_n + 1 positions are ever sampled below (the last
+        //     position of tokens_so_far through the end of draft_tokens), so
+        //     logits are only requested there -- requesting them at every
+        //     earlier context position would compute and retain a full
+        //     n_vocab-wide row for positions that are never read, which is
+        //     wasted work and (since llama.cpp's output buffer only grows,
+        //     never shrinks) a wasted allocation that persists for the rest
+        //     of this context's lifetime.
         llama_memory_clear(llama_get_memory(ctx_), true);
         const int32_t n_verify = static_cast<int32_t>(tokens_so_far.size() + draft_tokens.size());
         llama_batch verify_batch = llama_batch_init(n_verify, 0, 1);
@@ -284,7 +291,10 @@ SpeculativeResult InferenceEngine::complete_speculative(
             verify_batch.pos[verify_batch.n_tokens]      = static_cast<llama_pos>(i);
             verify_batch.n_seq_id[verify_batch.n_tokens] = 1;
             verify_batch.seq_id[verify_batch.n_tokens][0] = 0;
-            verify_batch.logits[verify_batch.n_tokens]   = true;
+            // Only the LAST token of tokens_so_far is ever sampled (it's
+            // target_predictions[0]'s source, at base_idx below) -- earlier
+            // context positions are never read.
+            verify_batch.logits[verify_batch.n_tokens]   = (i + 1 >= tokens_so_far.size());
             verify_batch.n_tokens++;
         }
         for (size_t i = 0; i < draft_tokens.size(); ++i) {
