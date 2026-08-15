@@ -232,6 +232,20 @@ SpeculativeResult InferenceEngine::complete_speculative(
     while (result.accepted_tokens < n_predict) {
         const int lookahead_n = std::min(lookahead, n_predict - result.accepted_tokens);
 
+        // Guard BEFORE any decode this round: both the draft's redecode of
+        // tokens_so_far and the target's verification decode of
+        // tokens_so_far + draft_tokens must fit in one batch. Without this,
+        // a long-running generation eventually exceeds llama_n_batch(ctx_)
+        // and llama_decode hits an unconditional GGML_ASSERT inside
+        // llama.cpp -- a process abort, not a catchable exception. Mirrors
+        // the equivalent check in complete().
+        const size_t n_round = tokens_so_far.size() + static_cast<size_t>(lookahead_n);
+        if (n_round > static_cast<size_t>(llama_n_batch(ctx_))) {
+            llama_sampler_free(target_sampler);
+            throw std::runtime_error("speculative context too long: " + std::to_string(n_round) +
+                                     " tokens exceeds batch size " + std::to_string(llama_n_batch(ctx_)));
+        }
+
         // --- Draft: clear, redecode tokens_so_far, then step lookahead_n tokens.
         llama_memory_clear(llama_get_memory(draft.ctx_), true);
         {

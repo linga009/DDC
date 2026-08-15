@@ -271,6 +271,25 @@ TEST(InferenceEngine, SpeculativeDecodingBonusTokenMeansEvenLookaheadOneBatches)
     EXPECT_EQ(result.accepted_tokens, 8);
 }
 
+TEST(InferenceEngine, SpeculativeDecodingThrowsOnPromptExceedingBatchSize) {
+    swarm::InferenceEngine target(test_model_path());
+    swarm::InferenceEngine draft(test_model_path());
+
+    std::string long_prompt;
+    for (int i = 0; i < 3000; ++i) {
+        long_prompt += "hello ";
+    }
+
+    // Mirrors InferenceEngine.ThrowsOnPromptExceedingBatchSize above, but
+    // for complete_speculative(): tokens_so_far.size() + lookahead exceeds
+    // llama_n_batch(ctx_) (2048) on the very first round. Without a guard,
+    // the manually constructed verification batch's llama_decode() call
+    // hits an unconditional GGML_ASSERT inside llama.cpp -- a process
+    // abort, not a catchable exception -- so this test is the difference
+    // between a clean EXPECT_THROW and the whole test binary crashing.
+    EXPECT_THROW(target.complete_speculative(long_prompt, 8, draft, 4), std::runtime_error);
+}
+
 TEST_F(RpcServerFixture, ExplicitRemotePlacementOverridesSpecificLayer) {
     std::string captured_log;
     LlamaLogCaptureGuard log_guard(&captured_log);
