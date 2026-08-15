@@ -25,12 +25,17 @@ int main(int argc, char** argv) {
     }
 
     std::string endpoint = "127.0.0.1:" + std::to_string(port);
-    std::printf("swarm-rpc-server listening on %s\n", endpoint.c_str());
+    std::printf("swarm-rpc-server starting on %s\n", endpoint.c_str());
+    std::printf("warning: the RPC backend is insecure and intended for trusted LAN or "
+                "same-host use only -- never expose it to an untrusted network\n");
     std::fflush(stdout);
 
     ggml_backend_dev_t devices[] = { cpu_dev };
     ggml_backend_rpc_start_server(endpoint.c_str(), /*cache_dir=*/nullptr,
                                    /*n_threads=*/4, /*n_devices=*/1, devices);
-    // ggml_backend_rpc_start_server blocks forever serving requests.
-    return 0;
+    // ggml_backend_rpc_start_server normally blocks forever serving requests.
+    // If it returns at all, something went wrong during startup (e.g. the
+    // port was already in use) -- there is no successful-and-returned case.
+    std::fprintf(stderr, "error: RPC server stopped unexpectedly (port %d in use?)\n", port);
+    return 1;
 }
