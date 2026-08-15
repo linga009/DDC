@@ -63,17 +63,21 @@ test("register returns a peerId, and the peer is immediately active", () => {
   assert.equal(active[0].endpoint, "http://192.168.1.50:8080");
 });
 
-test("heartbeat on a known peer returns true and keeps it active past the timeout", () => {
+test("heartbeat before expiry refreshes lastSeen and keeps the peer active past the original window", () => {
   let now = 0;
   const registry = new PeerRegistry(() => now);
   const peerId = registry.register("http://192.168.1.50:8080");
 
-  now = 30001;
-  registry.heartbeat(peerId);
-  assert.equal(registry.listActive().length, 1);
+  // Heartbeat while still well within the 30s window (not yet expired).
+  now = 20000;
+  assert.equal(registry.heartbeat(peerId), true);
 
-  now = 60002;
-  assert.equal(registry.listActive().length, 0);
+  // 45s after registration -- past the ORIGINAL window, but only 25s after
+  // the heartbeat refreshed lastSeen, so still within a fresh 30s window.
+  // If the heartbeat hadn't refreshed lastSeen, this peer would already be
+  // expired (45000 - 0 > 30000).
+  now = 45000;
+  assert.equal(registry.listActive().length, 1);
 });
 
 test("heartbeat on an unknown peer returns false", () => {
