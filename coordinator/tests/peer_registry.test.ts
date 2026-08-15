@@ -73,6 +73,25 @@ test("registering the same endpoint twice returns the same peerId and does not d
   assert.equal(registry.listActive().length, 1);
 });
 
+test("registering the same endpoint after the previous registration expired mints a fresh peerId, not a revival of the stale one", () => {
+  let now = 0;
+  const registry = new PeerRegistry(() => now);
+  const first = registry.register("http://192.168.1.50:8080");
+
+  // Past the 30s timeout with no heartbeat -- the original entry is stale.
+  now = 30001;
+  const second = registry.register("http://192.168.1.50:8080");
+
+  // Must be a fresh registration (new peerId), never a silent revival of
+  // the expired entry under its old peerId -- that would reintroduce the
+  // same "depends on incidental pruning order" nondeterminism that
+  // heartbeat() is explicitly designed to avoid.
+  assert.notEqual(second, first);
+  const active = registry.listActive();
+  assert.equal(active.length, 1);
+  assert.equal(active[0].peerId, second);
+});
+
 test("registering the same endpoint again refreshes lastSeen, keeping the peer active past the original window", () => {
   let now = 0;
   const registry = new PeerRegistry(() => now);

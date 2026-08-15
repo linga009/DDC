@@ -22,18 +22,29 @@ export class PeerRegistry {
   }
 
   register(endpoint: string): string {
-    for (const peer of this.peers.values()) {
+    const now = this.clock();
+    for (const [peerId, peer] of this.peers) {
+      if (now - peer.lastSeen > this.timeoutMs) {
+        // Expired -- prune it here rather than letting it match below.
+        // Otherwise an endpoint whose previous registration has already
+        // timed out could get silently "revived" under its stale peerId,
+        // with the outcome depending on whether some unrelated call had
+        // already pruned it first -- exactly the nondeterministic contract
+        // heartbeat() (below) is careful to avoid.
+        this.peers.delete(peerId);
+        continue;
+      }
       if (peer.endpoint === endpoint) {
-        // Already registered -- treat this as a refresh (same effect as a
-        // heartbeat) rather than minting a duplicate entry for the same
-        // endpoint, which would otherwise double-count that peer's reported
-        // capacity in the federated aggregate.
-        peer.lastSeen = this.clock();
+        // Already registered and still active -- treat this as a refresh
+        // (same effect as a heartbeat) rather than minting a duplicate
+        // entry for the same endpoint, which would otherwise double-count
+        // that peer's reported capacity in the federated aggregate.
+        peer.lastSeen = now;
         return peer.peerId;
       }
     }
     const peerId = randomUUID();
-    this.peers.set(peerId, { peerId, endpoint, lastSeen: this.clock() });
+    this.peers.set(peerId, { peerId, endpoint, lastSeen: now });
     return peerId;
   }
 
