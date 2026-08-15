@@ -1,0 +1,35 @@
+export interface CatalogEntry {
+  id: string;
+  displayName: string;
+  minActiveNodes: number;
+}
+
+export interface AvailabilityEntry extends CatalogEntry {
+  available: boolean;
+}
+
+// Dev-scale thresholds for local testing only -- NOT the spec's real-world
+// tens/hundreds/thousands. Recalibrate against measured per-node throughput
+// before these numbers mean anything in production (see Plan 1's Known Risks
+// and this plan's Global Constraints for why).
+const DEFAULT_CATALOG: CatalogEntry[] = [
+  { id: "tinyllama-1.1b", displayName: "TinyLlama 1.1B", minActiveNodes: 0 },
+  { id: "small-7b", displayName: "Small 7-8B dense model", minActiveNodes: 2 },
+  { id: "mixtral-8x7b", displayName: "Mixtral 8x7B", minActiveNodes: 5 },
+  { id: "mixtral-8x22b", displayName: "Mixtral 8x22B", minActiveNodes: 10 },
+];
+
+export class ModelCatalog {
+  private readonly entries: CatalogEntry[];
+
+  constructor(entries: CatalogEntry[] = DEFAULT_CATALOG) {
+    this.entries = entries;
+  }
+
+  availability(activeNodeCount: number): AvailabilityEntry[] {
+    return this.entries.map(entry => ({
+      ...entry,
+      available: activeNodeCount >= entry.minActiveNodes,
+    }));
+  }
+}
