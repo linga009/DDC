@@ -8,4 +8,7 @@ target_compile_features(inference_engine PUBLIC cxx_std_17)
 add_executable(swarm-cli src/main.cpp)
 target_link_libraries(swarm-cli PRIVATE inference_engine)
 
+add_executable(swarm-rpc-server src/rpc_server_main.cpp)
+target_link_libraries(swarm-rpc-server PRIVATE ggml)
+
 add_subdirectory(tests)

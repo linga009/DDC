@@ -6,5 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 enable_testing()
 
+set(GGML_RPC ON CACHE BOOL "" FORCE)
+
 add_subdirectory(vendor/llama.cpp)
 add_subdirectory(core)
