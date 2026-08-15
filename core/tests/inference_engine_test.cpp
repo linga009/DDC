@@ -202,3 +202,34 @@ TEST(InferenceEngine, LoadsMoeModelWithExistingSingleDeviceConstructor) {
 
     EXPECT_FALSE(result.empty());
 }
+
+TEST(InferenceEngine, ExplicitLocalPlacementProducesRealCompletion) {
+    swarm::InferenceEngine engine(
+        moe_test_model_path(),
+        std::vector<std::string>{},
+        std::vector<swarm::LayerPlacement>{
+            {0, "local"}, {1, "local"}, {2, "local"},
+        });
+
+    std::string result = engine.complete("Hello", 8);
+
+    EXPECT_FALSE(result.empty());
+}
+
+TEST_F(RpcServerFixture, ExplicitRemotePlacementOverridesSpecificLayer) {
+    std::string captured_log;
+    LlamaLogCaptureGuard log_guard(&captured_log);
+
+    swarm::InferenceEngine engine(
+        moe_test_model_path(),
+        std::vector<std::string>{"127.0.0.1:50052"},
+        std::vector<swarm::LayerPlacement>{
+            {3, "127.0.0.1:50052"},
+        });
+
+    std::string result = engine.complete("Hello", 8);
+
+    EXPECT_FALSE(result.empty());
+    EXPECT_NE(captured_log.find("blk.3.ffn_gate_exps"), std::string::npos);
+    EXPECT_NE(captured_log.find("overridden to RPC0[127.0.0.1:50052]"), std::string::npos);
+}

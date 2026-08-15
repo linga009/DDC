@@ -6,6 +6,7 @@
 #include "ggml-rpc.h"
 
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace swarm {
@@ -66,6 +67,71 @@ InferenceEngine::InferenceEngine(const std::string& model_path,
     if (ctx_ == nullptr) {
         llama_model_free(model_);
         throw std::runtime_error("failed to create llama context with remote devices for model: " + model_path);
+    }
+}
+
+InferenceEngine::InferenceEngine(const std::string& model_path,
+                                  const std::vector<std::string>& remote_endpoints,
+                                  const std::vector<LayerPlacement>& layer_placements) {
+    ggml_backend_load_all();
+
+    devices_.clear();
+    ggml_backend_dev_t local_cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (local_cpu != nullptr) {
+        devices_.push_back(local_cpu);
+    }
+
+    // endpoint string -> resolved buffer type, so multiple layers naming the
+    // same remote endpoint reuse one RPC connection instead of opening a new
+    // one per layer.
+    std::unordered_map<std::string, ggml_backend_buffer_type_t> endpoint_buft;
+    endpoint_buft["local"] = ggml_backend_dev_buffer_type(local_cpu);
+
+    for (const auto& endpoint : remote_endpoints) {
+        ggml_backend_reg_t rpc_reg = ggml_backend_rpc_add_server(endpoint.c_str());
+        if (rpc_reg == nullptr) {
+            throw std::runtime_error("failed to reach RPC endpoint: " + endpoint);
+        }
+        size_t n = ggml_backend_reg_dev_count(rpc_reg);
+        for (size_t i = 0; i < n; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_reg_dev_get(rpc_reg, i);
+            devices_.push_back(dev);
+        }
+        if (n > 0) {
+            endpoint_buft[endpoint] = ggml_backend_dev_buffer_type(ggml_backend_reg_dev_get(rpc_reg, 0));
+        }
+    }
+    devices_.push_back(nullptr);
+
+    override_patterns_.reserve(layer_placements.size());
+    tensor_overrides_.reserve(layer_placements.size() + 1);
+    for (const auto& placement : layer_placements) {
+        auto it = endpoint_buft.find(placement.device_endpoint);
+        if (it == endpoint_buft.end()) {
+            throw std::runtime_error(
+                "layer placement references unknown device endpoint: " + placement.device_endpoint);
+        }
+        override_patterns_.push_back("^blk\\." + std::to_string(placement.layer) + "\\.ffn_.*_exps");
+        tensor_overrides_.push_back({override_patterns_.back().c_str(), it->second});
+    }
+    tensor_overrides_.push_back({nullptr, nullptr});
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.devices = devices_.data();
+    model_params.tensor_buft_overrides = tensor_overrides_.data();
+    model_ = llama_model_load_from_file(model_path.c_str(), model_params);
+    if (model_ == nullptr) {
+        throw std::runtime_error("failed to load model with layer placements: " + model_path);
+    }
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 2048;
+    ctx_params.n_batch = 2048;
+
+    ctx_ = llama_init_from_model(model_, ctx_params);
+    if (ctx_ == nullptr) {
+        llama_model_free(model_);
+        throw std::runtime_error("failed to create llama context with layer placements for model: " + model_path);
     }
 }
 
