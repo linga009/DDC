@@ -33,6 +33,7 @@ async function fetchPeerCapacity(endpoint: string): Promise<number> {
   try {
     const res = await fetch(`${endpoint}/capacity`, { signal: AbortSignal.timeout(2000) });
     if (!res.ok) {
+      console.warn(`peer ${endpoint} returned non-OK status from /capacity: ${res.status}`);
       return 0;
     }
     const body = await res.json();
@@ -112,13 +113,25 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           sendJson(res, 400, { error: "endpoint must be a non-empty string" });
           return;
         }
+        let parsedEndpoint: URL;
         try {
-          new URL(candidate.endpoint);
+          parsedEndpoint = new URL(candidate.endpoint);
         } catch {
           sendJson(res, 400, { error: "endpoint must be a valid URL" });
           return;
         }
-        const peerId = peers.register(candidate.endpoint);
+        if (parsedEndpoint.protocol !== "http:" && parsedEndpoint.protocol !== "https:") {
+          sendJson(res, 400, { error: "endpoint must use http or https" });
+          return;
+        }
+        // Normalize away a trailing slash so both dedupe (PeerRegistry.register
+        // matches on exact endpoint string) and outbound capacity fetches
+        // (`${endpoint}/capacity`) are built consistently -- an unnormalized
+        // trailing slash would otherwise produce a malformed `...//capacity`
+        // URL that silently 404s, and would let the same instance register
+        // twice (with and without the slash) and double-count its capacity.
+        const normalizedEndpoint = parsedEndpoint.href.replace(/\/$/, "");
+        const peerId = peers.register(normalizedEndpoint);
         sendJson(res, 200, { peerId });
         return;
       }

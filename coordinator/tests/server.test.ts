@@ -258,6 +258,26 @@ test("POST /peers/register rejects a non-URL endpoint with 400", async () => {
   }
 });
 
+test("POST /peers/register rejects a non-http(s) scheme endpoint with 400", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/peers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "file:///etc/passwd" }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(typeof body.error, "string");
+
+    // Confirm nothing was actually registered.
+    const listRes = await fetch(`${baseUrl}/peers`);
+    assert.equal((await listRes.json()).length, 0);
+  } finally {
+    server.close();
+  }
+});
+
 test("POST /peers/:peerId/heartbeat keeps a peer active past what would otherwise be its expiry", async () => {
   // Inject a fake clock and a short timeout so we can prove the heartbeat
   // actually extends the peer's life, deterministically and without a real
@@ -410,5 +430,50 @@ test("GET /catalog treats a peer reporting negative activeNodes as contributing 
   } finally {
     server.close();
     fakePeer.close();
+  }
+});
+
+test("GET /catalog correctly reflects a peer's capacity even when registered with a trailing-slash endpoint", async () => {
+  const catalogEntries = [
+    { id: "small", displayName: "Small", minActiveNodes: 1 },
+  ];
+
+  // A real test-peer server reporting real, non-zero capacity.
+  const testPeer = createHttpServer((req, res) => {
+    if (req.url === "/capacity") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ activeNodes: 3 }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>(resolve => testPeer.listen(0, "127.0.0.1", resolve));
+  const testPeerAddress = testPeer.address();
+  if (testPeerAddress === null || typeof testPeerAddress === "string") {
+    throw new Error("expected test peer to bind a real port");
+  }
+  // Deliberately register WITH a trailing slash.
+  const testPeerUrlWithSlash = `http://127.0.0.1:${testPeerAddress.port}/`;
+
+  const { server, baseUrl } = await startTestServer(catalogEntries);
+  try {
+    await fetch(`${baseUrl}/peers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: testPeerUrlWithSlash }),
+    });
+
+    const res = await fetch(`${baseUrl}/catalog`);
+    assert.equal(res.status, 200);
+    const catalog = await res.json();
+    // If the trailing slash weren't normalized away, the outbound fetch
+    // would hit a malformed URL (double slash before "capacity"), 404, and
+    // silently contribute 0 -- leaving the model unavailable despite real
+    // capacity.
+    assert.equal(catalog.find((e: any) => e.id === "small").available, true);
+  } finally {
+    server.close();
+    testPeer.close();
   }
 });
