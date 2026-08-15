@@ -59,3 +59,20 @@ test("main.ts binds to the host given via the HOST env var", async () => {
     child.kill();
   }
 });
+
+test("main.ts falls back to 127.0.0.1 when HOST is set but empty, not all interfaces", async () => {
+  // HOST="" is set-but-empty, distinct from HOST being unset. A `??`
+  // fallback only triggers on `undefined`, so it would let "" through and
+  // an empty string passed to server.listen() binds to all interfaces
+  // (0.0.0.0 and ::) -- silently defeating the safe-default fix. Only a
+  // falsy-string check (`||`, or an explicit `=== ""` check) catches this.
+  const env = { ...process.env, PORT: "0", HOST: "" };
+
+  const child = spawn(process.execPath, [mainPath], { env });
+  try {
+    const logLine = await waitForStartupLog(child);
+    assert.match(logLine, /^coordinator listening on 127\.0\.0\.1:0 \(no authentication -- trusted networks only\)$/);
+  } finally {
+    child.kill();
+  }
+});
