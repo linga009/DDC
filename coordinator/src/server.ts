@@ -1,6 +1,7 @@
 import { createServer as createHttpServer, IncomingMessage, ServerResponse } from "node:http";
 import { NodeRegistry, type DeviceTier } from "./registry.ts";
 import { ModelCatalog } from "./catalog.ts";
+import { PeerRegistry } from "./peer_registry.ts";
 
 const VALID_DEVICE_TIERS: readonly DeviceTier[] = ["desktop", "android", "ios"];
 
@@ -28,7 +29,27 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
-export function createServer(registry: NodeRegistry, catalog: ModelCatalog) {
+async function fetchPeerCapacity(endpoint: string): Promise<number> {
+  try {
+    const res = await fetch(`${endpoint}/capacity`, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) {
+      return 0;
+    }
+    const body = await res.json();
+    return typeof body.activeNodes === "number" ? body.activeNodes : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function federatedActiveNodeCount(registry: NodeRegistry, peers: PeerRegistry): Promise<number> {
+  const local = registry.listActive().length;
+  const peerCounts = await Promise.all(
+    peers.listActive().map(peer => fetchPeerCapacity(peer.endpoint)));
+  return local + peerCounts.reduce((sum, n) => sum + n, 0);
+}
+
+export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry) {
   return createHttpServer(async (req, res) => {
     try {
       const method = req.method ?? "GET";
@@ -72,8 +93,47 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog) {
         return;
       }
 
+      if (method === "GET" && parts[0] === "capacity" && parts.length === 1) {
+        sendJson(res, 200, { activeNodes: registry.listActive().length });
+        return;
+      }
+
+      if (method === "POST" && parts[0] === "peers" && parts.length === 2 && parts[1] === "register") {
+        const body = await readJsonBody(req);
+        if (typeof body !== "object" || body === null) {
+          sendJson(res, 400, { error: "request body must be a JSON object" });
+          return;
+        }
+        const candidate = body as Record<string, unknown>;
+        if (typeof candidate.endpoint !== "string" || candidate.endpoint.length === 0) {
+          sendJson(res, 400, { error: "endpoint must be a non-empty string" });
+          return;
+        }
+        const peerId = peers.register(candidate.endpoint);
+        sendJson(res, 200, { peerId });
+        return;
+      }
+
+      if (method === "GET" && parts[0] === "peers" && parts.length === 1) {
+        sendJson(res, 200, peers.listActive());
+        return;
+      }
+
+      if (method === "DELETE" && parts[0] === "peers" && parts.length === 2) {
+        const ok = peers.deregister(parts[1]);
+        if (!ok) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
       if (method === "GET" && parts[0] === "catalog" && parts.length === 1) {
-        sendJson(res, 200, catalog.availability(registry.listActive().length));
+        const activeNodeCount = await federatedActiveNodeCount(registry, peers);
+        sendJson(res, 200, catalog.availability(activeNodeCount));
         return;
       }
 
