@@ -34,11 +34,9 @@ InferenceEngine::InferenceEngine(const std::string& model_path,
                                   const std::vector<std::string>& remote_endpoints) {
     ggml_backend_load_all();
 
-    std::vector<ggml_backend_dev_t> devices;
-
     ggml_backend_dev_t local_cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (local_cpu != nullptr) {
-        devices.push_back(local_cpu);
+        devices_.push_back(local_cpu);
     }
 
     for (const auto& endpoint : remote_endpoints) {
@@ -48,13 +46,13 @@ InferenceEngine::InferenceEngine(const std::string& model_path,
         }
         size_t n = ggml_backend_reg_dev_count(rpc_reg);
         for (size_t i = 0; i < n; ++i) {
-            devices.push_back(ggml_backend_reg_dev_get(rpc_reg, i));
+            devices_.push_back(ggml_backend_reg_dev_get(rpc_reg, i));
         }
     }
-    devices.push_back(nullptr);  // NULL-terminated, per llama_model_params.devices contract
+    devices_.push_back(nullptr);  // NULL-terminated, per llama_model_params.devices contract
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.devices = devices.data();
+    model_params.devices = devices_.data();
     model_ = llama_model_load_from_file(model_path.c_str(), model_params);
     if (model_ == nullptr) {
         throw std::runtime_error("failed to load model with remote devices: " + model_path);
