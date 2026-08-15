@@ -109,6 +109,54 @@ test("POST /nodes/register with malformed JSON returns 400 and the server surviv
   }
 });
 
+test("POST /nodes/register rejects a non-string endpoint with 400", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: { a: 1 }, deviceTier: "desktop" }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(typeof body.error, "string");
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /nodes/register rejects an invalid deviceTier with 400", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "toaster" }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(typeof body.error, "string");
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /nodes/register with a JSON body of literal null returns 400, not 500", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "null",
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(typeof body.error, "string");
+  } finally {
+    server.close();
+  }
+});
+
 test("GET /catalog with zero active nodes only shows the zero-threshold model available", async () => {
   const { server, baseUrl } = await startTestServer();
   try {

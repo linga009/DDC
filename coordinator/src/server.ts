@@ -2,6 +2,8 @@ import { createServer as createHttpServer, IncomingMessage, ServerResponse } fro
 import { NodeRegistry, type DeviceTier } from "./registry.ts";
 import { ModelCatalog } from "./catalog.ts";
 
+const VALID_DEVICE_TIERS: readonly DeviceTier[] = ["desktop", "android", "ios"];
+
 class JsonParseError extends Error {}
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -34,12 +36,21 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog) {
       const parts = url.pathname.split("/").filter(Boolean);
 
       if (method === "POST" && parts[0] === "nodes" && parts.length === 2 && parts[1] === "register") {
-        const body = (await readJsonBody(req)) as { endpoint?: string; deviceTier?: DeviceTier };
-        if (!body.endpoint || !body.deviceTier) {
-          sendJson(res, 400, { error: "endpoint and deviceTier are required" });
+        const body = await readJsonBody(req);
+        if (typeof body !== "object" || body === null) {
+          sendJson(res, 400, { error: "request body must be a JSON object" });
           return;
         }
-        const nodeId = registry.register(body.endpoint, body.deviceTier);
+        const candidate = body as Record<string, unknown>;
+        if (typeof candidate.endpoint !== "string" || candidate.endpoint.length === 0) {
+          sendJson(res, 400, { error: "endpoint must be a non-empty string" });
+          return;
+        }
+        if (typeof candidate.deviceTier !== "string" || !VALID_DEVICE_TIERS.includes(candidate.deviceTier as DeviceTier)) {
+          sendJson(res, 400, { error: "deviceTier must be one of: desktop, android, ios" });
+          return;
+        }
+        const nodeId = registry.register(candidate.endpoint, candidate.deviceTier as DeviceTier);
         sendJson(res, 200, { nodeId });
         return;
       }
