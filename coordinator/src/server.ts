@@ -112,6 +112,12 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           sendJson(res, 400, { error: "endpoint must be a non-empty string" });
           return;
         }
+        try {
+          new URL(candidate.endpoint);
+        } catch {
+          sendJson(res, 400, { error: "endpoint must be a valid URL" });
+          return;
+        }
         const peerId = peers.register(candidate.endpoint);
         sendJson(res, 200, { peerId });
         return;

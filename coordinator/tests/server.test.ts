@@ -238,6 +238,26 @@ test("DELETE /peers/:peerId deregisters a peer, 204 for known, 404 for unknown",
   }
 });
 
+test("POST /peers/register rejects a non-URL endpoint with 400", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/peers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "not-a-url-at-all" }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(typeof body.error, "string");
+
+    // Confirm nothing was actually registered.
+    const listRes = await fetch(`${baseUrl}/peers`);
+    assert.equal((await listRes.json()).length, 0);
+  } finally {
+    server.close();
+  }
+});
+
 test("POST /peers/:peerId/heartbeat keeps a peer active past what would otherwise be its expiry", async () => {
   // Inject a fake clock and a short timeout so we can prove the heartbeat
   // actually extends the peer's life, deterministically and without a real
