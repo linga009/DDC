@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -23,7 +24,29 @@ std::string test_model_path() {
 
 class RpcServerFixture : public ::testing::Test {
 protected:
+    // Kills any swarm-rpc-server process by image/command name -- blunt, but
+    // fine for a test-only fixture. Shared by SetUp() and TearDown(): see
+    // their comments for why it needs to run at both ends.
+    static void KillAnyRunningServer() {
+#ifdef _WIN32
+        std::system("taskkill /F /IM swarm-rpc-server.exe > NUL 2>&1");
+#else
+        std::system("pkill -f swarm-rpc-server > /dev/null 2>&1");
+#endif
+    }
+
     void SetUp() override {
+        // TearDown() below only runs on normal test completion (including
+        // assertion failures) -- NOT if the test binary itself aborts or
+        // crashes (this codebase has real abort paths, e.g. GGML_ABORT on
+        // RPC protocol errors). Clean up any server orphaned by a prior
+        // crashed run before launching a new one, so the fixture is
+        // self-healing instead of leaving the tree poisoned until someone
+        // manually kills it. This also sidesteps a Windows quirk: the
+        // vendored RPC transport sets SO_REUSEADDR, so two servers could
+        // otherwise silently coexist on the same port.
+        KillAnyRunningServer();
+
 #ifdef _WIN32
         std::string cmd = "start /B \"\" \"" SWARM_RPC_SERVER_PATH "\" --port 50052 > NUL 2>&1";
 #else
@@ -37,14 +60,10 @@ protected:
     void TearDown() override {
         // The server above is launched via a detached shell ("start /B" on
         // Windows, "&" elsewhere), so we don't have its PID. Kill it by
-        // image/command name instead -- blunt, but fine for a test-only
-        // fixture. Without this, the leaked process keeps swarm-rpc-server.exe
-        // locked on Windows and the next `cmake --build` fails to relink it.
-#ifdef _WIN32
-        std::system("taskkill /F /IM swarm-rpc-server.exe > NUL 2>&1");
-#else
-        std::system("pkill -f swarm-rpc-server > /dev/null 2>&1");
-#endif
+        // image/command name instead. Without this, the leaked process keeps
+        // swarm-rpc-server.exe locked on Windows and the next `cmake --build`
+        // fails to relink it.
+        KillAnyRunningServer();
     }
 };
 
@@ -68,8 +87,16 @@ public:
     LlamaLogCaptureGuard& operator=(const LlamaLogCaptureGuard&) = delete;
 
 private:
+    // Tees to stderr in addition to capturing: if InferenceEngine
+    // construction throws inside the guarded scope (the realistic failure
+    // mode when this test breaks -- RPC server not up, endpoint
+    // unreachable, etc.), the EXPECT_* that would print captured_log on
+    // failure never runs. Without this, llama/ggml's diagnostic output --
+    // which used to go to stderr by default -- would be silently
+    // discarded instead, making such CI failures much harder to debug.
     static void Callback(ggml_log_level, const char* text, void* user_data) {
         static_cast<std::string*>(user_data)->append(text);
+        std::fputs(text, stderr);
     }
 
     std::string* out_;
