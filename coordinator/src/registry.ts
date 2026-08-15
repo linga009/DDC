@@ -38,11 +38,19 @@ export class NodeRegistry {
   listActive(timeoutMs = 30000): NodeInfo[] {
     const now = this.clock();
     const active: NodeInfo[] = [];
-    for (const node of this.nodes.values()) {
+    for (const [nodeId, node] of this.nodes) {
       if (now - node.lastSeen <= timeoutMs) {
         active.push({ nodeId: node.nodeId, endpoint: node.endpoint, deviceTier: node.deviceTier });
+      } else {
+        // Expired -- prune it here rather than just leaving it out of the
+        // result, so long-running processes don't accumulate dead entries.
+        this.nodes.delete(nodeId);
       }
     }
     return active;
+  }
+
+  size(): number {
+    return this.nodes.size;
   }
 }
