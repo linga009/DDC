@@ -34,32 +34,58 @@ test("a node past the heartbeat timeout is excluded from listActive", () => {
   const registry = new NodeRegistry(() => now);
 
   const nodeId = registry.register("127.0.0.1:50052", "desktop");
-  assert.equal(registry.listActive(30000).length, 1);
+  assert.equal(registry.listActive().length, 1);
 
   now = 30001; // just past the 30s timeout, with no heartbeat in between
-  assert.equal(registry.listActive(30000).length, 0);
+  assert.equal(registry.listActive().length, 0);
 
-  // The listActive() call above scanned the expired entry and pruned it
-  // (see the "prunes expired nodes" test below), so it's gone for good --
-  // a heartbeat for it now behaves like an unknown node, and it would need
-  // to register again to come back.
+  // Gone for good -- it would need to register again to come back.
   assert.equal(registry.heartbeat(nodeId), false);
-  assert.equal(registry.listActive(30000).length, 0);
+  assert.equal(registry.listActive().length, 0);
 });
 
-test("a node that misses its timeout can still be revived by a heartbeat, as long as listActive hasn't scanned it as expired yet", () => {
+test("a node past its timeout cannot be revived by a heartbeat, regardless of whether listActive scanned it first", () => {
   let now = 0;
   const registry = new NodeRegistry(() => now);
 
   const nodeId = registry.register("127.0.0.1:50052", "desktop");
 
-  now = 30001; // past the timeout, but listActive hasn't run since expiry,
-  // so the entry is still sitting in the map awaiting its next scan
-  assert.equal(registry.heartbeat(nodeId), true); // refreshes lastSeen to `now`
-  assert.equal(registry.listActive(30000).length, 1);
+  now = 30001; // past the timeout; no listActive() call has run since expiry,
+  // so the entry is still physically sitting in the map -- but heartbeat()
+  // must still treat it as expired rather than reviving it, since "past the
+  // timeout" is now an unconditional invariant that doesn't depend on
+  // whether some unrelated listActive() call happened to prune it first.
+  assert.equal(registry.heartbeat(nodeId), false);
+  assert.equal(registry.listActive().length, 0);
+  assert.equal(registry.size(), 0);
+});
 
-  now = 60002; // 30001ms past the refreshed heartbeat
-  assert.equal(registry.listActive(30000).length, 0);
+test("heartbeat still revives a node that is within its timeout window", () => {
+  let now = 0;
+  const registry = new NodeRegistry(() => now);
+
+  const nodeId = registry.register("127.0.0.1:50052", "desktop");
+
+  now = 20000; // within the 30s timeout
+  assert.equal(registry.heartbeat(nodeId), true); // refreshes lastSeen to `now`
+  assert.equal(registry.listActive().length, 1);
+
+  now = 49999; // 29999ms past the refreshed heartbeat -- still within timeout
+  assert.equal(registry.listActive().length, 1);
+
+  now = 50001; // 30001ms past the refreshed heartbeat -- now expired
+  assert.equal(registry.listActive().length, 0);
+});
+
+test("a custom timeout configured on the registry applies to both listActive and heartbeat", () => {
+  let now = 0;
+  const registry = new NodeRegistry(() => now, 1000);
+
+  const nodeId = registry.register("127.0.0.1:50052", "desktop");
+
+  now = 1001; // past the custom 1000ms timeout
+  assert.equal(registry.heartbeat(nodeId), false);
+  assert.equal(registry.listActive().length, 0);
 });
 
 test("listActive prunes expired nodes from internal state, not just from its return value", () => {
@@ -70,9 +96,21 @@ test("listActive prunes expired nodes from internal state, not just from its ret
   assert.equal(registry.size(), 1);
 
   now = 30001; // just past the 30s timeout, with no heartbeat in between
-  const active = registry.listActive(30000);
+  const active = registry.listActive();
   assert.equal(active.length, 0);
   assert.equal(registry.size(), 0); // genuinely removed, not just filtered out
+});
+
+test("heartbeat prunes an expired node from internal state, not just returns false", () => {
+  let now = 0;
+  const registry = new NodeRegistry(() => now);
+
+  const nodeId = registry.register("127.0.0.1:50052", "desktop");
+  assert.equal(registry.size(), 1);
+
+  now = 30001; // just past the 30s timeout
+  assert.equal(registry.heartbeat(nodeId), false);
+  assert.equal(registry.size(), 0); // genuinely removed by heartbeat itself
 });
 
 test("multiple nodes are tracked independently", () => {
