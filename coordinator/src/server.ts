@@ -114,6 +114,18 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         return;
       }
 
+      if (method === "POST" && parts[0] === "peers" && parts.length === 3 && parts[2] === "heartbeat") {
+        const ok = peers.heartbeat(parts[1]);
+        if (!ok) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
       if (method === "GET" && parts[0] === "peers" && parts.length === 1) {
         sendJson(res, 200, peers.listActive());
         return;

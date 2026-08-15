@@ -10,10 +10,12 @@ const DEFAULT_TEST_CATALOG: CatalogEntry[] = [
   { id: "small-7b", displayName: "Small 7-8B dense model", minActiveNodes: 1 },
 ];
 
-async function startTestServer(catalogEntries: CatalogEntry[] = DEFAULT_TEST_CATALOG) {
+async function startTestServer(
+  catalogEntries: CatalogEntry[] = DEFAULT_TEST_CATALOG,
+  peers: PeerRegistry = new PeerRegistry(),
+) {
   const registry = new NodeRegistry();
   const catalog = new ModelCatalog(catalogEntries);
-  const peers = new PeerRegistry();
   const server = createServer(registry, catalog, peers);
 
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -230,6 +232,51 @@ test("DELETE /peers/:peerId deregisters a peer, 204 for known, 404 for unknown",
 
     const deleteAgain = await fetch(`${baseUrl}/peers/${peerId}`, { method: "DELETE" });
     assert.equal(deleteAgain.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /peers/:peerId/heartbeat keeps a peer active past what would otherwise be its expiry", async () => {
+  // Inject a fake clock and a short timeout so we can prove the heartbeat
+  // actually extends the peer's life, deterministically and without a real
+  // 30-second wait.
+  let now = 0;
+  const peers = new PeerRegistry(() => now, 1000);
+  const { server, baseUrl } = await startTestServer(DEFAULT_TEST_CATALOG, peers);
+  try {
+    const registerRes = await fetch(`${baseUrl}/peers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://192.168.1.50:9090" }),
+    });
+    const { peerId } = await registerRes.json();
+
+    // Still within the original 1000ms window -- heartbeat should succeed
+    // and refresh lastSeen.
+    now = 700;
+    const heartbeatRes = await fetch(`${baseUrl}/peers/${peerId}/heartbeat`, { method: "POST" });
+    assert.equal(heartbeatRes.status, 204);
+
+    // 1500ms after registration -- past the ORIGINAL 1000ms window, but
+    // only 800ms after the heartbeat refreshed lastSeen, so still within a
+    // fresh window. Without the heartbeat route/refresh, this peer would
+    // already be expired (1500 - 0 > 1000).
+    now = 1500;
+    const listRes = await fetch(`${baseUrl}/peers`);
+    const list = await listRes.json();
+    assert.equal(list.length, 1);
+    assert.equal(list[0].peerId, peerId);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /peers/:peerId/heartbeat returns 404 for an unknown peer", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/peers/not-a-real-id/heartbeat`, { method: "POST" });
+    assert.equal(res.status, 404);
   } finally {
     server.close();
   }
