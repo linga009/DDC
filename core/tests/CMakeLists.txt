@@ -12,6 +12,9 @@ target_link_libraries(inference_engine_test PRIVATE inference_engine GTest::gtes
 target_compile_definitions(inference_engine_test PRIVATE
     SWARM_TEST_MODEL_DIR="${CMAKE_SOURCE_DIR}/models"
 )
+target_compile_definitions(inference_engine_test PRIVATE
+    SWARM_RPC_SERVER_PATH="$<TARGET_FILE:swarm-rpc-server>"
+)
 
 include(GoogleTest)
 gtest_discover_tests(inference_engine_test)

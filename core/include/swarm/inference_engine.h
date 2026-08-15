@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 struct llama_model;
 struct llama_context;
@@ -10,6 +11,7 @@ namespace swarm {
 class InferenceEngine {
 public:
     explicit InferenceEngine(const std::string& model_path);
+    InferenceEngine(const std::string& model_path, const std::vector<std::string>& remote_endpoints);
     ~InferenceEngine();
 
     InferenceEngine(const InferenceEngine&) = delete;
