@@ -22,6 +22,16 @@ export class PeerRegistry {
   }
 
   register(endpoint: string): string {
+    for (const peer of this.peers.values()) {
+      if (peer.endpoint === endpoint) {
+        // Already registered -- treat this as a refresh (same effect as a
+        // heartbeat) rather than minting a duplicate entry for the same
+        // endpoint, which would otherwise double-count that peer's reported
+        // capacity in the federated aggregate.
+        peer.lastSeen = this.clock();
+        return peer.peerId;
+      }
+    }
     const peerId = randomUUID();
     this.peers.set(peerId, { peerId, endpoint, lastSeen: this.clock() });
     return peerId;

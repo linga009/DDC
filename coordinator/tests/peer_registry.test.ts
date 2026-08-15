@@ -63,3 +63,29 @@ test("multiple peers are tracked independently", () => {
   assert.notEqual(a, b);
   assert.equal(registry.listActive().length, 2);
 });
+
+test("registering the same endpoint twice returns the same peerId and does not double-count in listActive", () => {
+  const registry = new PeerRegistry();
+  const first = registry.register("http://192.168.1.50:8080");
+  const second = registry.register("http://192.168.1.50:8080");
+
+  assert.equal(first, second);
+  assert.equal(registry.listActive().length, 1);
+});
+
+test("registering the same endpoint again refreshes lastSeen, keeping the peer active past the original window", () => {
+  let now = 0;
+  const registry = new PeerRegistry(() => now);
+  const peerId = registry.register("http://192.168.1.50:8080");
+
+  now = 20000;
+  const again = registry.register("http://192.168.1.50:8080");
+  assert.equal(again, peerId);
+
+  // 45s after the original registration -- past the ORIGINAL 30s window,
+  // but only 25s after the re-register refreshed lastSeen, so still within
+  // a fresh 30s window. If the duplicate register hadn't refreshed
+  // lastSeen, this peer would already be expired (45000 - 0 > 30000).
+  now = 45000;
+  assert.equal(registry.listActive().length, 1);
+});
