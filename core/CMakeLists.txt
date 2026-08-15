@@ -1,5 +1,6 @@
 add_library(inference_engine
     src/inference_engine.cpp
+    src/speculative.cpp
 )
 target_include_directories(inference_engine PUBLIC include)
 target_link_libraries(inference_engine PUBLIC llama)

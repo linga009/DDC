@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -10,6 +11,20 @@ typedef struct ggml_backend_device* ggml_backend_dev_t;
 struct llama_model_tensor_buft_override;
 
 namespace swarm {
+
+// Given a draft model's proposed tokens and a target model's greedy
+// predictions at those same positions, returns the accepted token
+// sequence: the longest matching prefix of draft_tokens, plus exactly one
+// more token from target_predictions -- either the correction at the
+// first mismatch, or the bonus token if the whole draft was accepted.
+//
+// target_predictions must have exactly draft_tokens.size() + 1 entries:
+// target_predictions[i] is the target model's prediction for the token
+// immediately after draft_tokens[0..i-1] (target_predictions[0] predicts
+// the token right after the existing context, before any draft token).
+std::vector<int32_t> resolve_speculative_acceptance(
+    const std::vector<int32_t>& draft_tokens,
+    const std::vector<int32_t>& target_predictions);
 
 // Places one layer's MoE *expert* tensors (ffn_gate_exps / ffn_down_exps /
 // ffn_up_exps) on the given device endpoint ("local" or one of the
