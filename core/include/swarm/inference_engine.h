@@ -11,6 +11,11 @@ struct llama_model_tensor_buft_override;
 
 namespace swarm {
 
+// Places one layer's MoE *expert* tensors (ffn_gate_exps / ffn_down_exps /
+// ffn_up_exps) on the given device endpoint ("local" or one of the
+// remote_endpoints passed to the InferenceEngine constructor). This does NOT
+// move the whole layer: that layer's attention, norms, and router tensors
+// are left wherever automatic placement puts them.
 struct LayerPlacement {
     int layer;
     std::string device_endpoint;
