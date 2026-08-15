@@ -227,6 +227,50 @@ TEST(InferenceEngine, ThrowsOnUnknownLayerPlacementEndpoint) {
         std::runtime_error);
 }
 
+TEST(InferenceEngine, SpeculativeDecodingProducesRealCompletion) {
+    swarm::InferenceEngine target(test_model_path());
+    swarm::InferenceEngine draft(test_model_path());
+
+    swarm::SpeculativeResult result =
+        target.complete_speculative("The capital of France is", 16, draft, 4);
+
+    EXPECT_FALSE(result.text.empty());
+    EXPECT_GT(result.accepted_tokens, 0);
+}
+
+TEST(InferenceEngine, SpeculativeDecodingReducesTargetDecodeCalls) {
+    swarm::InferenceEngine target(test_model_path());
+    swarm::InferenceEngine draft(test_model_path());
+
+    swarm::SpeculativeResult result =
+        target.complete_speculative("The capital of France is", 16, draft, 4);
+
+    // One target decode call verifies up to `lookahead` tokens at once, so
+    // the number of target decode calls should be well under one-per-token.
+    EXPECT_LT(result.target_decode_calls, result.accepted_tokens);
+}
+
+TEST(InferenceEngine, SpeculativeDecodingBonusTokenMeansEvenLookaheadOneBatches) {
+    swarm::InferenceEngine target(test_model_path());
+    swarm::InferenceEngine draft(test_model_path());
+
+    swarm::SpeculativeResult result =
+        target.complete_speculative("The capital of France is", 8, draft, 1);
+
+    // A verification round always requests lookahead+1 target predictions,
+    // not just `lookahead` -- the extra position is the "bonus" token from
+    // the same batch (see resolve_speculative_acceptance's contract: when
+    // the whole draft is accepted, the returned sequence is the accepted
+    // draft tokens PLUS one more). So even at lookahead=1, full acceptance
+    // (guaranteed here by self-speculation + greedy sampling) means every
+    // round nets 2 accepted tokens for 1 decode call, not 1 -- there is no
+    // lookahead value that produces a strict 1-decode-call-per-token ratio.
+    // n_predict=8 is chosen to divide evenly by (lookahead+1)=2, so this is
+    // an exact equality, not a rounding-dependent bound.
+    EXPECT_EQ(result.target_decode_calls, result.accepted_tokens / (1 + 1));
+    EXPECT_EQ(result.accepted_tokens, 8);
+}
+
 TEST_F(RpcServerFixture, ExplicitRemotePlacementOverridesSpecificLayer) {
     std::string captured_log;
     LlamaLogCaptureGuard log_guard(&captured_log);

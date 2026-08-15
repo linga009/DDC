@@ -26,6 +26,15 @@ std::vector<int32_t> resolve_speculative_acceptance(
     const std::vector<int32_t>& draft_tokens,
     const std::vector<int32_t>& target_predictions);
 
+// Result of a speculative-decoding completion run: the generated text, plus
+// counters that let callers (and tests) observe how much the batched
+// multi-token verification actually reduced round-trips to the target model.
+struct SpeculativeResult {
+    std::string text;
+    int accepted_tokens = 0;
+    int target_decode_calls = 0;
+};
+
 // Places one layer's MoE *expert* tensors (ffn_gate_exps / ffn_down_exps /
 // ffn_up_exps) on the given device endpoint ("local" or one of the
 // remote_endpoints passed to the InferenceEngine constructor). This does NOT
@@ -49,6 +58,15 @@ public:
     InferenceEngine& operator=(const InferenceEngine&) = delete;
 
     std::string complete(const std::string& prompt, int n_predict);
+
+    // Speculative decoding: `draft` (a second, independent InferenceEngine)
+    // proposes up to `lookahead` tokens at a time, which this engine (the
+    // target) verifies in a single batched decode call against its own
+    // greedy predictions, via resolve_speculative_acceptance(). Accesses
+    // draft's private model_/ctx_ directly -- private members are
+    // accessible between instances of the same class in C++.
+    SpeculativeResult complete_speculative(const std::string& prompt, int n_predict,
+                                            InferenceEngine& draft, int lookahead);
 
 private:
     // Backing storage for model_params.devices in the remote-device
