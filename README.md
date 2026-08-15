@@ -4,10 +4,12 @@ A native C++ inference engine (`swarm::InferenceEngine`, a wrapper around
 [llama.cpp](https://github.com/ggml-org/llama.cpp)) and a `swarm-cli`
 command-line executable for running local LLM inference.
 
-This repo implements the first foundational plan from the project vision (a
-local, single-device inference engine) plus an early piece of the second
-plan's networking layer: the `coordinator/` service described below. Sharding
-and federation are not yet implemented — see
+This repo implements the first three foundational plans from the project
+vision: a local, single-device inference engine; a first step into
+multi-node sharding via a minimal RPC mechanism; and a coordinator service
+that tracks node liveness and gates model availability by capacity (both
+described below). Federation across independently-run coordinator instances
+is not yet implemented — see
 [`docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md`](docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md)
 for the full design of where this is headed.
 
@@ -70,6 +72,30 @@ Example output:
 ```
 The capital of France is Paris.
 ```
+
+## Networking and RPC sharding
+
+This repo includes a first, minimal step toward multi-node inference, built
+on llama.cpp's RPC backend:
+
+- **`swarm-rpc-server`** — a small executable (`core/src/rpc_server_main.cpp`)
+  that exposes the local CPU device so another process can offload
+  computation to it. Run it with `--port N`. It binds to `127.0.0.1` only —
+  there is currently no option to bind another interface, so it is reachable
+  only from the same machine.
+- **`swarm::InferenceEngine`** has a second constructor overload,
+  `InferenceEngine(model_path, remote_endpoints)`, that combines the local
+  CPU device with one or more remote devices reached via `swarm-rpc-server`
+  instances, so model layers can be split across the local machine and
+  remote hosts.
+
+> [!WARNING]
+> The underlying llama.cpp RPC backend is, in upstream's own words, "in a
+> proof-of-concept development stage. As such, the functionality is fragile
+> and insecure." **Never run `swarm-rpc-server` on an open or untrusted
+> network.** It has no authentication or encryption. It is suitable for
+> trusted LAN or same-host use only, and currently binds to `127.0.0.1` for
+> exactly this reason.
 
 ## Coordinator service
 
