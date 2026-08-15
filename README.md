@@ -37,10 +37,12 @@ git submodule update --init
 
 ```bash
 ./scripts/download_test_model.sh
+./scripts/download_moe_test_model.sh
 ```
 
 This downloads a small TinyLlama GGUF model into `models/` for use by the
-test suite and the `swarm-cli` example below.
+test suite and the `swarm-cli` example below. The second script fetches a
+~90MB MoE (mixture-of-experts) model used by the layer-placement tests.
 
 ## Build
 
