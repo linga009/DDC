@@ -15,6 +15,11 @@ target_compile_definitions(inference_engine_test PRIVATE
 target_compile_definitions(inference_engine_test PRIVATE
     SWARM_RPC_SERVER_PATH="$<TARGET_FILE:swarm-rpc-server>"
 )
+# $<TARGET_FILE:...> above only supplies a path string -- it does not make
+# CMake build swarm-rpc-server before inference_engine_test. Without this,
+# a clean `cmake --build build --target inference_engine_test` can leave
+# the RPC-split test pointing at a stale or missing executable.
+add_dependencies(inference_engine_test swarm-rpc-server)
 
 include(GoogleTest)
 gtest_discover_tests(inference_engine_test)

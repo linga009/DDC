@@ -1,5 +1,7 @@
 #include "swarm/inference_engine.h"
 
+#include "llama.h"
+
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -31,6 +33,46 @@ protected:
         // give the server a moment to bind the port before tests connect
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
+
+    void TearDown() override {
+        // The server above is launched via a detached shell ("start /B" on
+        // Windows, "&" elsewhere), so we don't have its PID. Kill it by
+        // image/command name instead -- blunt, but fine for a test-only
+        // fixture. Without this, the leaked process keeps swarm-rpc-server.exe
+        // locked on Windows and the next `cmake --build` fails to relink it.
+#ifdef _WIN32
+        std::system("taskkill /F /IM swarm-rpc-server.exe > NUL 2>&1");
+#else
+        std::system("pkill -f swarm-rpc-server > /dev/null 2>&1");
+#endif
+    }
+};
+
+// RAII guard that installs a llama.cpp log callback appending into the given
+// string, and restores default logging on scope exit -- including when an
+// assertion (EXPECT_*/ASSERT_*) inside the guarded scope fails partway
+// through, since destructors still run during stack unwinding from a
+// non-fatal gtest failure (and ASSERT_* just returns, it doesn't throw).
+class LlamaLogCaptureGuard {
+public:
+    explicit LlamaLogCaptureGuard(std::string* out) : out_(out) {
+        out_->clear();
+        llama_log_set(&LlamaLogCaptureGuard::Callback, out_);
+    }
+
+    ~LlamaLogCaptureGuard() {
+        llama_log_set(nullptr, nullptr);
+    }
+
+    LlamaLogCaptureGuard(const LlamaLogCaptureGuard&) = delete;
+    LlamaLogCaptureGuard& operator=(const LlamaLogCaptureGuard&) = delete;
+
+private:
+    static void Callback(ggml_log_level, const char* text, void* user_data) {
+        static_cast<std::string*>(user_data)->append(text);
+    }
+
+    std::string* out_;
 };
 
 }  // namespace
@@ -88,11 +130,21 @@ TEST(InferenceEngine, ManyCallsDoNotExhaustContext) {
 }
 
 TEST_F(RpcServerFixture, SplitsAcrossLocalAndRemoteDevice) {
+    std::string captured_log;
+    LlamaLogCaptureGuard log_guard(&captured_log);
+
     swarm::InferenceEngine engine(test_model_path(), std::vector<std::string>{"127.0.0.1:50052"});
 
     std::string result = engine.complete("The capital of France is", 8);
 
     EXPECT_FALSE(result.empty());
+    // load_tensors logs "layer N assigned to device <name>" at DEBUG level
+    // for every layer (see llama-model.cpp); remote RPC devices are named
+    // "RPC0", "RPC1", etc. (see ggml_backend_rpc_add_server in
+    // ggml-rpc.cpp). A purely-local fallback would only ever log
+    // "assigned to device CPU", so finding "assigned to device RPC" proves
+    // at least one layer was genuinely placed on the remote device.
+    EXPECT_NE(captured_log.find("assigned to device RPC"), std::string::npos) << captured_log;
 }
 
 TEST(InferenceEngine, ThrowsIfRemoteEndpointUnreachable) {
