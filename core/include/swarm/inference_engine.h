@@ -65,6 +65,19 @@ public:
     // greedy predictions, via resolve_speculative_acceptance(). Accesses
     // draft's private model_/ctx_ directly -- private members are
     // accessible between instances of the same class in C++.
+    //
+    // Design notes:
+    //  - Deliberately redecodes the full accepted-so-far context each round
+    //    (O(n^2) total work over a generation) instead of incrementally
+    //    updating the KV cache across rounds -- a simplification, not an
+    //    oversight; fine at test scale, not production-grade.
+    //  - `draft` and `this` (the target) must share a tokenizer/vocabulary
+    //    -- passing a different-family model produces silent garbage
+    //    output, not an error.
+    //  - This method's own tests use the *same* model for both draft and
+    //    target, which proves the round-trip-reduction mechanism only, not
+    //    a wall-clock speedup; a genuinely smaller/faster draft model is a
+    //    drop-in swap for `draft`.
     SpeculativeResult complete_speculative(const std::string& prompt, int n_predict,
                                             InferenceEngine& draft, int lookahead);
 

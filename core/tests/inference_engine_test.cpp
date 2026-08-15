@@ -227,6 +227,13 @@ TEST(InferenceEngine, ThrowsOnUnknownLayerPlacementEndpoint) {
         std::runtime_error);
 }
 
+// NOTE: every complete_speculative test below uses the same model
+// (TinyLlama) as both draft and target. That proves the batched-
+// verification / accept-reject mechanism and round-trip counting end to
+// end, but NOT a wall-clock speedup -- draft and target cost the same here.
+// A real speedup requires a genuinely smaller/faster draft model, which is
+// a drop-in swap for the `draft` argument (see complete_speculative's doc
+// comment in inference_engine.h).
 TEST(InferenceEngine, SpeculativeDecodingProducesRealCompletion) {
     swarm::InferenceEngine target(test_model_path());
     swarm::InferenceEngine draft(test_model_path());
