@@ -4,12 +4,16 @@ A native C++ inference engine (`swarm::InferenceEngine`, a wrapper around
 [llama.cpp](https://github.com/ggml-org/llama.cpp)) and a `swarm-cli`
 command-line executable for running local LLM inference.
 
-This repo implements the first three foundational plans from the project
-vision: a local, single-device inference engine; a first step into
-multi-node sharding via a minimal RPC mechanism; and a coordinator service
-that tracks node liveness and gates model availability by capacity (both
-described below). Federation across independently-run coordinator instances
-is not yet implemented — see
+This repo implements five foundational plans from the project vision: a
+local, single-device inference engine; a first step into multi-node
+sharding via a minimal RPC mechanism; a coordinator service that tracks
+node liveness and gates model availability by capacity (both described
+below); explicit per-layer placement of Mixture-of-Experts tensors across
+local and remote devices; and speculative decoding, which verifies several
+draft-model-proposed tokens per target-model round-trip
+(`InferenceEngine::complete_speculative`, not yet exposed via `swarm-cli`).
+Federation across independently-run coordinator instances is not yet
+implemented — see
 [`docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md`](docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md)
 for the full design of where this is headed.
 
