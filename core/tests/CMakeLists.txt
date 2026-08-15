@@ -11,6 +11,7 @@ add_executable(inference_engine_test inference_engine_test.cpp)
 target_link_libraries(inference_engine_test PRIVATE inference_engine GTest::gtest_main)
 target_compile_definitions(inference_engine_test PRIVATE
     SWARM_TEST_MODEL_DIR="${CMAKE_SOURCE_DIR}/models"
+    SWARM_MOE_TEST_MODEL_DIR="${CMAKE_SOURCE_DIR}/models"
 )
 target_compile_definitions(inference_engine_test PRIVATE
     SWARM_RPC_SERVER_PATH="$<TARGET_FILE:swarm-rpc-server>"

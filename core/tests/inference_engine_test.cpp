@@ -104,6 +104,18 @@ private:
 
 }  // namespace
 
+#ifndef SWARM_MOE_TEST_MODEL_DIR
+#define SWARM_MOE_TEST_MODEL_DIR "models"
+#endif
+
+namespace {
+
+std::string moe_test_model_path() {
+    return std::string(SWARM_MOE_TEST_MODEL_DIR) + "/tiny-moe.Q4_K_M.gguf";
+}
+
+}  // namespace
+
 TEST(InferenceEngine, ThrowsOnInvalidModelPath) {
     EXPECT_THROW(swarm::InferenceEngine engine("does/not/exist.gguf"), std::runtime_error);
 }
@@ -181,4 +193,12 @@ TEST(InferenceEngine, ThrowsIfRemoteEndpointUnreachable) {
     EXPECT_THROW(
         (swarm::InferenceEngine(test_model_path(), std::vector<std::string>{"127.0.0.1:50099"})),
         std::runtime_error);
+}
+
+TEST(InferenceEngine, LoadsMoeModelWithExistingSingleDeviceConstructor) {
+    swarm::InferenceEngine engine(moe_test_model_path());
+
+    std::string result = engine.complete("Hello", 8);
+
+    EXPECT_FALSE(result.empty());
 }
