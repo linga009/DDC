@@ -169,6 +169,23 @@ runtime behaviors of the system, not development phases:
   experts for that layer, not every shard in a chain. This is the core
   structural advantage over plain pipeline-parallel systems (e.g. Petals),
   which target dense models and touch every shard on every token.
+
+  **Correction found during Plan 4's implementation (2026-08-15):** llama.cpp
+  stores all of a layer's experts as one merged 3D tensor per projection
+  (`blk.N.ffn_gate_exps`, `_down_exps`, `_up_exps`), computed via a single
+  indexed matmul (`GGML_OP_MUL_MAT_ID`) — individual experts are not
+  separate tensors, so there is no supported way to place expert *K* of
+  layer *N* on one device and expert *J* of the same layer on another
+  without patching llama.cpp's core graph-building code. That's out of
+  scope: it means invasively modifying a widely-used, well-tested inference
+  engine's matmul routing logic, which trades a small sharding-granularity
+  win for real correctness risk in code every other plan depends on — not
+  a trade worth making. What *is* achievable, and what Plan 4 actually
+  builds: explicit **per-layer** placement of a layer's whole MoE block via
+  `llama_model_params.tensor_buft_overrides`, giving deliberate,
+  coordinator-controllable control (e.g. "layers 0-15 on node A, 16-31 on
+  node B") in place of Plan 2's automatic free-memory-proportional split —
+  finer-grained *control*, not finer-grained *sharding* than a layer.
 - **Locality clustering**: the coordinator prefers assembling pipelines
   from devices on the same local mesh when the requester has nearby peers;
   internet/federated routing is used only between clusters, not within one.
