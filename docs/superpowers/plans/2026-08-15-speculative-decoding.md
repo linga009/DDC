@@ -211,18 +211,25 @@ TEST(InferenceEngine, SpeculativeDecodingReducesTargetDecodeCalls) {
     EXPECT_LT(result.target_decode_calls, result.accepted_tokens);
 }
 
-TEST(InferenceEngine, SpeculativeDecodingWithLookaheadOneMatchesOneCallPerToken) {
+TEST(InferenceEngine, SpeculativeDecodingBonusTokenMeansEvenLookaheadOneBatches) {
     swarm::InferenceEngine target(test_model_path());
     swarm::InferenceEngine draft(test_model_path());
 
     swarm::SpeculativeResult result =
         target.complete_speculative("The capital of France is", 8, draft, 1);
 
-    // lookahead=1 means each round proposes and verifies exactly one token,
-    // so there's no batching benefit -- decode calls should equal accepted
-    // tokens exactly. This is a sanity check on the counting logic itself,
-    // not on the round-trip-reduction property (that's the test above).
-    EXPECT_EQ(result.target_decode_calls, result.accepted_tokens);
+    // A verification round always requests lookahead+1 target predictions,
+    // not just `lookahead` -- the extra position is the "bonus" token from
+    // the same batch (see resolve_speculative_acceptance's contract: when
+    // the whole draft is accepted, the returned sequence is the accepted
+    // draft tokens PLUS one more). So even at lookahead=1, full acceptance
+    // (guaranteed here by self-speculation + greedy sampling) means every
+    // round nets 2 accepted tokens for 1 decode call, not 1 -- there is no
+    // lookahead value that produces a strict 1-decode-call-per-token ratio.
+    // n_predict=8 is chosen to divide evenly by (lookahead+1)=2, so this is
+    // an exact equality, not a rounding-dependent bound.
+    EXPECT_EQ(result.target_decode_calls, result.accepted_tokens / (1 + 1));
+    EXPECT_EQ(result.accepted_tokens, 8);
 }
 ```
 
