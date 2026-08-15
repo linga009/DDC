@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -216,6 +217,16 @@ TEST(InferenceEngine, ExplicitLocalPlacementProducesRealCompletion) {
     EXPECT_FALSE(result.empty());
 }
 
+TEST(InferenceEngine, ThrowsOnUnknownLayerPlacementEndpoint) {
+    // No RPC server needed: an unknown device_endpoint is rejected before the
+    // model is loaded, so this is cheap to run alongside the other
+    // non-fixture tests above.
+    EXPECT_THROW(
+        (swarm::InferenceEngine(moe_test_model_path(), std::vector<std::string>{},
+                                 std::vector<swarm::LayerPlacement>{{0, "not-a-real-endpoint"}})),
+        std::runtime_error);
+}
+
 TEST_F(RpcServerFixture, ExplicitRemotePlacementOverridesSpecificLayer) {
     std::string captured_log;
     LlamaLogCaptureGuard log_guard(&captured_log);
@@ -230,6 +241,21 @@ TEST_F(RpcServerFixture, ExplicitRemotePlacementOverridesSpecificLayer) {
     std::string result = engine.complete("Hello", 8);
 
     EXPECT_FALSE(result.empty());
-    EXPECT_NE(captured_log.find("blk.3.ffn_gate_exps"), std::string::npos);
-    EXPECT_NE(captured_log.find("overridden to RPC0[127.0.0.1:50052]"), std::string::npos);
+    // Require both facts on the same log line: that layer 3's expert tensor
+    // was named AND that it was overridden to the RPC device. Checking these
+    // as two independent find() calls (the original form of this assertion)
+    // is vacuous for the first half -- "blk.3.ffn_gate_exps" also appears in
+    // llama.cpp's normal "loading tensor" log line for every tensor, override
+    // or not -- so only their co-occurrence on one line actually proves layer
+    // 3 was overridden. Real log format: "tensor blk.3.ffn_gate_exps.weight
+    // (1 MiB q4_K) buffer type overridden to RPC0[127.0.0.1:50052]".
+    std::regex overridden_layer_3(R"(blk\.3\.ffn_[a-z]+_exps\.weight [^\n]*overridden to RPC0\[127\.0\.0\.1:50052\])");
+    EXPECT_TRUE(std::regex_search(captured_log, overridden_layer_3)) << captured_log;
+
+    // Negative check: layer 4 was NOT placed on the placements list, so it
+    // must not have been overridden -- proving the override is specific to
+    // layer 3 rather than accidentally broad (e.g. a pattern bug matching
+    // every layer).
+    std::regex overridden_layer_4(R"(blk\.4\.ffn_[a-z]+_exps\.weight [^\n]*overridden to)");
+    EXPECT_FALSE(std::regex_search(captured_log, overridden_layer_4)) << captured_log;
 }
