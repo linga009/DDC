@@ -33,10 +33,18 @@ export class PeerRegistry {
       return false;
     }
     const now = this.clock();
-    const isExpired = now - peer.lastSeen > this.timeoutMs;
-    // Update lastSeen to revive the peer even if expired
+    if (now - peer.lastSeen > this.timeoutMs) {
+      // Already past the timeout -- treat this like an unknown peer rather
+      // than reviving it. Otherwise heartbeat's result for a stale peer
+      // would depend on whether some unrelated listActive() call happened
+      // to have scanned-and-pruned it first, which is a nondeterministic
+      // contract driven entirely by incidental traffic. Past-timeout now
+      // unconditionally means heartbeat() returns false.
+      this.peers.delete(peerId);
+      return false;
+    }
     peer.lastSeen = now;
-    return !isExpired;
+    return true;
   }
 
   deregister(peerId: string): boolean {
