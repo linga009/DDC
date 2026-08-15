@@ -85,6 +85,9 @@ InferenceEngine::InferenceEngine(const std::string& model_path,
     // same remote endpoint reuse one RPC connection instead of opening a new
     // one per layer.
     std::unordered_map<std::string, ggml_backend_buffer_type_t> endpoint_buft;
+    if (local_cpu == nullptr) {
+        throw std::runtime_error("no local CPU backend device available");
+    }
     endpoint_buft["local"] = ggml_backend_dev_buffer_type(local_cpu);
 
     for (const auto& endpoint : remote_endpoints) {
@@ -98,7 +101,11 @@ InferenceEngine::InferenceEngine(const std::string& model_path,
             devices_.push_back(dev);
         }
         if (n > 0) {
-            endpoint_buft[endpoint] = ggml_backend_dev_buffer_type(ggml_backend_reg_dev_get(rpc_reg, 0));
+            ggml_backend_buffer_type_t rpc_buft = ggml_backend_dev_buffer_type(ggml_backend_reg_dev_get(rpc_reg, 0));
+            if (rpc_buft == nullptr) {
+                throw std::runtime_error("failed to resolve buffer type for RPC endpoint: " + endpoint);
+            }
+            endpoint_buft[endpoint] = rpc_buft;
         }
     }
     devices_.push_back(nullptr);
