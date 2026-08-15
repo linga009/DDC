@@ -215,12 +215,20 @@ git commit -m "Add PeerRegistry: federation peer registration and liveness track
 - Consumes: `PeerRegistry` from Task 1, alongside the existing `NodeRegistry`/`ModelCatalog`.
 - Produces: `createServer` gains a new required parameter for the peer registry; new endpoints:
   ```
-  GET  /capacity              -> { activeNodes: number }
-  POST /peers/register        -> { peerId: string }, body: { endpoint: string }
-  GET  /peers                 -> PeerInfo[]
-  DELETE /peers/:peerId       -> 204, or 404 if unknown
-  GET  /catalog                -> now includes federated capacity from active peers
+  GET  /capacity                 -> { activeNodes: number }
+  POST /peers/register           -> { peerId: string }, body: { endpoint: string }
+  POST /peers/:peerId/heartbeat  -> 204, or 404 if unknown/expired
+  GET  /peers                    -> PeerInfo[]
+  DELETE /peers/:peerId          -> 204, or 404 if unknown
+  GET  /catalog                   -> now includes federated capacity from active peers
   ```
+
+  **Correction found during Task 2's whole-branch review (2026-08-16):** the original
+  version of this interface list omitted `POST /peers/:peerId/heartbeat` entirely, even
+  though `PeerRegistry` (Task 1) already implements `heartbeat()` and expires peers after
+  30s with no way to refresh them. Without this route, federation silently stops working
+  30 seconds after any peer registers — the review caught this by letting a test registry
+  actually expire, not by reading the code. Fixed here; see Task 2 Step 2 below.
   No later plan yet depends on this directly, but it's the surface a future request-routing plan would build on.
 
 - [ ] **Step 1: Write the failing tests**
