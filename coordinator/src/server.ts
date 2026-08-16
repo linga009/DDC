@@ -3,7 +3,7 @@ import { NodeRegistry, type DeviceTier } from "./registry.ts";
 import { ModelCatalog } from "./catalog.ts";
 import { PeerRegistry } from "./peer_registry.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
-import { ReputationTracker } from "./reputation_tracker.ts";
+import type { ReputationTracker } from "./reputation_tracker.ts";
 
 const VALID_DEVICE_TIERS: readonly DeviceTier[] = ["desktop", "android", "ios"];
 

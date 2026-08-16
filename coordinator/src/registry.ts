@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { ReputationTracker } from "./reputation_tracker.ts";
+import type { ReputationTracker } from "./reputation_tracker.ts";
 
 export type DeviceTier = "desktop" | "android" | "ios";
 

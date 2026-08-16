@@ -1,4 +1,4 @@
-interface NodeStats {
+export interface NodeStats {
   agreements: number;
   disagreements: number;
 }
@@ -15,6 +15,12 @@ export class ReputationTracker {
     minSamples: number = DEFAULT_MIN_SAMPLES,
     disagreementThreshold: number = DEFAULT_DISAGREEMENT_THRESHOLD,
   ) {
+    if (!Number.isInteger(minSamples) || minSamples < 1) {
+      throw new Error("minSamples must be a finite integer >= 1");
+    }
+    if (!Number.isFinite(disagreementThreshold) || disagreementThreshold <= 0 || disagreementThreshold > 1) {
+      throw new Error("disagreementThreshold must be a finite number with 0 < threshold <= 1");
+    }
     this.minSamples = minSamples;
     this.disagreementThreshold = disagreementThreshold;
   }

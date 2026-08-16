@@ -81,3 +81,20 @@ test("getStats for a never-seen node reports zero counts", () => {
   assert.equal(stats.agreements, 0);
   assert.equal(stats.disagreements, 0);
 });
+
+test("constructing with minSamples=0 throws", () => {
+  assert.throws(() => new ReputationTracker(0, 0.5));
+});
+
+test("constructing with disagreementThreshold=1.5 throws", () => {
+  assert.throws(() => new ReputationTracker(5, 1.5));
+});
+
+test("constructing with disagreementThreshold=0 throws (must be >0, not >=0)", () => {
+  assert.throws(() => new ReputationTracker(5, 0));
+});
+
+test("constructing with valid values does not throw", () => {
+  assert.doesNotThrow(() => new ReputationTracker());
+  assert.doesNotThrow(() => new ReputationTracker(3, 0.75));
+});

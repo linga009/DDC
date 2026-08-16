@@ -152,15 +152,21 @@ Endpoints:
 
 A node with zero recorded checks is trusted by default. Ejection (excluding
 the node from `GET /nodes`, `GET /capacity`, and `/catalog`'s active-node
-count) requires both a minimum sample size and a disagreement rate above
-threshold — a single unlucky or malicious disagreement doesn't eject a node
-instantly. **This plan does not implement the actual redundant-computation
-spot-check mechanism** (running the same request on two nodes and comparing
-outputs) — that requires a request-routing system this repo doesn't have
-yet. It only builds the reputation ledger and ejection policy, ready to be
-wired in once routing exists. Reputation endpoints themselves stay
-operable on an already-ejected node (so future spot-check results can
-still be recorded for it) — only capacity-facing views exclude it.
+count) requires both a minimum sample size and a disagreement rate at or
+above threshold — the defaults are `minSamples=5` and
+`disagreementThreshold=0.5`, and neither is currently runtime-configurable
+(both are `ReputationTracker` constructor parameters, hardcoded at their
+defaults in `main.ts`). This means a node doesn't eject on a single sample.
+This is not a defense against a malicious caller — the minSamples/threshold
+gate exists to absorb noisy or unlucky spot-check results, not adversarial
+ones; see the no-auth caveat below. **The coordinator does not implement
+the actual redundant-computation spot-check mechanism** (running the same
+request on two nodes and comparing outputs) — that requires a
+request-routing system this repo doesn't have yet. It only builds the
+reputation ledger and ejection policy, ready to be wired in once routing
+exists. Reputation endpoints themselves stay operable on an
+already-ejected node (so future spot-check results can still be recorded
+for it) — only capacity-facing views exclude it.
 
 **Caveat:** there is no authentication, and by default the server binds only
 to `127.0.0.1`; setting `HOST` to bind wider (e.g. `0.0.0.0`) should only be
@@ -171,3 +177,28 @@ so anyone able to reach this instance can add outbound request targets.
 The reputation-recording endpoints are likewise unauthenticated — currently
 any caller can record arbitrary agreement/disagreement events for any node.
 Reputation state is in-memory only and does not persist across restarts.
+
+**Known gaming vectors:** reputation is keyed by `nodeId`, and
+`NodeRegistry.register()` mints a fresh `randomUUID()` on every call with no
+endpoint dedupe (unlike `PeerRegistry`, which dedupes registrations by
+endpoint) — so an ejected node clears its record with one more
+`POST /nodes/register` call, restoring its `/capacity` count immediately.
+Verified live: 5 disagreements ejects a node; one re-register call and
+it's back with a clean slate. This is a stronger, cheaper vector than a
+node simply avoiding ever being spot-checked to stay perpetually
+"unproven, therefore trusted" under the zero-checks-trusted default above.
+Separately, the disagreement ratio is all-time with no decay or windowing,
+so an established node with a long good history (e.g. 200 agreements)
+needs 200 *consecutive* disagreements to be ejected — the inverse of
+catching a node that goes bad (compromised, degraded hardware) after
+building trust, and effectively un-ejectable at any realistic spot-check
+sampling rate. Fixing the first requires stable node identity
+(endpoint-keyed or node-supplied public key); fixing the second requires a
+sliding window or EWMA scoring function instead of a lifetime ratio. Both
+are out of scope for this ledger-only plan and are prerequisites for the
+future spot-check-mechanism plan. Note also that because every
+registration mints a fresh reputation entry with no eviction, a churning
+fleet leaks one entry per registration in the in-memory `Map` — the same
+stable-identity fix needed above would address this too; evicting on
+registry-prune alone is not attempted here, since it would open a new
+evasion path (go quiet for 30s to get a clean slate).
