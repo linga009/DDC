@@ -8,35 +8,59 @@ namespace swarm {
 
 namespace {
 
-// Locates the ':' that follows a top-level occurrence of `"key"` in `body`.
-//
-// A plain body.find("\"key\"") can match text inside an *earlier* key's
-// string value that happens to equal the target key name (e.g. body =
-// {"prompt":"n_predict","extra":"z","n_predict":5} while looking for
-// "n_predict": the first occurrence is the *value* of "prompt", not the
-// "n_predict" key). If left unguarded, the colon search that follows can
-// then latch onto an unrelated key's colon and either return the wrong
-// value or spuriously fail. Since JSON object keys are always immediately
-// preceded (modulo whitespace) by '{' or ',', checking that context is
-// enough to reject false matches without turning this into a real parser.
+// Returns the position of the ':' that follows a genuinely top-level
+// occurrence of "key" in `body` -- i.e. a key belonging to the outermost
+// JSON object, not one embedded inside a string value or nested inside a
+// nested object/array. Returns std::string::npos if no such top-level key
+// exists. Tracks {}/[] nesting depth in a single pass, correctly skipping
+// over string contents (respecting \" escapes within strings) so that
+// braces or quote characters inside string values never affect the depth
+// count or get mistaken for structural JSON syntax.
 size_t findTopLevelKeyColon(const std::string& body, const std::string& key) {
     std::string needle = "\"" + key + "\"";
-    size_t searchFrom = 0;
-    while (true) {
-        size_t keyPos = body.find(needle, searchFrom);
-        if (keyPos == std::string::npos) {
-            return std::string::npos;
+    int depth = 0;
+    bool inString = false;
+    for (size_t i = 0; i < body.size(); ++i) {
+        char c = body[i];
+        if (inString) {
+            if (c == '\\' && i + 1 < body.size()) {
+                ++i;  // skip the escaped character, whatever it is
+                continue;
+            }
+            if (c == '"') {
+                inString = false;
+            }
+            continue;
         }
-        size_t j = keyPos;
-        while (j > 0 && std::isspace(static_cast<unsigned char>(body[j - 1]))) {
-            --j;
+        if (c == '"') {
+            if (depth == 1 && body.compare(i, needle.size(), needle) == 0) {
+                // A textual match at depth 1 could be a *key* (immediately
+                // followed, modulo whitespace, by ':') or a top-level
+                // *string value* that merely happens to equal the key text
+                // (e.g. {"prompt":"n_predict","extra":"z","n_predict":5}
+                // while looking for "n_predict" -- "prompt"'s value matches
+                // the needle too). Only the former is a real key, so the
+                // colon must immediately follow the closing quote rather
+                // than being located via an unbounded forward search (which
+                // could latch onto an unrelated later key's colon).
+                size_t j = i + needle.size();
+                while (j < body.size() && std::isspace(static_cast<unsigned char>(body[j]))) {
+                    ++j;
+                }
+                if (j < body.size() && body[j] == ':') {
+                    return j;
+                }
+            }
+            inString = true;
+            continue;
         }
-        bool validKeyPosition = (j == 0) || body[j - 1] == '{' || body[j - 1] == ',';
-        if (validKeyPosition) {
-            return body.find(':', keyPos + needle.size());
+        if (c == '{' || c == '[') {
+            ++depth;
+        } else if (c == '}' || c == ']') {
+            --depth;
         }
-        searchFrom = keyPos + 1;
     }
+    return std::string::npos;
 }
 
 }  // namespace
@@ -59,6 +83,28 @@ bool extractJsonString(const std::string& body, const std::string& key, std::str
             if (next == '"') { result += '"'; i += 2; continue; }
             if (next == '\\') { result += '\\'; i += 2; continue; }
             if (next == 'n') { result += '\n'; i += 2; continue; }
+            if (next == 't') { result += '\t'; i += 2; continue; }
+            if (next == 'r') { result += '\r'; i += 2; continue; }
+            if (next == 'b') { result += '\b'; i += 2; continue; }
+            if (next == 'f') { result += '\f'; i += 2; continue; }
+            if (next == 'u' && i + 5 < body.size()) {
+                std::string hex = body.substr(i + 2, 4);
+                bool validHex = hex.size() == 4;
+                for (char hc : hex) {
+                    if (!std::isxdigit(static_cast<unsigned char>(hc))) { validHex = false; break; }
+                }
+                if (validHex) {
+                    unsigned int codepoint = static_cast<unsigned int>(std::stoul(hex, nullptr, 16));
+                    if (codepoint < 0x80) {
+                        result += static_cast<char>(codepoint);
+                        i += 6;
+                        continue;
+                    }
+                }
+                // Not a recognized \u00XX-below-0x80 form -- fall through to
+                // the default handling below (copy the backslash literally),
+                // same as any other unrecognized escape.
+            }
         }
         result += body[i];
         ++i;

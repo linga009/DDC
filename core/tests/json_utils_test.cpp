@@ -87,4 +87,41 @@ TEST(JsonUtilsTest, ReturnsFalseRatherThanThrowingOnAnOutOfRangeInteger) {
     EXPECT_FALSE(swarm::extractJsonInt(body, "n_predict", out));
 }
 
+// --- Task 2 fix-round tests: nested-key scoping + broadened escape set ---
+
+TEST(JsonUtilsTest, PrefersTheRealTopLevelKeyOverASameNamedNestedObjectKey) {
+    // "n_predict" appears twice: once as a key inside a nested object
+    // (the value of "prompt"), and once as the real top-level key. The
+    // key-matching logic must track brace/bracket nesting depth so it
+    // returns the top-level value (5), not the nested one (1).
+    std::string body = R"({"prompt":{"n_predict":1},"n_predict":5})";
+    int out = 0;
+    ASSERT_TRUE(swarm::extractJsonInt(body, "n_predict", out));
+    EXPECT_EQ(out, 5);
+}
+
+TEST(JsonUtilsTest, DecodesTabAndCarriageReturnEscapes) {
+    // JSON.stringify (used by this project's coordinator) emits \t and \r
+    // for tab and carriage-return characters, in addition to \n. These
+    // must decode to the literal characters, not pass through as literal
+    // backslash-letter pairs.
+    std::string out;
+    ASSERT_TRUE(swarm::extractJsonString(R"({"prompt":"line1\tindented\r\n"})", "prompt", out));
+    EXPECT_EQ(out, "line1\tindented\r\n");
+}
+
+TEST(JsonUtilsTest, RoundTripsTabCarriageReturnAndControlCharacterThroughEscapeAndExtract) {
+    // jsonEscapeString encodes a control character with no short escape
+    // letter (like 0x01) as a four-hex-digit \u00XX form. extractJsonString
+    // must decode that form (plus \t and \r) symmetrically, so escaping and
+    // extraction round-trip for the full short-escape-plus-\u00XX set.
+    std::string original = "tab\t cr\r ctrl";
+    original += static_cast<char>(0x01);
+    original += " end";
+    std::string body = R"({"prompt":")" + swarm::jsonEscapeString(original) + R"("})";
+    std::string out;
+    ASSERT_TRUE(swarm::extractJsonString(body, "prompt", out));
+    EXPECT_EQ(out, original);
+}
+
 }  // namespace
