@@ -8,6 +8,7 @@ import { ModelCatalog, type CatalogEntry } from "../src/catalog.ts";
 import { PeerRegistry } from "../src/peer_registry.ts";
 import { KeywordSafetyClassifier, type SafetyClassifier } from "../src/safety_classifier.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
+import { openApiDocument } from "../src/openapi.ts";
 
 const DEFAULT_TEST_CATALOG: CatalogEntry[] = [
   { id: "tinyllama-1.1b", displayName: "TinyLlama 1.1B", minActiveNodes: 0 },
@@ -982,6 +983,59 @@ test("GET /nodes/locality safely handles a node that self-reports localityGroup 
     // implementation reassigns it to the nodes array via the legacy
     // __proto__ setter.
     assert.equal(Object.getPrototypeOf(body), Object.prototype);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /openapi.json serves the OpenAPI document", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/openapi.json`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /application\/json/);
+    const body = await res.json();
+    assert.equal(body.openapi, "3.0.3");
+    assert.ok(body.paths["/catalog"], "expected /catalog to be documented");
+    assert.ok(body.paths["/nodes/{nodeId}/reputation"], "expected the reputation path template to be documented");
+  } finally {
+    server.close();
+  }
+});
+
+test("every path+method documented in openapi.json resolves to a real route (not a 404)", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    // Register one node and one peer first, so path-templated routes
+    // (/nodes/{nodeId}/..., /peers/{peerId}/...) have a real ID to substitute
+    // in and can be checked against their real (non-404) status rather than
+    // failing for the unrelated reason of "no such id".
+    const nodeRes = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+    });
+    const { nodeId } = await nodeRes.json();
+    const peerRes = await fetch(`${baseUrl}/peers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:9999" }),
+    });
+    const { peerId } = await peerRes.json();
+
+    const substitute = (path: string) => path.replace("{nodeId}", nodeId).replace("{peerId}", peerId);
+
+    for (const [path, methods] of Object.entries(openApiDocument.paths as Record<string, Record<string, unknown>>)) {
+      for (const method of Object.keys(methods)) {
+        const url = `${baseUrl}${substitute(path)}`;
+        const res = await fetch(url, {
+          method: method.toUpperCase(),
+          headers: method.toUpperCase() === "POST" ? { "content-type": "application/json" } : undefined,
+          body: method.toUpperCase() === "POST" ? "{}" : undefined,
+        });
+        assert.notEqual(res.status, 404, `${method.toUpperCase()} ${path} (documented in openapi.json) returned 404 -- route missing or path template wrong`);
+      }
+    }
   } finally {
     server.close();
   }

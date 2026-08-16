@@ -7,6 +7,7 @@ import { ModelCatalog } from "./catalog.ts";
 import { PeerRegistry } from "./peer_registry.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
+import { openApiDocument } from "./openapi.ts";
 
 const VALID_DEVICE_TIERS: readonly DeviceTier[] = ["desktop", "android", "ios"];
 
@@ -319,6 +320,11 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
 
       if (method === "GET" && parts.length === 1 && parts[0] === "style.css") {
         serveStaticFile(res, "style.css", "text/css; charset=utf-8");
+        return;
+      }
+
+      if (method === "GET" && parts.length === 1 && parts[0] === "openapi.json") {
+        sendJson(res, 200, openApiDocument);
         return;
       }
 
