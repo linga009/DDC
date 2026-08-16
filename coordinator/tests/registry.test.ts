@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { NodeRegistry } from "../src/registry.ts";
+import { ReputationTracker } from "../src/reputation_tracker.ts";
 
 test("register returns a nodeId, and the node is immediately active", () => {
   const registry = new NodeRegistry();
@@ -120,4 +121,23 @@ test("multiple nodes are tracked independently", () => {
 
   assert.notEqual(a, b);
   assert.equal(registry.listActive().length, 2);
+});
+
+test("listActive excludes a node the reputation tracker has marked untrusted", () => {
+  const registry = new NodeRegistry();
+  const reputation = new ReputationTracker(3, 0.5);
+  const nodeId = registry.register("127.0.0.1:50052", "desktop");
+
+  assert.equal(registry.listActive(reputation).length, 1);
+
+  for (let i = 0; i < 3; i++) {
+    reputation.recordDisagreement(nodeId);
+  }
+  assert.equal(registry.listActive(reputation).length, 0);
+});
+
+test("listActive without a reputation tracker argument behaves exactly as before (backward compatible)", () => {
+  const registry = new NodeRegistry();
+  registry.register("127.0.0.1:50052", "desktop");
+  assert.equal(registry.listActive().length, 1);
 });

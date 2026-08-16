@@ -3,6 +3,7 @@ import { NodeRegistry, type DeviceTier } from "./registry.ts";
 import { ModelCatalog } from "./catalog.ts";
 import { PeerRegistry } from "./peer_registry.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
+import { ReputationTracker } from "./reputation_tracker.ts";
 
 const VALID_DEVICE_TIERS: readonly DeviceTier[] = ["desktop", "android", "ios"];
 
@@ -59,14 +60,14 @@ async function fetchPeerCapacity(endpoint: string): Promise<number> {
   }
 }
 
-async function federatedActiveNodeCount(registry: NodeRegistry, peers: PeerRegistry): Promise<number> {
-  const local = registry.listActive().length;
+async function federatedActiveNodeCount(registry: NodeRegistry, peers: PeerRegistry, reputation: ReputationTracker): Promise<number> {
+  const local = registry.listActive(reputation).length;
   const peerCounts = await Promise.all(
     peers.listActive().map(peer => fetchPeerCapacity(peer.endpoint)));
   return local + peerCounts.reduce((sum, n) => sum + n, 0);
 }
 
-export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier) {
+export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier, reputation: ReputationTracker) {
   return createHttpServer(async (req, res) => {
     try {
       const method = req.method ?? "GET";
@@ -105,8 +106,44 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         return;
       }
 
+      if (method === "POST" && parts[0] === "nodes" && parts.length === 4 && parts[2] === "reputation" &&
+          (parts[3] === "agree" || parts[3] === "disagree")) {
+        // Existence check deliberately uses the UNFILTERED listActive() (no
+        // reputation argument): a node already ejected by reputation (i.e.
+        // excluded from the filtered view) is still a real, registered node,
+        // and further agree/disagree events must still be recordable against
+        // it. Only capacity-facing views (GET /nodes, /catalog) apply the
+        // reputation filter.
+        const exists = registry.listActive().some(n => n.nodeId === parts[1]);
+        if (!exists) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        if (parts[3] === "agree") {
+          reputation.recordAgreement(parts[1]);
+        } else {
+          reputation.recordDisagreement(parts[1]);
+        }
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      if (method === "GET" && parts[0] === "nodes" && parts.length === 3 && parts[2] === "reputation") {
+        const exists = registry.listActive().some(n => n.nodeId === parts[1]);
+        if (!exists) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        const stats = reputation.getStats(parts[1]);
+        sendJson(res, 200, { ...stats, trusted: reputation.isTrusted(parts[1]) });
+        return;
+      }
+
       if (method === "GET" && parts[0] === "nodes" && parts.length === 1) {
-        sendJson(res, 200, registry.listActive());
+        sendJson(res, 200, registry.listActive(reputation));
         return;
       }
 
@@ -179,7 +216,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
       }
 
       if (method === "GET" && parts[0] === "catalog" && parts.length === 1) {
-        const activeNodeCount = await federatedActiveNodeCount(registry, peers);
+        const activeNodeCount = await federatedActiveNodeCount(registry, peers, reputation);
         sendJson(res, 200, catalog.availability(activeNodeCount));
         return;
       }

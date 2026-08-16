@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { ReputationTracker } from "./reputation_tracker.ts";
 
 export type DeviceTier = "desktop" | "android" | "ios";
 
@@ -48,11 +49,14 @@ export class NodeRegistry {
     return true;
   }
 
-  listActive(): NodeInfo[] {
+  listActive(reputation?: ReputationTracker): NodeInfo[] {
     const now = this.clock();
     const active: NodeInfo[] = [];
     for (const [nodeId, node] of this.nodes) {
       if (now - node.lastSeen <= this.timeoutMs) {
+        if (reputation && !reputation.isTrusted(node.nodeId)) {
+          continue;
+        }
         active.push({ nodeId: node.nodeId, endpoint: node.endpoint, deviceTier: node.deviceTier });
       } else {
         // Expired -- prune it here rather than just leaving it out of the

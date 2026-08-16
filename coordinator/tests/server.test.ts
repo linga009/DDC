@@ -6,6 +6,7 @@ import { NodeRegistry } from "../src/registry.ts";
 import { ModelCatalog, type CatalogEntry } from "../src/catalog.ts";
 import { PeerRegistry } from "../src/peer_registry.ts";
 import { KeywordSafetyClassifier, type SafetyClassifier } from "../src/safety_classifier.ts";
+import { ReputationTracker } from "../src/reputation_tracker.ts";
 
 const DEFAULT_TEST_CATALOG: CatalogEntry[] = [
   { id: "tinyllama-1.1b", displayName: "TinyLlama 1.1B", minActiveNodes: 0 },
@@ -16,10 +17,11 @@ async function startTestServer(
   catalogEntries: CatalogEntry[] = DEFAULT_TEST_CATALOG,
   peers: PeerRegistry = new PeerRegistry(),
   classifier: SafetyClassifier = new KeywordSafetyClassifier([]),
+  reputation: ReputationTracker = new ReputationTracker(),
 ) {
   const registry = new NodeRegistry();
   const catalog = new ModelCatalog(catalogEntries);
-  const server = createServer(registry, catalog, peers, classifier);
+  const server = createServer(registry, catalog, peers, classifier, reputation);
 
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -649,6 +651,69 @@ test("POST /classify fails closed (safe:false) if the classifier hangs forever",
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.deepEqual(body, { safe: false, categories: ["classifier_error"] });
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /nodes/:nodeId/reputation/agree and /disagree record events, GET reports them", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const registerRes = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+    });
+    const { nodeId } = await registerRes.json();
+
+    await fetch(`${baseUrl}/nodes/${nodeId}/reputation/agree`, { method: "POST" });
+    await fetch(`${baseUrl}/nodes/${nodeId}/reputation/agree`, { method: "POST" });
+    await fetch(`${baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST" });
+
+    const statsRes = await fetch(`${baseUrl}/nodes/${nodeId}/reputation`);
+    assert.equal(statsRes.status, 200);
+    const stats = await statsRes.json();
+    assert.equal(stats.agreements, 2);
+    assert.equal(stats.disagreements, 1);
+    assert.equal(stats.trusted, true);
+  } finally {
+    server.close();
+  }
+});
+
+test("reputation endpoints return 404 for an unknown nodeId", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes/never-registered/reputation/agree`, { method: "POST" });
+    assert.equal(res.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("a node ejected by reputation disappears from GET /nodes and stops counting toward catalog capacity", async () => {
+  const catalogEntries = [{ id: "small", displayName: "Small", minActiveNodes: 1 }];
+  const { server, baseUrl } = await startTestServer(catalogEntries);
+  try {
+    const registerRes = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+    });
+    const { nodeId } = await registerRes.json();
+
+    const beforeCatalog = await (await fetch(`${baseUrl}/catalog`)).json();
+    assert.equal(beforeCatalog.find((e: any) => e.id === "small").available, true);
+
+    for (let i = 0; i < 5; i++) {
+      await fetch(`${baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST" });
+    }
+
+    const nodesRes = await fetch(`${baseUrl}/nodes`);
+    assert.equal((await nodesRes.json()).length, 0);
+
+    const afterCatalog = await (await fetch(`${baseUrl}/catalog`)).json();
+    assert.equal(afterCatalog.find((e: any) => e.id === "small").available, false);
   } finally {
     server.close();
   }
