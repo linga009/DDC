@@ -123,15 +123,22 @@ Spec: [`docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md`](
 | 10 | [Web chat/dashboard client](docs/superpowers/plans/2026-08-16-web-chat-client.md) (rescoped from native apps — see plan's Scope correction) | Done |
 | 11 | [Developer API](docs/superpowers/plans/2026-08-16-developer-api.md) (OpenAPI spec + typed `SwarmClient`) | Done |
 
-**All 11 plans complete.** The repo now has: a working single/multi-node C++ inference engine with speculative decoding and MoE layer placement; a federated Node.js coordinator with node/peer registries, capacity-gated model catalog, a safety-classifier gate (ships with zero rules by default — disclosed, not solved), a reputation/ejection ledger, locality-aware node grouping, a browser dashboard, and a documented+typed developer API. The connective tissue still missing, called out in every plan since Plan 6: no request-routing or pipeline-assembly system exists yet, so no client can get an actual generated response end-to-end. That is the natural next major initiative.
+**Plans 1–11 complete.** These built every piece the original spec calls for *except* the ability to actually route a prompt to a real generated response: a working single/multi-node C++ inference engine with speculative decoding and MoE layer placement; a federated Node.js coordinator with node/peer registries, capacity-gated model catalog, a safety-classifier gate (ships with zero rules by default — disclosed, not solved), a reputation/ejection ledger, locality-aware node grouping, a browser dashboard, and a documented+typed developer API.
 
 **Plan 10 scope note:** the master spec originally called for native Android/iOS/Linux/Windows/macOS client apps. This dev environment is Windows-only with no mobile/desktop client toolchain installed, and iOS is categorically impossible to build/test without a Mac — when asked, the user chose to rescope Plan 10 to a browser-based dashboard served directly by the coordinator (`GET /`, `/app.js`, `/style.css`) instead. It shows live swarm status and a `/classify` demo; it does not attempt real inference, and its `/classify` demo is backed by the same zero-rule default classifier as the endpoint itself (see the "Coordinator" section below) — both gaps are visibly disclosed in the page's own UI, not just in docs. Native apps remain undesigned and deferred.
 
-None of Plans 1–9 implement actual multi-hop request routing or pipeline
-assembly end-to-end — each one built the piece the spec calls for
-(sharding mechanics, capacity tracking, federation, safety gate, reputation
-ledger, locality grouping) *ready to be wired into* a routing system that
-doesn't exist in this repo yet. That routing system is the connective
-tissue still missing across every plan so far — keep this in mind when
-scoping Plans 10/11 or any future plan that assumes requests are actually
-flowing end-to-end today.
+### Request routing & pipeline assembly (the initiative after Plans 1–11)
+
+Design: [`docs/superpowers/specs/2026-08-16-request-routing-design.md`](docs/superpowers/specs/2026-08-16-request-routing-design.md) — read this for the full Phase A/B/C/D roadmap and the reasoning behind it (chosen deliberately for genuine multi-node sharding as v1, not a simpler single-node path — this is the project's actual differentiator).
+
+| Phase | Plan | Status |
+|---|------|--------|
+| A (C++ side) | [swarm-node-agent](docs/superpowers/plans/2026-08-16-swarm-node-agent.md) — a long-lived process wrapping `InferenceEngine` behind a minimal hand-rolled HTTP server (`GET /health`, `POST /complete`) | Done |
+| A (coordinator side) | [Coordinator request routing](docs/superpowers/plans/2026-08-16-coordinator-request-routing.md) — `POST /generate`: classify → find a node with a matching `servesModel` → forward → respond | Written, not yet executed |
+| B | Coordinator-driven dynamic pipeline assembly (which nodes form a pipeline, chosen live from the registry/reputation/locality data every prior plan built) | Not yet designed |
+| C | Background pre-warming + demand-based autoscaling of the warm-pipeline pool per model | Not yet designed |
+| D | Token streaming (`InferenceEngine::complete()` is fully blocking today — no per-token callback exists yet) | Not yet designed |
+
+**Phase A is real, not a demo:** `swarm-node-agent --remote <endpoint>` genuinely runs RPC-sharded multi-node inference and MoE layer placement over real HTTP, verified live during whole-branch review (not just unit-tested) — see the plan's own progress ledger for the adversarial-probing details. Known, disclosed limitations of the walking skeleton: single-threaded (one request at a time), `n_predict` capped at 512 at the agent level, `/health` reflects startup-only readiness (a dead remote RPC device crashes the whole agent process on its next request — an uncatchable upstream `GGML_ABORT`, not something this phase fixes), and pipeline composition is entirely operator-configured via CLI flags at agent startup — nothing dynamic yet (that's Phase B).
+
+**Every plan before Phase A** (1–11) built one piece of infrastructure *ready to be wired into* a routing system that didn't exist yet — this was true up through Plan 11 and is why every one of those plans has a "Scope correction" or "What this plan does not do" section naming the gap. Phase A is the first plan to actually close it, end to end, for a single manually-configured pipeline. Phases B–D are what make that dynamic, warm-ahead-of-demand, and streaming.
