@@ -35,13 +35,16 @@ coordinator service, safety gate, reputation ledger, locality grouping, web
 dashboard, developer API) exists to eventually route real requests to a
 swarm of these engines instead of one.
 
-**Current status:** 11 of the project's implementation plans are complete —
-see [`CLAUDE.md`](CLAUDE.md)'s Plan Roadmap for exactly what's built versus
-what's still ahead. In short: the compute engine, a federated coordinator
-service, and a browser client all work and are tested; the one piece still
-missing across every plan so far is the request-routing/pipeline-assembly
-system that would let a client actually get a generated response back from
-the swarm end-to-end. That's the natural next place to contribute.
+**Current status:** 11 of the project's implementation plans are complete,
+and Phase A of the request-routing initiative that follows them is done too
+— see [`CLAUDE.md`](CLAUDE.md)'s Plan Roadmap for exactly what's built
+versus what's still ahead. In short: the compute engine, a federated
+coordinator service, a browser client, and a working end-to-end
+request-routing path (`POST /generate`, routing a prompt through the safety
+gate to a real `swarm-node-agent` and back) all work and are tested. What's
+still missing is dynamic node selection instead of manual registration
+(Phase B), background pre-warming/autoscaling of warm pipelines (Phase C),
+and token streaming (Phase D). That's the natural next place to contribute.
 
 ## Get involved
 
@@ -49,9 +52,12 @@ This is early, real infrastructure — not a finished product — and it's
 built in the open specifically so people can pick up a piece of it. Useful
 ways to help right now:
 
-- **Request routing / pipeline assembly** — the biggest open gap (see
-  above). Every existing piece (capacity tracking, safety gate, reputation,
-  locality) is groundwork waiting for this.
+- **Dynamic pipeline assembly, pre-warming, and streaming** — Phases B, C,
+  and D of the request-routing initiative (see above); manual, single-node,
+  non-streaming routing (Phase A) is done, but nothing dynamic,
+  demand-driven, or streamed exists yet. Every existing piece (capacity
+  tracking, safety gate, reputation, locality) is groundwork waiting for
+  this.
 - **Client apps** — this repo currently ships a browser dashboard only
   (native mobile/desktop apps were deliberately deferred — see
   [`CLAUDE.md`](CLAUDE.md)'s Plan 10 note for why).
@@ -202,7 +208,13 @@ It exposes two HTTP endpoints:
   default (64); only a valid, in-range-parsed-but-out-of-bounds integer
   triggers the `400`. Even within the 512 cap, a single request can still
   take significant time depending on model size and node hardware — this
-  cap bounds the worst case, it does not guarantee a fast response.
+  cap bounds the worst case, it does not guarantee a fast response. Note
+  that this cap bounds *generation* length only, not prompt processing
+  time: live testing found that a request with a very long prompt (not a
+  long `n_predict`) can still tie up this single-threaded agent for over a
+  minute before failing, since there is currently no bound on prompt
+  length or prompt-processing time at either the coordinator or the agent
+  level.
 
 JSON string values (like `prompt`) are decoded assuming standard
 `JSON.stringify`-style escaping. A client using a JSON library that escapes
@@ -210,14 +222,20 @@ non-ASCII characters as `\uXXXX` for codepoints at or above `0x80` (e.g.
 Python's `json.dumps` with its default `ensure_ascii=True`) will have those
 characters corrupted, since only `\u00XX` (codepoints below `0x80`) is
 decoded here. Requests built with `JSON.stringify` (as this project's
-coordinator does) are unaffected.
+coordinator does) are unaffected for normal Unicode text. One narrow
+exception: a lone/unpaired UTF-16 surrogate in a prompt (a rare, malformed
+input, not a normal usage concern) is itself emitted by `JSON.stringify` as
+a literal `\udXXX` escape sequence, which this agent's decoder does not
+turn back into a real character — live-verified, it round-trips as the
+6-character escape text, not a character. So the "coordinator is
+unaffected" claim above does not fully cover this specific edge case.
 
 Like `swarm-rpc-server`, this is a minimal building block: it serves one
 request at a time, with no concurrency, request queueing, authentication,
-or clean-shutdown path — it runs until killed. Nothing in this repo calls
-`swarm-node-agent` yet; it is the first HTTP-reachable wrapper around
-`InferenceEngine`, ready for a future coordinator-side request router
-(Plan 13) to call.
+or clean-shutdown path — it runs until killed. The coordinator's
+`POST /generate` (see the Coordinator service section below) is now a real
+caller of this agent's `POST /complete` endpoint — the first thing in this
+repo to actually route a request to `InferenceEngine` over HTTP end to end.
 
 ## Coordinator service
 
@@ -248,6 +266,10 @@ Endpoints:
   for. Like `localityGroup`, this is **self-reported and unverified** — the
   coordinator does not check that a node actually has the declared model
   loaded and ready; `POST /generate` (see below) trusts it at routing time.
+  Combined with the no-auth posture, this means anyone can register an
+  endpoint claiming to serve a given model and start receiving real
+  `/generate` traffic for it — see the known gaming vectors below for the
+  sharper version of this involving reputation ejection.
 - `POST /nodes/:nodeId/heartbeat` — refresh a node's liveness
 - `GET /nodes` — list currently active nodes
 - `GET /nodes/locality` — active nodes bucketed by their self-reported
@@ -304,7 +326,11 @@ request-routing system that didn't exist yet; this is that system's first
 piece. It requires at least one `swarm-node-agent` process (see the Node
 agent section above) to be running and registered via `POST
 /nodes/register` with a `servesModel` value matching the requested
-`modelId` — without one, every call to `/generate` returns `503`. This is
+`modelId` — without one, every call to `/generate` returns `503`. That node
+must also keep sending `POST /nodes/:nodeId/heartbeat` periodically (the
+same 30-second liveness timeout every other endpoint relies on) — once it
+ages out of the registry from a missed heartbeat, `/generate` stops finding
+it and returns `503` again, exactly as if it had never registered. This is
 still only Phase A of the request-routing initiative: node selection is a
 simple first-match scan over active nodes (not load- or locality-aware),
 there is no background pre-warming of pipelines ahead of demand, and there
@@ -326,10 +352,12 @@ This is not a defense against a malicious caller — the minSamples/threshold
 gate exists to absorb noisy or unlucky spot-check results, not adversarial
 ones; see the no-auth caveat below. **The coordinator does not implement
 the actual redundant-computation spot-check mechanism** (running the same
-request on two nodes and comparing outputs) — that requires a
-request-routing system this repo doesn't have yet. It only builds the
-reputation ledger and ejection policy, ready to be wired in once routing
-exists. Reputation endpoints themselves stay operable on an
+request on two independently-chosen nodes and comparing outputs) —
+`POST /generate` (Phase A, see below) only selects and calls a single node
+per request, with no redundant dispatch to a second node for comparison, so
+this specific dual-node mechanism still doesn't exist. It only builds the
+reputation ledger and ejection policy, ready to be wired into a future
+dual-node dispatch path. Reputation endpoints themselves stay operable on an
 already-ejected node (so future spot-check results can still be recorded
 for it) — only capacity-facing views exclude it.
 
@@ -352,7 +380,14 @@ Verified live: 5 disagreements ejects a node; one re-register call and
 it's back with a clean slate. This is a stronger, cheaper vector than a
 node simply avoiding ever being spot-checked to stay perpetually
 "unproven, therefore trusted" under the zero-checks-trusted default above.
-Separately, the disagreement ratio is all-time with no decay or windowing,
+Since `POST /generate` now exists, ejecting a legitimate node this way is
+no longer just about restoring a `/capacity` count: verified live, an
+attacker who has separately registered their own endpoint with a
+`servesModel` matching the ejected node's model becomes the sole remaining
+match for that model, so every subsequent `/generate` call for it —
+including real user prompts — gets routed to the attacker's node, which can
+return arbitrary attacker-controlled text as if it were the real model's
+output. Separately, the disagreement ratio is all-time with no decay or windowing,
 so an established node with a long good history (e.g. 200 agreements)
 needs 200 *consecutive* disagreements to be ejected — the inverse of
 catching a node that goes bad (compromised, degraded hardware) after
@@ -395,11 +430,13 @@ paragraph rather than repeating it here. Separately, a node can also
 register with `localityGroup: "ungrouped"` verbatim, which is
 indistinguishable from a node that never set the field at all. `GET
 /nodes/locality` exists purely as a stable, queryable interface for
-grouping; no pipeline-assembly or request-routing system in this repo yet
-consumes it (see the federation caveat above — this repo has no
-cross-instance or cross-node request routing at all yet), and no
-client-side mesh-discovery mechanism (WiFi Direct, Multipeer Connectivity,
-LAN broadcast) yet exists to produce real, verifiable locality identifiers.
+grouping; no pipeline-assembly or locality-aware request-routing system in
+this repo yet consumes it — `POST /generate` (Phase A, see below) is a
+simple first-match scan over active nodes with no locality-awareness at
+all, and this repo still has no cross-instance (federated) or multi-node
+pipeline-aware request routing of any kind. No client-side mesh-discovery
+mechanism (WiFi Direct, Multipeer Connectivity, LAN broadcast) yet exists
+to produce real, verifiable locality identifiers, either.
 Both are expected to be built against this interface later.
 
 ## Developer API
@@ -450,12 +487,13 @@ list above). It shows:
 - **A `/classify` demo** — a text box and button that submit a prompt to
   `POST /classify` and display the resulting `safe`/`categories` verdict.
 
-**The dashboard does not run real inference.** It only demonstrates the
-existing safety-gate endpoint; there is no request-routing/pipeline-assembly
-system anywhere in this repo yet to actually generate a response from a
-model, so the client visibly discloses this in its own UI rather than
-faking it. The client is same-origin only, with no authentication — matching
-the coordinator's existing no-auth posture described above. As with the
-`/classify` endpoint itself (see above), the shipped classifier has zero
-rules by default, so the demo currently reports every prompt as `safe:
-true`; the dashboard's own notice discloses this.
+**The dashboard's own demo button does not run real inference.** It only
+calls `POST /classify`, not `POST /generate` — a real inference-request
+endpoint exists and works (see the Coordinator service section above), but
+this dashboard was never wired up to call it, and the client visibly
+discloses this gap in its own UI rather than faking it. The client is
+same-origin only, with no authentication — matching the coordinator's
+existing no-auth posture described above. As with the `/classify` endpoint
+itself (see above), the shipped classifier has zero rules by default, so
+the demo currently reports every prompt as `safe: true`; the dashboard's
+own notice discloses this.

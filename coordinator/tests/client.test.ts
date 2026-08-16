@@ -46,7 +46,7 @@ test("SwarmClient registers a node and lists it", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
     const client = new SwarmClient(baseUrl);
-    const nodeId = await client.registerNode("127.0.0.1:50052", "desktop");
+    const nodeId = await client.registerNode("http://127.0.0.1:50052", "desktop");
     assert.equal(typeof nodeId, "string");
 
     const nodes = await client.listNodes();
@@ -61,7 +61,7 @@ test("SwarmClient heartbeat returns true for a known node and false for an unkno
   const { server, baseUrl } = await startTestServer();
   try {
     const client = new SwarmClient(baseUrl);
-    const nodeId = await client.registerNode("127.0.0.1:50052", "desktop");
+    const nodeId = await client.registerNode("http://127.0.0.1:50052", "desktop");
     assert.equal(await client.heartbeat(nodeId), true);
     assert.equal(await client.heartbeat("never-registered"), false);
   } finally {
@@ -73,7 +73,7 @@ test("SwarmClient records reputation events and reads them back", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
     const client = new SwarmClient(baseUrl);
-    const nodeId = await client.registerNode("127.0.0.1:50052", "desktop");
+    const nodeId = await client.registerNode("http://127.0.0.1:50052", "desktop");
     assert.equal(await client.recordAgreement(nodeId), true);
     assert.equal(await client.recordDisagreement(nodeId), true);
 
@@ -92,7 +92,7 @@ test("SwarmClient reads capacity and catalog", async () => {
     const client = new SwarmClient(baseUrl);
     assert.equal(await client.getCapacity(), 0);
 
-    await client.registerNode("127.0.0.1:50052", "desktop");
+    await client.registerNode("http://127.0.0.1:50052", "desktop");
     assert.equal(await client.getCapacity(), 1);
 
     const catalog = await client.getCatalog();
@@ -107,7 +107,7 @@ test("SwarmClient lists nodes grouped by locality", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
     const client = new SwarmClient(baseUrl);
-    await client.registerNode("127.0.0.1:50052", "desktop", "kitchen-mesh");
+    await client.registerNode("http://127.0.0.1:50052", "desktop", "kitchen-mesh");
     const groups = await client.listNodesByLocality();
     assert.equal((groups["kitchen-mesh"] as unknown[]).length, 1);
   } finally {
@@ -150,7 +150,7 @@ test("SwarmClient.registerNode rejects with the server's error detail on a 400",
   try {
     const client = new SwarmClient(baseUrl);
     await assert.rejects(
-      () => client.registerNode("127.0.0.1:50052", "toaster" as any),
+      () => client.registerNode("http://127.0.0.1:50052", "toaster" as any),
       (err: Error) => {
         assert.match(err.message, /deviceTier must be one of/);
         return true;

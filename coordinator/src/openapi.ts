@@ -6,8 +6,12 @@ export const openApiDocument = {
     description:
       "Federated LLM inference coordinator: node/peer registry, capacity " +
       "tracking, model catalog gating, safety classification, reputation, " +
-      "and locality grouping. Does not yet expose an inference-request " +
-      "endpoint -- no request-routing system exists in this repo yet.",
+      "locality grouping, and request routing. POST /generate is the " +
+      "first inference-request endpoint in this repo -- it classifies a " +
+      "prompt, routes it to a single active node whose self-reported " +
+      "servesModel matches (first-match, no locality-awareness, no " +
+      "retry/fallback), and returns the generated text. Dynamic node " +
+      "selection, pre-warming, and streaming are not implemented yet.",
   },
   paths: {
     "/nodes/register": {
@@ -231,9 +235,30 @@ export const openApiDocument = {
         },
         responses: {
           "200": { description: "Generated text", content: { "application/json": { schema: { type: "object", properties: { text: { type: "string" } } } } } },
-          "400": { description: "Invalid request, or the prompt was classified unsafe", content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } } },
-          "503": { description: "No active node currently serves the requested model" },
-          "502": { description: "The selected node was unreachable or returned a malformed response" },
+          "400": {
+            description:
+              "Invalid request, or the prompt was classified unsafe. Two distinct shapes are possible: a " +
+              "generic validation error ({ error: string }), or a classify-rejected prompt, which returns " +
+              "the safety verdict itself ({ safe: false, categories: string[] }) instead.",
+            content: {
+              "application/json": {
+                schema: {
+                  oneOf: [
+                    { type: "object", properties: { error: { type: "string" } }, required: ["error"] },
+                    { type: "object", properties: { safe: { type: "boolean" }, categories: { type: "array", items: { type: "string" } } }, required: ["safe", "categories"] },
+                  ],
+                },
+              },
+            },
+          },
+          "503": {
+            description: "No active node currently serves the requested model",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+          "502": {
+            description: "The selected node was unreachable or returned a malformed response",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
         },
       },
     },

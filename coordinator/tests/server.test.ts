@@ -40,7 +40,7 @@ test("POST /nodes/register returns a nodeId and the node appears in the catalog'
     const registerRes = await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
     assert.equal(registerRes.status, 200);
     const { nodeId } = await registerRes.json();
@@ -62,7 +62,7 @@ test("POST /nodes/:nodeId/heartbeat returns 204 for a known node and 404 for an 
     const registerRes = await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
     const { nodeId } = await registerRes.json();
 
@@ -82,13 +82,13 @@ test("GET /nodes lists active nodes", async () => {
     await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
 
     const res = await fetch(`${baseUrl}/nodes`);
     const nodes = await res.json();
     assert.equal(nodes.length, 1);
-    assert.equal(nodes[0].endpoint, "127.0.0.1:50052");
+    assert.equal(nodes[0].endpoint, "http://127.0.0.1:50052");
   } finally {
     server.close();
   }
@@ -112,7 +112,7 @@ test("POST /nodes/register with malformed JSON returns 400 and the server surviv
     const goodRes = await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
     assert.equal(goodRes.status, 200);
     const { nodeId } = await goodRes.json();
@@ -138,13 +138,70 @@ test("POST /nodes/register rejects a non-string endpoint with 400", async () => 
   }
 });
 
+test("POST /nodes/register rejects a scheme-less endpoint with 400", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(typeof body.error, "string");
+
+    // Confirm nothing was actually registered.
+    const nodesRes = await fetch(`${baseUrl}/nodes`);
+    assert.equal((await nodesRes.json()).length, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /nodes/register rejects a non-http(s) scheme endpoint with 400", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "ftp://127.0.0.1:50052", deviceTier: "desktop" }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(typeof body.error, "string");
+
+    // Confirm nothing was actually registered.
+    const nodesRes = await fetch(`${baseUrl}/nodes`);
+    assert.equal((await nodesRes.json()).length, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /nodes/register normalizes away a trailing slash on endpoint", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052/", deviceTier: "desktop" }),
+    });
+    assert.equal(res.status, 200);
+
+    const nodes = await (await fetch(`${baseUrl}/nodes`)).json();
+    assert.equal(nodes[0].endpoint, "http://127.0.0.1:50052");
+  } finally {
+    server.close();
+  }
+});
+
 test("POST /nodes/register rejects an invalid deviceTier with 400", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
     const res = await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "toaster" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "toaster" }),
     });
     assert.equal(res.status, 400);
     const body = await res.json();
@@ -188,7 +245,7 @@ test("GET /capacity reports the active node count", async () => {
     await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
 
     const res = await fetch(`${baseUrl}/capacity`);
@@ -341,7 +398,7 @@ test("GET /catalog aggregates a live peer's reported capacity with local capacit
   await fetch(`${baseUrlB}/nodes/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+    body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
   });
 
   const { server: serverA, baseUrl: baseUrlA } = await startTestServer(catalogEntries);
@@ -417,7 +474,7 @@ test("GET /catalog treats a peer reporting negative activeNodes as contributing 
     await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
 
     await fetch(`${baseUrl}/peers/register`, {
@@ -664,7 +721,7 @@ test("POST /nodes/:nodeId/reputation/agree and /disagree record events, GET repo
     const registerRes = await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
     const { nodeId } = await registerRes.json();
 
@@ -700,7 +757,7 @@ test("a node ejected by reputation disappears from GET /nodes and stops counting
     const registerRes = await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
     const { nodeId } = await registerRes.json();
 
@@ -738,7 +795,7 @@ test("POST /nodes/register accepts an optional localityGroup and it is echoed ba
     const registerRes = await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop", localityGroup: "kitchen-mesh" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: "kitchen-mesh" }),
     });
     assert.equal(registerRes.status, 200);
 
@@ -755,7 +812,7 @@ test("POST /nodes/register rejects a non-string localityGroup", async () => {
     const res = await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop", localityGroup: 42 }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: 42 }),
     });
     assert.equal(res.status, 400);
   } finally {
@@ -769,7 +826,7 @@ test("POST /nodes/register rejects an empty-string localityGroup", async () => {
     const res = await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop", localityGroup: "" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: "" }),
     });
     assert.equal(res.status, 400);
   } finally {
@@ -783,12 +840,12 @@ test("GET /nodes/locality groups registered nodes by their localityGroup, with u
     await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop", localityGroup: "kitchen-mesh" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: "kitchen-mesh" }),
     });
     await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50053", deviceTier: "android" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50053", deviceTier: "android" }),
     });
 
     const res = await fetch(`${baseUrl}/nodes/locality`);
@@ -807,7 +864,7 @@ test("GET /nodes/locality excludes a node ejected by reputation", async () => {
     const registerRes = await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop", localityGroup: "kitchen-mesh" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: "kitchen-mesh" }),
     });
     const { nodeId } = await registerRes.json();
 
@@ -961,7 +1018,7 @@ test("GET /nodes/locality safely handles a node that self-reports localityGroup 
     await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop", localityGroup: "__proto__" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: "__proto__" }),
     });
 
     const res = await fetch(`${baseUrl}/nodes/locality`);
@@ -977,7 +1034,7 @@ test("GET /nodes/locality safely handles a node that self-reports localityGroup 
     // both the buggy and fixed cases).
     assert.equal(Object.prototype.hasOwnProperty.call(body, "__proto__"), true);
     assert.equal(body["__proto__"].length, 1);
-    assert.equal(body["__proto__"][0].endpoint, "127.0.0.1:50052");
+    assert.equal(body["__proto__"][0].endpoint, "http://127.0.0.1:50052");
 
     // The object's actual prototype must remain untouched -- a buggy
     // implementation reassigns it to the nodes array via the legacy
@@ -1013,7 +1070,7 @@ test("every path+method documented in openapi.json resolves to a real route (not
     const nodeRes = await fetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
     const { nodeId } = await nodeRes.json();
     const peerRes = await fetch(`${baseUrl}/peers/register`, {

@@ -111,6 +111,24 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           sendJson(res, 400, { error: "endpoint must be a non-empty string" });
           return;
         }
+        let parsedNodeEndpoint: URL;
+        try {
+          parsedNodeEndpoint = new URL(candidate.endpoint);
+        } catch {
+          sendJson(res, 400, { error: "endpoint must be a valid URL" });
+          return;
+        }
+        if (parsedNodeEndpoint.protocol !== "http:" && parsedNodeEndpoint.protocol !== "https:") {
+          sendJson(res, 400, { error: "endpoint must use http or https" });
+          return;
+        }
+        // Normalize away a trailing slash, same reasoning as POST
+        // /peers/register below: POST /generate builds outbound URLs as
+        // `${node.endpoint}/complete`, and an unnormalized trailing slash
+        // would produce a malformed `...//complete` request that silently
+        // fails at generate-time instead of being caught here at
+        // registration time.
+        const normalizedNodeEndpoint = parsedNodeEndpoint.href.replace(/\/$/, "");
         if (typeof candidate.deviceTier !== "string" || !VALID_DEVICE_TIERS.includes(candidate.deviceTier as DeviceTier)) {
           sendJson(res, 400, { error: "deviceTier must be one of: desktop, android, ios" });
           return;
@@ -131,7 +149,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           }
           servesModel = candidate.servesModel;
         }
-        const nodeId = registry.register(candidate.endpoint, candidate.deviceTier as DeviceTier, localityGroup, servesModel);
+        const nodeId = registry.register(normalizedNodeEndpoint, candidate.deviceTier as DeviceTier, localityGroup, servesModel);
         sendJson(res, 200, { nodeId });
         return;
       }
