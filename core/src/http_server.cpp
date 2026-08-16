@@ -1,6 +1,7 @@
 #include "swarm/http_server.h"
 
 #include <cctype>
+#include <csignal>
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>
@@ -23,6 +24,15 @@ static constexpr socket_t kInvalidSocket = -1;
 namespace swarm {
 
 namespace {
+
+// Generous for a JSON prompt body, small enough to bound memory use from a
+// single connection.
+constexpr size_t kMaxRequestBodyBytes = 10 * 1024 * 1024;  // 10 MiB
+
+// Generous for a small, fixed set of headers this server expects, small
+// enough to bound memory use from a connection that never sends a
+// terminator.
+constexpr size_t kMaxHeaderBytes = 16 * 1024;  // 16 KiB
 
 void closeSocket(socket_t s) {
 #ifdef _WIN32
@@ -60,6 +70,9 @@ std::string readUntilHeadersEnd(socket_t s) {
     std::string data;
     char buf[4096];
     while (data.find("\r\n\r\n") == std::string::npos) {
+        if (data.size() > kMaxHeaderBytes) {
+            throw std::runtime_error("request headers too large");
+        }
         long long n = recvBytes(s, buf, sizeof(buf));
         if (n <= 0) {
             throw std::runtime_error("connection closed before headers completed");
@@ -123,7 +136,20 @@ ParsedHead parseHead(const std::string& head, std::string& bodySoFar) {
             std::string value = headerLine.substr(colon + 1);
             size_t firstDigit = value.find_first_not_of(" \t");
             if (firstDigit != std::string::npos) {
-                result.contentLength = static_cast<size_t>(std::stoul(value.substr(firstDigit)));
+                if (value[firstDigit] == '-') {
+                    // std::stoul accepts a leading '-' and silently wraps it
+                    // into a huge unsigned value (per strtoul's documented
+                    // behavior) instead of throwing -- reject explicitly so
+                    // "Content-Length: -5" is treated as malformed rather
+                    // than as a request to read billions of bytes of body.
+                    throw std::runtime_error("invalid Content-Length");
+                }
+                unsigned long parsed = std::stoul(value.substr(firstDigit));
+                if (parsed > kMaxRequestBodyBytes) {
+                    throw std::runtime_error(
+                        "Content-Length exceeds maximum allowed request body size");
+                }
+                result.contentLength = static_cast<size_t>(parsed);
             }
         }
     }
@@ -176,6 +202,17 @@ void HttpServer::route(const std::string& method, const std::string& path, HttpH
 }
 
 void HttpServer::run() {
+#ifndef _WIN32
+    // Writing to a socket after the peer has reset the connection raises
+    // SIGPIPE on POSIX, whose default disposition terminates the whole
+    // process -- not just the current connection. Ignore it once here (run()
+    // is only ever called once, at process startup, and blocks forever) so a
+    // client that disconnects early just yields a normal failed send()
+    // instead of killing the server. No-op on Windows, where the equivalent
+    // failure is already a plain SOCKET_ERROR return.
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
 #ifdef _WIN32
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);

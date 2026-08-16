@@ -130,4 +130,49 @@ TEST_F(HttpServerFixture, ReturnsA400ForAMalformedRequestLine) {
     EXPECT_NE(response.find("HTTP/1.1 400"), std::string::npos);
 }
 
+TEST_F(HttpServerFixture, ReturnsA400ForANegativeContentLength) {
+    swarm::HttpServer server(kTestPort + 4);
+    server.route("POST", "/echo", [](const swarm::HttpRequest&) {
+        return swarm::HttpResponse{200, R"({"ok":true})"};
+    });
+    startServer(server);
+
+    // "-5" must be rejected outright rather than accepted by std::stoul's
+    // silent unsigned wraparound (which would otherwise turn it into a
+    // request to read billions of bytes of body).
+    std::string request = "POST /echo HTTP/1.1\r\nContent-Length: -5\r\n\r\n";
+    std::string response = sendRawRequest(kTestPort + 4, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 400"), std::string::npos);
+}
+
+TEST_F(HttpServerFixture, ReturnsA400ForAContentLengthAboveTheMaximum) {
+    swarm::HttpServer server(kTestPort + 5);
+    server.route("POST", "/echo", [](const swarm::HttpRequest&) {
+        return swarm::HttpResponse{200, R"({"ok":true})"};
+    });
+    startServer(server);
+
+    // Rejection must happen from the header value alone (before the server
+    // tries to read that much body), so it's safe to send no body bytes at
+    // all and still expect a 400.
+    std::string request = "POST /echo HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n";
+    std::string response = sendRawRequest(kTestPort + 5, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 400"), std::string::npos);
+}
+
+TEST_F(HttpServerFixture, ReturnsA400ForHeadersExceedingTheSizeCap) {
+    swarm::HttpServer server(kTestPort + 6);
+    startServer(server);
+
+    // A single oversized header line, and no "\r\n\r\n" terminator anywhere
+    // -- this must trip the header-size cap rather than hang forever or grow
+    // memory unbounded waiting for a terminator that never arrives.
+    std::string request = "GET /health HTTP/1.1\r\nX-Padding: " + std::string(20 * 1024, 'a');
+    std::string response = sendRawRequest(kTestPort + 6, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 400"), std::string::npos);
+}
+
 }  // namespace
