@@ -820,6 +820,62 @@ test("GET /nodes/locality excludes a node ejected by reputation", async () => {
   }
 });
 
+test("GET / serves index.html with text/html content-type", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /text\/html/);
+    const body = await res.text();
+    assert.match(body, /<title>/);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /app.js serves app.js with application/javascript content-type", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/app.js`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /javascript/);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /style.css serves style.css with text/css content-type", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/style.css`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /text\/css/);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /nonexistent-static-file.js still 404s (no interference with existing routes)", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nonexistent-static-file.js`);
+    assert.equal(res.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("existing GET /nodes route is unaffected by the new static routes", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes`);
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), []);
+  } finally {
+    server.close();
+  }
+});
+
 test("GET /nodes/locality safely handles a node that self-reports localityGroup \"__proto__\"", async () => {
   const { server, baseUrl } = await startTestServer();
   try {

@@ -1,4 +1,7 @@
 import { createServer as createHttpServer, IncomingMessage, ServerResponse } from "node:http";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { join, dirname } from "node:path";
 import { NodeRegistry, type DeviceTier } from "./registry.ts";
 import { ModelCatalog } from "./catalog.ts";
 import { PeerRegistry } from "./peer_registry.ts";
@@ -6,6 +9,24 @@ import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
 
 const VALID_DEVICE_TIERS: readonly DeviceTier[] = ["desktop", "android", "ios"];
+
+const PUBLIC_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "public");
+
+// `filename` here is always one of three string literals supplied by this
+// file's own route-handler code below, never derived from `req.url` or
+// `parts` -- this is what makes path traversal structurally impossible, not
+// a runtime check. Do not change this into a generic GET /public/:filename
+// route.
+function serveStaticFile(res: ServerResponse, filename: string, contentType: string): void {
+  try {
+    const content = readFileSync(join(PUBLIC_DIR, filename));
+    res.writeHead(200, { "content-type": contentType });
+    res.end(content);
+  } catch {
+    res.writeHead(404);
+    res.end();
+  }
+}
 
 class JsonParseError extends Error {}
 
@@ -282,6 +303,21 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           // a timeout) must never be treated as "safe".
           sendJson(res, 200, { safe: false, categories: ["classifier_error"] });
         }
+        return;
+      }
+
+      if (method === "GET" && parts.length === 0) {
+        serveStaticFile(res, "index.html", "text/html; charset=utf-8");
+        return;
+      }
+
+      if (method === "GET" && parts.length === 1 && parts[0] === "app.js") {
+        serveStaticFile(res, "app.js", "application/javascript; charset=utf-8");
+        return;
+      }
+
+      if (method === "GET" && parts.length === 1 && parts[0] === "style.css") {
+        serveStaticFile(res, "style.css", "text/css; charset=utf-8");
         return;
       }
 
