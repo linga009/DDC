@@ -275,7 +275,14 @@ PORT=8080 node src/main.ts
 
 Endpoints:
 
-- `POST /nodes/register` — register a node, returns a `nodeId`. Accepts an
+- `POST /nodes/register` — register a node, returns a `nodeId`. `endpoint`
+  must be a full, valid `http://` or `https://` URL (e.g.
+  `http://127.0.0.1:8081`) — a bare `host:port` string like `127.0.0.1:8081`
+  is rejected with `400`, and a trailing slash is stripped before storing.
+  This mirrors `POST /peers/register`'s existing validation and matters
+  because `POST /generate` (see below) actually `fetch()`es this URL; an
+  unnormalized or malformed endpoint used to register successfully and only
+  fail later, confusingly, at `/generate` time. Accepts an
   optional `localityGroup` string field (must be non-empty when provided) —
   see the locality-grouping note below. Also accepts an optional
   `servesModel` string field (must be a known catalog model id when
