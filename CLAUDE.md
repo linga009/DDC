@@ -121,7 +121,9 @@ Spec: [`docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md`](
 | 8 | [Trust/reputation tracking](docs/superpowers/plans/2026-08-16-trust-reputation-tracking.md) (ejection policy) | Done |
 | 9 | [Locality-aware node clustering](docs/superpowers/plans/2026-08-16-locality-clustering.md) | Done |
 | 10 | [Web chat/dashboard client](docs/superpowers/plans/2026-08-16-web-chat-client.md) (rescoped from native apps — see plan's Scope correction) | Done |
-| 11 | Developer API | Not yet designed |
+| 11 | [Developer API](docs/superpowers/plans/2026-08-16-developer-api.md) (OpenAPI spec + typed `SwarmClient`) | Done |
+
+**All 11 plans complete.** The repo now has: a working single/multi-node C++ inference engine with speculative decoding and MoE layer placement; a federated Node.js coordinator with node/peer registries, capacity-gated model catalog, a safety-classifier gate (ships with zero rules by default — disclosed, not solved), a reputation/ejection ledger, locality-aware node grouping, a browser dashboard, and a documented+typed developer API. The connective tissue still missing, called out in every plan since Plan 6: no request-routing or pipeline-assembly system exists yet, so no client can get an actual generated response end-to-end. That is the natural next major initiative.
 
 **Plan 10 scope note:** the master spec originally called for native Android/iOS/Linux/Windows/macOS client apps. This dev environment is Windows-only with no mobile/desktop client toolchain installed, and iOS is categorically impossible to build/test without a Mac — when asked, the user chose to rescope Plan 10 to a browser-based dashboard served directly by the coordinator (`GET /`, `/app.js`, `/style.css`) instead. It shows live swarm status and a `/classify` demo; it does not attempt real inference, and its `/classify` demo is backed by the same zero-rule default classifier as the endpoint itself (see the "Coordinator" section below) — both gaps are visibly disclosed in the page's own UI, not just in docs. Native apps remain undesigned and deferred.
 

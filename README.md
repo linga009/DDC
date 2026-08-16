@@ -1,23 +1,72 @@
 # swarm-llm
 
-A native C++ inference engine (`swarm::InferenceEngine`, a wrapper around
-[llama.cpp](https://github.com/ggml-org/llama.cpp)) and a `swarm-cli`
-command-line executable for running local LLM inference.
+**A federated, open-source network for running open-weight LLMs on compute
+people already own** — phones, laptops, desktops — instead of a single
+company's data center. No central authority (Mastodon/Matrix-style
+federation: anyone can run a coordinator instance and peer with others). No
+cryptocurrency, token, or mining layer of any kind — this project exists to
+give people free access to bigger and better open models by pooling idle
+hardware, not to pay contributors in a coin. Full vision:
+[`docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md`](docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md).
 
-This repo implements five foundational plans from the project vision: a
-local, single-device inference engine; a first step into multi-node
-sharding via a minimal RPC mechanism; a coordinator service that tracks
-node liveness and gates model availability by capacity (both described
-below); explicit per-layer placement of Mixture-of-Experts tensors across
-local and remote devices; and speculative decoding, which verifies several
-draft-model-proposed tokens per target-model round-trip
-(`InferenceEngine::complete_speculative`, not yet exposed via `swarm-cli`).
-Federation across independently-run coordinator instances now covers peer
-registration, liveness, and capacity aggregation into `/catalog`; it does
-not yet cover cross-instance request routing (an instance handing a client
-off to a peer's nodes to actually run inference) — see
-[`docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md`](docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md)
-for the full design of where this is headed.
+## Why this exists
+
+Running a large open-weight model well requires more RAM/VRAM than almost
+any single consumer device has. The usual answers are "pay a cloud
+provider" or "run a small, worse model locally." This project's bet is a
+third option: split a large model across many ordinary machines'
+spare capacity — the same idea that makes a datacenter's fast interconnect
+useful, applied to phones and laptops on a home network or the open
+internet — and grow the set of models a swarm can serve as more people
+contribute capacity, entirely for free. Every model stays open-weight;
+nobody pays to participate, and nobody gets paid to contribute hardware.
+Safety and consent are treated as first-class from the start (see the
+safety-classifier gate and reputation/ejection sections below), not bolted
+on later.
+
+**`swarm-cli` is the proof that the hard part works today.** It's a real
+`llama.cpp`-backed inference engine (`swarm::InferenceEngine`) that can
+already split a single model's layers across a local device and one or more
+networked peers via a minimal RPC mechanism, place Mixture-of-Experts
+tensors on chosen devices, and verify several speculative tokens per
+round-trip to cut latency. That's the computational core the whole
+federated-swarm idea depends on — everything else in this repo (the
+coordinator service, safety gate, reputation ledger, locality grouping, web
+dashboard, developer API) exists to eventually route real requests to a
+swarm of these engines instead of one.
+
+**Current status:** 11 of the project's implementation plans are complete —
+see [`CLAUDE.md`](CLAUDE.md)'s Plan Roadmap for exactly what's built versus
+what's still ahead. In short: the compute engine, a federated coordinator
+service, and a browser client all work and are tested; the one piece still
+missing across every plan so far is the request-routing/pipeline-assembly
+system that would let a client actually get a generated response back from
+the swarm end-to-end. That's the natural next place to contribute.
+
+## Get involved
+
+This is early, real infrastructure — not a finished product — and it's
+built in the open specifically so people can pick up a piece of it. Useful
+ways to help right now:
+
+- **Request routing / pipeline assembly** — the biggest open gap (see
+  above). Every existing piece (capacity tracking, safety gate, reputation,
+  locality) is groundwork waiting for this.
+- **Client apps** — this repo currently ships a browser dashboard only
+  (native mobile/desktop apps were deliberately deferred — see
+  [`CLAUDE.md`](CLAUDE.md)'s Plan 10 note for why).
+- **Testing on real hardware** — everything so far has been built and
+  tested on a single Windows dev machine; multi-machine, multi-platform,
+  real-network testing would surface things a single-box test suite can't.
+- **Model coverage and sharding strategy** — MoE layer placement and
+  speculative decoding exist; there's a lot of room to improve throughput
+  and model support.
+
+Start with [`CLAUDE.md`](CLAUDE.md) for repo layout, conventions, and the
+development workflow this project follows for every change (plan → review →
+merge, with an emphasis on live-tested behavior over code-review-only
+sign-off). Open an issue or a PR — there's no formal process yet beyond
+that.
 
 ## Prerequisites
 
