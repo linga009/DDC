@@ -120,8 +120,10 @@ Spec: [`docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md`](
 | 7 | [Safety classifier gateway](docs/superpowers/plans/2026-08-16-safety-classifier-gateway.md) (`/classify`) | Done |
 | 8 | [Trust/reputation tracking](docs/superpowers/plans/2026-08-16-trust-reputation-tracking.md) (ejection policy) | Done |
 | 9 | [Locality-aware node clustering](docs/superpowers/plans/2026-08-16-locality-clustering.md) | Done |
-| 10 | Client apps (Android, iOS, Linux, Windows, macOS) | Not yet designed |
+| 10 | [Web chat/dashboard client](docs/superpowers/plans/2026-08-16-web-chat-client.md) (rescoped from native apps — see plan's Scope correction) | Done |
 | 11 | Developer API | Not yet designed |
+
+**Plan 10 scope note:** the master spec originally called for native Android/iOS/Linux/Windows/macOS client apps. This dev environment is Windows-only with no mobile/desktop client toolchain installed, and iOS is categorically impossible to build/test without a Mac — when asked, the user chose to rescope Plan 10 to a browser-based dashboard served directly by the coordinator (`GET /`, `/app.js`, `/style.css`) instead. It shows live swarm status and a `/classify` demo; it does not attempt real inference, and its `/classify` demo is backed by the same zero-rule default classifier as the endpoint itself (see the "Coordinator" section below) — both gaps are visibly disclosed in the page's own UI, not just in docs. Native apps remain undesigned and deferred.
 
 None of Plans 1–9 implement actual multi-hop request routing or pipeline
 assembly end-to-end — each one built the piece the spec calls for
