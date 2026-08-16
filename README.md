@@ -154,6 +154,44 @@ on llama.cpp's RPC backend:
 > trusted LAN or same-host use only, and currently binds to `127.0.0.1` for
 > exactly this reason.
 
+## Node agent
+
+`swarm-node-agent` (`core/src/node_agent_main.cpp`) is a long-lived process
+that loads a model once at startup and serves it over HTTP, wrapping
+`swarm::InferenceEngine`'s existing, unchanged public API:
+
+```bash
+./build/core/swarm-node-agent.exe --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --port 8081
+```
+
+CLI flags:
+
+- `--model <path.gguf>` (required) — path to the GGUF model file.
+- `--port N` (required) — port to bind on `127.0.0.1`.
+- `--remote host:port` (repeatable, optional) — one or more `swarm-rpc-server`
+  endpoints to shard the model across, same as `InferenceEngine`'s
+  remote-device constructor.
+- `--layer-placement N:endpoint` (repeatable, optional) — pin a specific
+  layer's MoE expert tensors to a device endpoint (`local` or one of the
+  `--remote` endpoints), same as `InferenceEngine`'s layer-placement
+  constructor.
+
+It exposes two HTTP endpoints:
+
+- `GET /health` — returns `200 {"status":"ready"}` once the model has
+  finished loading and the server is accepting connections.
+- `POST /complete` — body `{"prompt": "...", "n_predict": 64}`
+  (`n_predict` optional, defaults to 64) returns `200 {"text": "..."}` with
+  the generated completion, or `400` if `prompt` is missing/not a string or
+  `n_predict` isn't a positive integer.
+
+Like `swarm-rpc-server`, this is a minimal building block: it serves one
+request at a time, with no concurrency, request queueing, authentication,
+or clean-shutdown path — it runs until killed. Nothing in this repo calls
+`swarm-node-agent` yet; it is the first HTTP-reachable wrapper around
+`InferenceEngine`, ready for a future coordinator-side request router
+(Plan 13) to call.
+
 ## Coordinator service
 
 `coordinator/` is a small HTTP service that tracks which nodes are alive and

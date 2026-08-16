@@ -17,4 +17,7 @@ target_link_libraries(swarm-cli PRIVATE inference_engine)
 add_executable(swarm-rpc-server src/rpc_server_main.cpp)
 target_link_libraries(swarm-rpc-server PRIVATE ggml)
 
+add_executable(swarm-node-agent src/node_agent_main.cpp)
+target_link_libraries(swarm-node-agent PRIVATE inference_engine)
+
 add_subdirectory(tests)
