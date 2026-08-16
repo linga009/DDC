@@ -124,4 +124,28 @@ TEST(JsonUtilsTest, RoundTripsTabCarriageReturnAndControlCharacterThroughEscapeA
     EXPECT_EQ(out, original);
 }
 
+// --- Whole-branch review fix: extractJsonString must validate the value is
+// actually a JSON string, not silently latch onto some unrelated later
+// quoted text when the key's real value is a non-string type. ---
+
+TEST(JsonUtilsTest, ReturnsFalseWhenTheValueIsAJsonNumber) {
+    std::string out;
+    EXPECT_FALSE(swarm::extractJsonString(R"({"prompt":123})", "prompt", out));
+}
+
+TEST(JsonUtilsTest, ReturnsFalseWhenTheValueIsNull) {
+    std::string out;
+    EXPECT_FALSE(swarm::extractJsonString(R"({"prompt":null,"other":"text"})", "prompt", out));
+}
+
+TEST(JsonUtilsTest, ReturnsFalseWhenTheValueIsANestedObject) {
+    std::string out;
+    EXPECT_FALSE(swarm::extractJsonString(R"({"prompt":{"inner":"secret"},"n_predict":4})", "prompt", out));
+}
+
+TEST(JsonUtilsTest, ReturnsFalseWhenTheValueIsAnArray) {
+    std::string out;
+    EXPECT_FALSE(swarm::extractJsonString(R"({"prompt":["hello"],"n_predict":4})", "prompt", out));
+}
+
 }  // namespace

@@ -70,13 +70,26 @@ bool extractJsonString(const std::string& body, const std::string& key, std::str
     if (colon == std::string::npos) {
         return false;
     }
-    size_t quoteStart = body.find('"', colon);
-    if (quoteStart == std::string::npos) {
+    // Anchor to the character immediately after the colon (skipping
+    // whitespace only), mirroring extractJsonInt's own anchoring discipline
+    // -- do NOT do an unbounded forward search for the next '"' character,
+    // since that would happily latch onto some unrelated later quoted text
+    // (another key's name, another key's value, even a key from inside a
+    // nested object) whenever this key's actual value isn't a string at all
+    // (a number, null, true/false, a nested object, or an array). If the
+    // first non-whitespace character after the colon isn't '"', this key's
+    // value is simply not a JSON string, so report that via `false`.
+    size_t i = colon + 1;
+    while (i < body.size() && std::isspace(static_cast<unsigned char>(body[i]))) {
+        ++i;
+    }
+    if (i >= body.size() || body[i] != '"') {
         return false;
     }
+    size_t quoteStart = i;
 
     std::string result;
-    size_t i = quoteStart + 1;
+    i = quoteStart + 1;
     while (i < body.size() && body[i] != '"') {
         if (body[i] == '\\' && i + 1 < body.size()) {
             char next = body[i + 1];

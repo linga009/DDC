@@ -101,6 +101,19 @@ int main(int argc, char** argv) {
             if (nPredict <= 0) {
                 return swarm::HttpResponse{400, R"({"error":"n_predict must be a positive integer"})"};
             }
+            // Defense-in-depth cap at the agent level: this process is
+            // independently network-reachable, and a large n_predict against
+            // InferenceEngine's fixed context size can tie up this
+            // single-threaded server for minutes (blocking even /health)
+            // before ultimately failing once the context is exhausted,
+            // discarding every token generated. Reject outright rather than
+            // clamp/truncate, so callers get a clear signal instead of a
+            // silently different amount than requested. A future
+            // coordinator-side cap (Phase B) is a separate, independent
+            // check -- this one does not depend on it existing.
+            if (nPredict > 512) {
+                return swarm::HttpResponse{400, R"({"error":"n_predict must not exceed 512"})"};
+            }
 
             try {
                 std::string text = engine->complete(prompt, nPredict);

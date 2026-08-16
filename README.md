@@ -179,11 +179,38 @@ CLI flags:
 It exposes two HTTP endpoints:
 
 - `GET /health` — returns `200 {"status":"ready"}` once the model has
-  finished loading and the server is accepting connections.
+  finished loading and the server is accepting connections. This reflects
+  only that startup finished — it is **not** a live engine-health check.
+  If a remote RPC device this agent depends on (via `--remote`) disappears
+  mid-session, the underlying llama.cpp RPC transport aborts the whole
+  process on the next request (an upstream `GGML_ABORT`, not a catchable
+  C++ exception, so `/complete` cannot turn it into a clean error
+  response). `/health` will keep reporting `ready` right up until that
+  abort happens.
 - `POST /complete` — body `{"prompt": "...", "n_predict": 64}`
   (`n_predict` optional, defaults to 64) returns `200 {"text": "..."}` with
-  the generated completion, or `400` if `prompt` is missing/not a string or
-  `n_predict` isn't a positive integer.
+  the generated completion. Returns `400` if `prompt` is missing or its
+  value is not a JSON string (a number, `null`, `true`/`false`, a nested
+  object, or an array are all rejected, not silently coerced). `n_predict`
+  is capped at `512` — a value above that returns `400
+  {"error":"n_predict must not exceed 512"}` rather than running (a large
+  `n_predict` against `InferenceEngine`'s fixed context size can otherwise
+  tie up this single-threaded server for minutes, blocking even `/health`,
+  and then fail outright once the context is exhausted, discarding every
+  token generated). Note the asymmetry: a non-numeric or otherwise
+  malformed `n_predict` is **not** rejected — it silently falls back to the
+  default (64); only a valid, in-range-parsed-but-out-of-bounds integer
+  triggers the `400`. Even within the 512 cap, a single request can still
+  take significant time depending on model size and node hardware — this
+  cap bounds the worst case, it does not guarantee a fast response.
+
+JSON string values (like `prompt`) are decoded assuming standard
+`JSON.stringify`-style escaping. A client using a JSON library that escapes
+non-ASCII characters as `\uXXXX` for codepoints at or above `0x80` (e.g.
+Python's `json.dumps` with its default `ensure_ascii=True`) will have those
+characters corrupted, since only `\u00XX` (codepoints below `0x80`) is
+decoded here. Requests built with `JSON.stringify` (as this project's
+coordinator does) are unaffected.
 
 Like `swarm-rpc-server`, this is a minimal building block: it serves one
 request at a time, with no concurrency, request queueing, authentication,
