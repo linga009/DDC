@@ -1,2 +1,43 @@
 <!doctype html>
-<title>placeholder</title>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>swarm-llm coordinator</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>swarm-llm coordinator</h1>
+    <p class="tagline">Federated, open-weight LLM inference network — status dashboard</p>
+  </header>
+
+  <main>
+    <section id="status">
+      <h2>Swarm status</h2>
+      <p>Active nodes (local + federated): <strong id="active-count">—</strong></p>
+      <table id="catalog-table">
+        <thead>
+          <tr><th>Model</th><th>Min. active nodes</th><th>Available</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section id="classify-demo">
+      <h2>Safety classifier demo</h2>
+      <p class="notice">
+        This checks a prompt against the coordinator's <code>/classify</code>
+        safety gate. <strong>It does not run inference</strong> — no
+        request-routing system exists yet to actually generate a response
+        from a model. See the project README for details.
+      </p>
+      <textarea id="prompt-input" rows="3" placeholder="Type a prompt to classify..."></textarea>
+      <button id="classify-button" type="button">Check safety</button>
+      <p id="classify-result" role="status"></p>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

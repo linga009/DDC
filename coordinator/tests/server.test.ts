@@ -876,6 +876,21 @@ test("existing GET /nodes route is unaffected by the new static routes", async (
   }
 });
 
+test("index.html contains the expected element IDs app.js depends on, and the no-real-inference notice", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const body = await (await fetch(`${baseUrl}/`)).text();
+    assert.match(body, /id="active-count"/);
+    assert.match(body, /id="catalog-table"/);
+    assert.match(body, /id="prompt-input"/);
+    assert.match(body, /id="classify-button"/);
+    assert.match(body, /id="classify-result"/);
+    assert.match(body, /does not run inference/i);
+  } finally {
+    server.close();
+  }
+});
+
 test("GET /nodes/locality safely handles a node that self-reports localityGroup \"__proto__\"", async () => {
   const { server, baseUrl } = await startTestServer();
   try {

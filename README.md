@@ -243,3 +243,24 @@ cross-instance or cross-node request routing at all yet), and no
 client-side mesh-discovery mechanism (WiFi Direct, Multipeer Connectivity,
 LAN broadcast) yet exists to produce real, verifiable locality identifiers.
 Both are expected to be built against this interface later.
+
+## Web client
+
+When the coordinator is running, it serves a small browser dashboard at `/`
+(plain HTML/CSS/vanilla JS — no build step, no framework, no new npm
+dependency; the files live in `coordinator/public/` and are served by the
+same static routes documented above). It shows:
+
+- **Swarm status** — the active node count (local + federated, from
+  `GET /capacity`) and the model catalog with each entry's minimum
+  active-node threshold and current availability (from `GET /catalog`),
+  polled every 5 seconds.
+- **A `/classify` demo** — a text box and button that submit a prompt to
+  `POST /classify` and display the resulting `safe`/`categories` verdict.
+
+**The dashboard does not run real inference.** It only demonstrates the
+existing safety-gate endpoint; there is no request-routing/pipeline-assembly
+system anywhere in this repo yet to actually generate a response from a
+model, so the client visibly discloses this in its own UI rather than
+faking it. The client is same-origin only, with no authentication — matching
+the coordinator's existing no-auth posture described above.
