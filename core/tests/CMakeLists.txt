@@ -7,7 +7,7 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-add_executable(inference_engine_test inference_engine_test.cpp speculative_test.cpp http_server_test.cpp)
+add_executable(inference_engine_test inference_engine_test.cpp speculative_test.cpp http_server_test.cpp json_utils_test.cpp)
 target_link_libraries(inference_engine_test PRIVATE inference_engine GTest::gtest_main)
 target_compile_definitions(inference_engine_test PRIVATE
     SWARM_TEST_MODEL_DIR="${CMAKE_SOURCE_DIR}/models"
