@@ -12,8 +12,10 @@ below); explicit per-layer placement of Mixture-of-Experts tensors across
 local and remote devices; and speculative decoding, which verifies several
 draft-model-proposed tokens per target-model round-trip
 (`InferenceEngine::complete_speculative`, not yet exposed via `swarm-cli`).
-Federation across independently-run coordinator instances is not yet
-implemented — see
+Federation across independently-run coordinator instances now covers peer
+registration, liveness, and capacity aggregation into `/catalog`; it does
+not yet cover cross-instance request routing (an instance handing a client
+off to a peer's nodes to actually run inference) — see
 [`docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md`](docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md)
 for the full design of where this is headed.
 
@@ -128,7 +130,15 @@ Endpoints:
 - `POST /nodes/:nodeId/heartbeat` — refresh a node's liveness
 - `GET /nodes` — list currently active nodes
 - `GET /catalog` — list models with `available` gated on active node count
+- `GET /capacity` — report this instance's active node count, for peers to fetch
+- `POST /peers/register` — register a federated peer instance, returns a `peerId`
+- `POST /peers/:peerId/heartbeat` — refresh a peer's liveness
+- `GET /peers` — list currently active peers
+- `DELETE /peers/:peerId` — deregister a peer
 
 **Caveat:** there is no authentication, and by default the server binds only
 to `127.0.0.1`; setting `HOST` to bind wider (e.g. `0.0.0.0`) should only be
-done on trusted networks.
+done on trusted networks. Federation compounds this: once a peer is
+registered, this instance makes an outbound HTTP request to it on every
+`GET /catalog` call, and `POST /peers/register` itself is unauthenticated,
+so anyone able to reach this instance can add outbound request targets.
