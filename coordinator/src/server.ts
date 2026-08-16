@@ -148,7 +148,13 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
       }
 
       if (method === "GET" && parts[0] === "capacity" && parts.length === 1) {
-        sendJson(res, 200, { activeNodes: registry.listActive().length });
+        // Apply the reputation filter here: /capacity is polled by OTHER
+        // coordinators (see fetchPeerCapacity) to build their own federated
+        // active-node count, and each coordinator only holds reputation data
+        // for its own directly-registered nodes. Filtering here is what
+        // keeps an ejected node from silently counting toward every other
+        // coordinator's federated capacity view.
+        sendJson(res, 200, { activeNodes: registry.listActive(reputation).length });
         return;
       }
 

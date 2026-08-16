@@ -714,6 +714,17 @@ test("a node ejected by reputation disappears from GET /nodes and stops counting
 
     const afterCatalog = await (await fetch(`${baseUrl}/catalog`)).json();
     assert.equal(afterCatalog.find((e: any) => e.id === "small").available, false);
+
+    const capacityRes = await fetch(`${baseUrl}/capacity`);
+    assert.equal(capacityRes.status, 200);
+    assert.deepEqual(await capacityRes.json(), { activeNodes: 0 });
+
+    // Even though the node is ejected from capacity-facing views (GET /nodes,
+    // GET /capacity, /catalog), it is still a real, registered node, and the
+    // reputation endpoints must remain operable against it -- the existence
+    // check for those routes deliberately uses the unfiltered listActive().
+    const agreeAfterEjection = await fetch(`${baseUrl}/nodes/${nodeId}/reputation/agree`, { method: "POST" });
+    assert.equal(agreeAfterEjection.status, 204);
   } finally {
     server.close();
   }
