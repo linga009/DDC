@@ -30,6 +30,18 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+const CLASSIFY_TIMEOUT_MS = 2000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("classifier timed out")), ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 async function fetchPeerCapacity(endpoint: string): Promise<number> {
   try {
     const res = await fetch(`${endpoint}/capacity`, { signal: AbortSignal.timeout(2000) });
@@ -184,10 +196,14 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           return;
         }
         try {
-          const result = await classifier.classify(candidate.prompt);
+          const result = await withTimeout(classifier.classify(candidate.prompt), CLASSIFY_TIMEOUT_MS);
+          if (typeof result?.safe !== "boolean" || !Array.isArray(result?.categories)) {
+            throw new Error("classifier returned a malformed result");
+          }
           sendJson(res, 200, result);
         } catch {
-          // Fail closed: a classifier error must never be treated as "safe".
+          // Fail closed: a classifier error (including a malformed result or
+          // a timeout) must never be treated as "safe".
           sendJson(res, 200, { safe: false, categories: ["classifier_error"] });
         }
         return;

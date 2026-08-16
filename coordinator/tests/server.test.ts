@@ -552,3 +552,50 @@ test("POST /classify fails closed (safe:false) if the classifier itself throws",
     server.close();
   }
 });
+
+const MALFORMED_CLASSIFIER_RESULTS: Array<{ name: string; value: unknown }> = [
+  { name: "safe is a string instead of a boolean", value: { safe: "yes", categories: [] } },
+  { name: "categories is missing entirely", value: { safe: true } },
+  { name: "null", value: null },
+  { name: "undefined", value: undefined },
+];
+
+for (const { name, value } of MALFORMED_CLASSIFIER_RESULTS) {
+  test(`POST /classify fails closed (safe:false) when the classifier returns a malformed result: ${name}`, async () => {
+    const malformedClassifier: SafetyClassifier = {
+      classify: async () => value as any,
+    };
+    const { server, baseUrl } = await startTestServer(undefined, undefined, malformedClassifier);
+    try {
+      const res = await fetch(`${baseUrl}/classify`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompt: "anything" }),
+      });
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.deepEqual(body, { safe: false, categories: ["classifier_error"] });
+    } finally {
+      server.close();
+    }
+  });
+}
+
+test("POST /classify fails closed (safe:false) if the classifier hangs forever", async () => {
+  const hangingClassifier: SafetyClassifier = {
+    classify: () => new Promise(() => {}),
+  };
+  const { server, baseUrl } = await startTestServer(undefined, undefined, hangingClassifier);
+  try {
+    const res = await fetch(`${baseUrl}/classify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "anything" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(body, { safe: false, categories: ["classifier_error"] });
+  } finally {
+    server.close();
+  }
+});
