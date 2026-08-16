@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { NodeRegistry } from "../src/registry.ts";
+import { NodeRegistry, UNGROUPED_LOCALITY } from "../src/registry.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
 
 test("register returns a nodeId, and the node is immediately active", () => {
@@ -140,4 +140,63 @@ test("listActive without a reputation tracker argument behaves exactly as before
   const registry = new NodeRegistry();
   registry.register("127.0.0.1:50052", "desktop");
   assert.equal(registry.listActive().length, 1);
+});
+
+test("register accepts an optional localityGroup and it is returned via listActive", () => {
+  const registry = new NodeRegistry();
+  registry.register("127.0.0.1:50052", "desktop", "kitchen-mesh");
+  const [node] = registry.listActive();
+  assert.equal(node.localityGroup, "kitchen-mesh");
+});
+
+test("register without a localityGroup leaves it undefined via listActive", () => {
+  const registry = new NodeRegistry();
+  registry.register("127.0.0.1:50052", "desktop");
+  const [node] = registry.listActive();
+  assert.equal(node.localityGroup, undefined);
+});
+
+test("groupByLocality groups nodes that share the same localityGroup together", () => {
+  const registry = new NodeRegistry();
+  registry.register("127.0.0.1:50052", "desktop", "kitchen-mesh");
+  registry.register("127.0.0.1:50053", "android", "kitchen-mesh");
+  registry.register("127.0.0.1:50054", "desktop", "office-mesh");
+
+  const groups = registry.groupByLocality();
+
+  assert.equal(groups.get("kitchen-mesh")?.length, 2);
+  assert.equal(groups.get("office-mesh")?.length, 1);
+});
+
+test("groupByLocality buckets nodes with no localityGroup under UNGROUPED_LOCALITY", () => {
+  const registry = new NodeRegistry();
+  registry.register("127.0.0.1:50052", "desktop");
+
+  const groups = registry.groupByLocality();
+
+  assert.equal(groups.get(UNGROUPED_LOCALITY)?.length, 1);
+});
+
+test("groupByLocality excludes a node the reputation tracker has marked untrusted", () => {
+  const registry = new NodeRegistry();
+  const reputation = new ReputationTracker(3, 0.5);
+  const nodeId = registry.register("127.0.0.1:50052", "desktop", "kitchen-mesh");
+
+  assert.equal(registry.groupByLocality(reputation).get("kitchen-mesh")?.length, 1);
+
+  for (let i = 0; i < 3; i++) {
+    reputation.recordDisagreement(nodeId);
+  }
+  assert.equal(registry.groupByLocality(reputation).has("kitchen-mesh"), false);
+});
+
+test("groupByLocality excludes an expired node, matching listActive's pruning", () => {
+  let now = 1000;
+  const registry = new NodeRegistry(() => now, 30000);
+  registry.register("127.0.0.1:50052", "desktop", "kitchen-mesh");
+
+  now += 30001;
+  const groups = registry.groupByLocality();
+
+  assert.equal(groups.has("kitchen-mesh"), false);
 });

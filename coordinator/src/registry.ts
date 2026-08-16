@@ -3,10 +3,13 @@ import type { ReputationTracker } from "./reputation_tracker.ts";
 
 export type DeviceTier = "desktop" | "android" | "ios";
 
+export const UNGROUPED_LOCALITY = "ungrouped";
+
 export interface NodeInfo {
   nodeId: string;
   endpoint: string;
   deviceTier: DeviceTier;
+  localityGroup?: string;
 }
 
 interface StoredNode extends NodeInfo {
@@ -23,9 +26,9 @@ export class NodeRegistry {
     this.timeoutMs = timeoutMs;
   }
 
-  register(endpoint: string, deviceTier: DeviceTier): string {
+  register(endpoint: string, deviceTier: DeviceTier, localityGroup?: string): string {
     const nodeId = randomUUID();
-    this.nodes.set(nodeId, { nodeId, endpoint, deviceTier, lastSeen: this.clock() });
+    this.nodes.set(nodeId, { nodeId, endpoint, deviceTier, localityGroup, lastSeen: this.clock() });
     return nodeId;
   }
 
@@ -57,7 +60,7 @@ export class NodeRegistry {
         if (reputation && !reputation.isTrusted(node.nodeId)) {
           continue;
         }
-        active.push({ nodeId: node.nodeId, endpoint: node.endpoint, deviceTier: node.deviceTier });
+        active.push({ nodeId: node.nodeId, endpoint: node.endpoint, deviceTier: node.deviceTier, localityGroup: node.localityGroup });
       } else {
         // Expired -- prune it here rather than just leaving it out of the
         // result, so long-running processes don't accumulate dead entries.
@@ -65,6 +68,20 @@ export class NodeRegistry {
       }
     }
     return active;
+  }
+
+  groupByLocality(reputation?: ReputationTracker): Map<string, NodeInfo[]> {
+    const groups = new Map<string, NodeInfo[]>();
+    for (const node of this.listActive(reputation)) {
+      const key = node.localityGroup ?? UNGROUPED_LOCALITY;
+      const bucket = groups.get(key);
+      if (bucket) {
+        bucket.push(node);
+      } else {
+        groups.set(key, [node]);
+      }
+    }
+    return groups;
   }
 
   size(): number {
