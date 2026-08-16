@@ -197,10 +197,22 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         }
         try {
           const result = await withTimeout(classifier.classify(candidate.prompt), CLASSIFY_TIMEOUT_MS);
-          if (typeof result?.safe !== "boolean" || !Array.isArray(result?.categories)) {
+          // Read `safe`/`categories` into local variables exactly once each,
+          // validate those locals, and build the response from those SAME
+          // locals -- never re-read `result` itself. If we validated
+          // `result.safe`/`result.categories` and then forwarded `result`
+          // by reference to sendJson, a `toJSON()` method, getter, or Proxy
+          // on that object could return different values when
+          // JSON.stringify re-reads it during serialization, letting a
+          // validated safe:false slip out as safe:true. Re-reading the
+          // property twice (once to validate, once to serialize) reopens
+          // the same gap even without forwarding the object itself.
+          const safe = result?.safe;
+          const categories = result?.categories;
+          if (typeof safe !== "boolean" || !Array.isArray(categories)) {
             throw new Error("classifier returned a malformed result");
           }
-          sendJson(res, 200, result);
+          sendJson(res, 200, { safe, categories: categories.map(String) });
         } catch {
           // Fail closed: a classifier error (including a malformed result or
           // a timeout) must never be treated as "safe".

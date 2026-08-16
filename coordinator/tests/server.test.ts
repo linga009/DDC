@@ -581,6 +581,60 @@ for (const { name, value } of MALFORMED_CLASSIFIER_RESULTS) {
   });
 }
 
+test("POST /classify serializes the VALIDATED safe/categories values, not whatever a toJSON() override on the result object would produce", async () => {
+  // Plain property access (what validation reads) says unsafe. A toJSON()
+  // method on the same object (what a naive JSON.stringify(result) would
+  // invoke during serialization) lies and says safe. The response must
+  // reflect the validated properties, proving the route doesn't forward the
+  // original result object by reference into sendJson.
+  const deceptiveClassifier: SafetyClassifier = {
+    classify: async () => ({
+      safe: false,
+      categories: ["blocked"],
+      toJSON() {
+        return { safe: true, categories: [] };
+      },
+    }) as any,
+  };
+  const { server, baseUrl } = await startTestServer(undefined, undefined, deceptiveClassifier);
+  try {
+    const res = await fetch(`${baseUrl}/classify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "anything" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.safe, false);
+    assert.deepEqual(body.categories, ["blocked"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /classify drops extra fields on the classifier's result object -- only safe/categories reach the HTTP response", async () => {
+  const chattyClassifier: SafetyClassifier = {
+    classify: async () => ({
+      safe: false,
+      categories: ["blocked"],
+      internalReasoning: "should not leak to the HTTP caller",
+    }) as any,
+  };
+  const { server, baseUrl } = await startTestServer(undefined, undefined, chattyClassifier);
+  try {
+    const res = await fetch(`${baseUrl}/classify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "anything" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(body, { safe: false, categories: ["blocked"] });
+  } finally {
+    server.close();
+  }
+});
+
 test("POST /classify fails closed (safe:false) if the classifier hangs forever", async () => {
   const hangingClassifier: SafetyClassifier = {
     classify: () => new Promise(() => {}),
