@@ -32,4 +32,8 @@ export class ModelCatalog {
       available: activeNodeCount >= entry.minActiveNodes,
     }));
   }
+
+  hasModel(id: string): boolean {
+    return this.entries.some(entry => entry.id === id);
+  }
 }

@@ -34,3 +34,9 @@ test("custom catalog entries are used verbatim, replacing the default table", ()
   assert.equal(result.length, 1);
   assert.equal(result[0].id, "only-one");
 });
+
+test("hasModel returns true for a known catalog id and false for an unknown one", () => {
+  const catalog = new ModelCatalog([{ id: "tinyllama-1.1b", displayName: "TinyLlama 1.1B", minActiveNodes: 0 }]);
+  assert.equal(catalog.hasModel("tinyllama-1.1b"), true);
+  assert.equal(catalog.hasModel("nonexistent-model"), false);
+});

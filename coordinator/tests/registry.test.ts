@@ -200,3 +200,25 @@ test("groupByLocality excludes an expired node, matching listActive's pruning", 
 
   assert.equal(groups.has("kitchen-mesh"), false);
 });
+
+test("register accepts an optional servesModel and it is returned via listActive", () => {
+  const registry = new NodeRegistry();
+  registry.register("http://127.0.0.1:50052", "desktop", undefined, "tinyllama-1.1b");
+  const [node] = registry.listActive();
+  assert.equal(node.servesModel, "tinyllama-1.1b");
+});
+
+test("register without a servesModel leaves it undefined via listActive", () => {
+  const registry = new NodeRegistry();
+  registry.register("http://127.0.0.1:50052", "desktop");
+  const [node] = registry.listActive();
+  assert.equal(node.servesModel, undefined);
+});
+
+test("register accepts both localityGroup and servesModel together", () => {
+  const registry = new NodeRegistry();
+  registry.register("http://127.0.0.1:50052", "desktop", "kitchen-mesh", "tinyllama-1.1b");
+  const [node] = registry.listActive();
+  assert.equal(node.localityGroup, "kitchen-mesh");
+  assert.equal(node.servesModel, "tinyllama-1.1b");
+});

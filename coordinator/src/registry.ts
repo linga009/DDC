@@ -10,6 +10,7 @@ export interface NodeInfo {
   endpoint: string;
   deviceTier: DeviceTier;
   localityGroup?: string;
+  servesModel?: string;
 }
 
 interface StoredNode extends NodeInfo {
@@ -26,9 +27,9 @@ export class NodeRegistry {
     this.timeoutMs = timeoutMs;
   }
 
-  register(endpoint: string, deviceTier: DeviceTier, localityGroup?: string): string {
+  register(endpoint: string, deviceTier: DeviceTier, localityGroup?: string, servesModel?: string): string {
     const nodeId = randomUUID();
-    this.nodes.set(nodeId, { nodeId, endpoint, deviceTier, localityGroup, lastSeen: this.clock() });
+    this.nodes.set(nodeId, { nodeId, endpoint, deviceTier, localityGroup, servesModel, lastSeen: this.clock() });
     return nodeId;
   }
 
@@ -60,7 +61,7 @@ export class NodeRegistry {
         if (reputation && !reputation.isTrusted(node.nodeId)) {
           continue;
         }
-        active.push({ nodeId: node.nodeId, endpoint: node.endpoint, deviceTier: node.deviceTier, localityGroup: node.localityGroup });
+        active.push({ nodeId: node.nodeId, endpoint: node.endpoint, deviceTier: node.deviceTier, localityGroup: node.localityGroup, servesModel: node.servesModel });
       } else {
         // Expired -- prune it here rather than just leaving it out of the
         // result, so long-running processes don't accumulate dead entries.
