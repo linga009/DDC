@@ -144,6 +144,23 @@ Endpoints:
   interface (`coordinator/src/safety_classifier.ts`).** `/classify` is also
   not yet wired into any request-submission path — nothing currently calls
   it automatically before routing a prompt for inference.
+- `POST /nodes/:nodeId/reputation/agree` / `POST /nodes/:nodeId/reputation/disagree`
+  — record that a node's output agreed or disagreed with a redundant
+  spot-check computation (204, or 404 if `nodeId` is unknown)
+- `GET /nodes/:nodeId/reputation` — report a node's reputation stats:
+  `{ agreements: number, disagreements: number, trusted: boolean }`
+
+A node with zero recorded checks is trusted by default. Ejection (excluding
+the node from `GET /nodes`, `GET /capacity`, and `/catalog`'s active-node
+count) requires both a minimum sample size and a disagreement rate above
+threshold — a single unlucky or malicious disagreement doesn't eject a node
+instantly. **This plan does not implement the actual redundant-computation
+spot-check mechanism** (running the same request on two nodes and comparing
+outputs) — that requires a request-routing system this repo doesn't have
+yet. It only builds the reputation ledger and ejection policy, ready to be
+wired in once routing exists. Reputation endpoints themselves stay
+operable on an already-ejected node (so future spot-check results can
+still be recorded for it) — only capacity-facing views exclude it.
 
 **Caveat:** there is no authentication, and by default the server binds only
 to `127.0.0.1`; setting `HOST` to bind wider (e.g. `0.0.0.0`) should only be
@@ -151,3 +168,6 @@ done on trusted networks. Federation compounds this: once a peer is
 registered, this instance makes an outbound HTTP request to it on every
 `GET /catalog` call, and `POST /peers/register` itself is unauthenticated,
 so anyone able to reach this instance can add outbound request targets.
+The reputation-recording endpoints are likewise unauthenticated — currently
+any caller can record arbitrary agreement/disagreement events for any node.
+Reputation state is in-memory only and does not persist across restarts.
