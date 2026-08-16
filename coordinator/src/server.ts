@@ -89,7 +89,15 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           sendJson(res, 400, { error: "deviceTier must be one of: desktop, android, ios" });
           return;
         }
-        const nodeId = registry.register(candidate.endpoint, candidate.deviceTier as DeviceTier);
+        let localityGroup: string | undefined;
+        if (candidate.localityGroup !== undefined) {
+          if (typeof candidate.localityGroup !== "string" || candidate.localityGroup.length === 0) {
+            sendJson(res, 400, { error: "localityGroup must be a non-empty string when provided" });
+            return;
+          }
+          localityGroup = candidate.localityGroup;
+        }
+        const nodeId = registry.register(candidate.endpoint, candidate.deviceTier as DeviceTier, localityGroup);
         sendJson(res, 200, { nodeId });
         return;
       }
@@ -144,6 +152,19 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
 
       if (method === "GET" && parts[0] === "nodes" && parts.length === 1) {
         sendJson(res, 200, registry.listActive(reputation));
+        return;
+      }
+
+      if (method === "GET" && parts[0] === "nodes" && parts.length === 2 && parts[1] === "locality") {
+        const groups = registry.groupByLocality(reputation);
+        // Object.fromEntries (not a manual loop) avoids invoking Object.prototype's
+        // legacy __proto__ setter when a self-reported localityGroup is literally
+        // "__proto__" (see commit 7060b00). Side effect: integer-like group names
+        // sort first in the JSON output instead of preserving Map insertion order
+        // — a documented own-property-ordering quirk, not a bug (JSON objects are
+        // formally unordered).
+        const asObject = Object.fromEntries(groups);
+        sendJson(res, 200, asObject);
         return;
       }
 

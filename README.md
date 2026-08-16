@@ -126,9 +126,16 @@ PORT=8080 node src/main.ts
 
 Endpoints:
 
-- `POST /nodes/register` — register a node, returns a `nodeId`
+- `POST /nodes/register` — register a node, returns a `nodeId`. Accepts an
+  optional `localityGroup` string field (must be non-empty when provided) —
+  see the locality-grouping note below.
 - `POST /nodes/:nodeId/heartbeat` — refresh a node's liveness
 - `GET /nodes` — list currently active nodes
+- `GET /nodes/locality` — active nodes bucketed by their self-reported
+  `localityGroup`: `{ [group: string]: NodeInfo[] }`. A node registered
+  without a `localityGroup` is bucketed under `"ungrouped"`. Uses the same
+  reputation filtering as `GET /nodes` — an ejected node does not appear in
+  any group.
 - `GET /catalog` — list models with `available` gated on active node count
 - `GET /capacity` — report this instance's active node count, for peers to fetch
 - `POST /peers/register` — register a federated peer instance, returns a `peerId`
@@ -202,3 +209,37 @@ fleet leaks one entry per registration in the in-memory `Map` — the same
 stable-identity fix needed above would address this too; evicting on
 registry-prune alone is not attempted here, since it would open a new
 evasion path (go quiet for 30s to get a clean slate).
+
+**Locality grouping is self-reported and unverified:** `localityGroup` is an
+arbitrary string a node supplies at registration time — the coordinator
+performs no check that it reflects real physical or network proximity. A
+node can claim membership in any group, including one it has no actual
+adjacency to, with no cost or detection (the same no-auth caveat above
+applies here too). This is worse than a single false claim: because
+`NodeRegistry.register()` mints a fresh `randomUUID()` on every call with no
+endpoint dedupe (the same gap noted in the reputation gaming-vectors above),
+one physical device can register itself repeatedly under different
+`localityGroup` values and appear in multiple groups simultaneously —
+inflating any group's apparent size for free, or flooding every group at
+once. Verified live: the same endpoint registered under `"kitchen-mesh"`,
+`"office-mesh"`, and `"garage-mesh"` produced 3 distinct nodeIds, all live
+simultaneously in `GET /nodes/locality`, all backed by the same physical
+endpoint; re-registering under a new group does not remove the old
+registration either, so the stale entry persists in its original group
+until its normal liveness/heartbeat timeout (currently 30s) expires. This
+matters beyond the general no-auth caveat because `GET /nodes/locality`
+exists as groundwork for a future pipeline assembler that will likely
+prefer larger or majority locality clusters when selecting nodes — making
+this a vector against the exact consumer this endpoint is groundwork for.
+The root cause is the same missing stable-node-identity fix already named
+as a prerequisite in the reputation gaming-vectors note above; see that
+paragraph rather than repeating it here. Separately, a node can also
+register with `localityGroup: "ungrouped"` verbatim, which is
+indistinguishable from a node that never set the field at all. `GET
+/nodes/locality` exists purely as a stable, queryable interface for
+grouping; no pipeline-assembly or request-routing system in this repo yet
+consumes it (see the federation caveat above — this repo has no
+cross-instance or cross-node request routing at all yet), and no
+client-side mesh-discovery mechanism (WiFi Direct, Multipeer Connectivity,
+LAN broadcast) yet exists to produce real, verifiable locality identifiers.
+Both are expected to be built against this interface later.

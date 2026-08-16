@@ -315,6 +315,15 @@ if (method === "GET" && parts[0] === "nodes" && parts.length === 2 && parts[1] =
 }
 ```
 
+> **Correction found during Task 2's review (2026-08-16):** the manual-loop
+> snippet above has a `__proto__`-key prototype-pollution bug — a
+> self-reported `localityGroup` of `"__proto__"` would hit
+> `asObject["__proto__"] = nodes`, which assigns through `Object.prototype`'s
+> setter instead of creating an own property. The actual implementation
+> deviates from this snippet and uses `const asObject =
+> Object.fromEntries(groups);` instead, which assigns `__proto__` as a
+> plain own key. See commit `7060b00`.
+
 Place this check so it does not shadow or get shadowed by the existing bare `GET /nodes` route (`parts.length === 1`) — the two have different `parts.length`, so ordering relative to each other doesn't matter, but confirm no other `parts[0] === "nodes"` route also matches `parts.length === 2 && parts[1] === "locality"` before adding it.
 
 - [ ] **Step 3: Update README**
