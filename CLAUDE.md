@@ -135,9 +135,11 @@ Design: [`docs/superpowers/specs/2026-08-16-request-routing-design.md`](docs/sup
 |---|------|--------|
 | A (C++ side) | [swarm-node-agent](docs/superpowers/plans/2026-08-16-swarm-node-agent.md) — a long-lived process wrapping `InferenceEngine` behind a minimal hand-rolled HTTP server (`GET /health`, `POST /complete`) | Done |
 | A (coordinator side) | [Coordinator request routing](docs/superpowers/plans/2026-08-16-coordinator-request-routing.md) — `POST /generate`: classify → find a node with a matching `servesModel` → forward → respond | Done |
-| B | Coordinator-driven dynamic pipeline assembly (which nodes form a pipeline, chosen live from the registry/reputation/locality data every prior plan built) | Not yet designed |
-| C | Background pre-warming + demand-based autoscaling of the warm-pipeline pool per model | Not yet designed |
-| D | Token streaming (`InferenceEngine::complete()` is fully blocking today — no per-token callback exists yet) | Not yet designed |
+| B | [Dynamic pipeline assembly](docs/superpowers/specs/2026-08-16-phase-b-dynamic-pipeline-assembly-design.md) (which nodes form a pipeline, chosen live from the registry/reputation/locality data every prior plan built) | Design written, not yet implemented |
+| C | [Background pre-warming + autoscaling](docs/superpowers/specs/2026-08-16-phase-c-prewarming-autoscaling-design.md) of the warm-pipeline pool per model | Design written, not yet implemented |
+| D | [Token streaming](docs/superpowers/specs/2026-08-16-phase-d-token-streaming-design.md) (`InferenceEngine::complete()` is fully blocking today — no per-token callback exists yet) | Design written, not yet implemented |
+
+**These three designs were written before any of them were built** — each one's own Open Questions/Known Risks section names real, unresolved decisions (notably: Phase B's launcher role is a genuinely new remote-code-execution-shaped surface that needs its own security posture, not a copy of the coordinator's no-auth stance — read that section before implementing). Re-validate against the actual codebase at planning time; don't treat these as settled.
 
 **Phase A is complete and real, not a demo — the milestone is live on `master`.** A client can now `POST /generate {prompt, modelId}` on the coordinator and get a real generated response, produced by an actual `swarm-node-agent` process (single-device or `--remote`-sharded multi-node, both verified live) registered via `servesModel`. Confirmed multiple times independently during whole-branch review, including under real adversarial load: concurrent requests, mid-flight reputation ejection, prompt-injection attempts against the hand-rolled JSON parser, and the real end-to-end test (`coordinator/tests/generate_e2e.ts`, run via `npm run test:e2e`) passing against a live spawned agent and a live GGUF model — not mocked, not skipped.
 

@@ -19,14 +19,14 @@ Every plan built so far (1 through 11) produces working, tested infrastructure, 
 - Any change to `InferenceEngine`'s core sharding/placement logic — Phase A reuses the existing single-device, remote-device, and layer-placement constructors exactly as built in Plans 1/2/4.
 - Web dashboard UI changes to actually display generated output (a small follow-up, not part of proving the backend path).
 
-## Roadmap (context for Phase A's design; B/C/D are not specified in detail yet)
+## Roadmap
 
-- **Phase A (this spec):** `swarm-node-agent` + a single coordinator endpoint (`POST /generate`) routing to one operator-configured pipeline. The walking skeleton.
-- **Phase B:** the coordinator decides pipeline composition dynamically from live `NodeRegistry`/reputation/locality state, commands node agents to assemble, tracks pipeline lifecycle.
-- **Phase C:** background pre-warming (extending the existing capacity-gating logic so "available" in the catalog means "a warm pipeline actually exists," not just "enough nodes are registered") and demand-based autoscaling of the warm-pipeline pool per model.
-- **Phase D:** token streaming — a new `InferenceEngine` per-token callback, plumbed through the node agent (Server-Sent Events) and the web client.
+- **Phase A (this spec) — Done, merged.** `swarm-node-agent` (Plan 12) + `POST /generate` (Plan 13), routing to one operator-configured pipeline. The walking skeleton — verified live, multiple times, producing real generated text end to end.
+- **Phase B — [design written](2026-08-16-phase-b-dynamic-pipeline-assembly-design.md), not yet implemented.** The coordinator decides pipeline composition dynamically from live `NodeRegistry`/reputation/locality state, commands a new launcher role to assemble it, tracks pipeline lifecycle.
+- **Phase C — [design written](2026-08-16-phase-c-prewarming-autoscaling-design.md), not yet implemented.** Background pre-warming (extending the existing capacity-gating logic so "available" in the catalog means "a warm pipeline actually exists," not just "enough nodes are registered") and demand-based autoscaling of the warm-pipeline pool per model.
+- **Phase D — [design written](2026-08-16-phase-d-token-streaming-design.md), not yet implemented.** Token streaming — a new `InferenceEngine` per-token callback, plumbed through the node agent (Server-Sent Events), the coordinator, and the web client.
 
-Each phase gets its own implementation plan once the phase before it is built and merged, following this project's established one-plan-at-a-time cadence.
+Each phase gets its own implementation plan once the phase before it is built and merged, following this project's established one-plan-at-a-time cadence. The B/C/D designs above were written before any of them were built — treat their open questions and risks sections as live, not settled, and revisit them at planning time rather than assuming they're still accurate.
 
 ## Architecture (Phase A)
 
