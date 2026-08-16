@@ -30,7 +30,9 @@
         This checks a prompt against the coordinator's <code>/classify</code>
         safety gate. <strong>It does not run inference</strong> — no
         request-routing system exists yet to actually generate a response
-        from a model. See the project README for details.
+        from a model. The classifier also ships with zero rules by default,
+        so it currently returns <code>safe: true</code> for every prompt —
+        see the README for details.
       </p>
       <textarea id="prompt-input" rows="3" placeholder="Type a prompt to classify..."></textarea>
       <button id="classify-button" type="button">Check safety</button>

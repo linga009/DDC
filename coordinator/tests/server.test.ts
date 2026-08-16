@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer as createHttpServer } from "node:http";
+import net from "node:net";
 import { createServer } from "../src/server.ts";
 import { NodeRegistry } from "../src/registry.ts";
 import { ModelCatalog, type CatalogEntry } from "../src/catalog.ts";
@@ -860,6 +861,68 @@ test("GET /nonexistent-static-file.js still 404s (no interference with existing 
   try {
     const res = await fetch(`${baseUrl}/nonexistent-static-file.js`);
     assert.equal(res.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+// Regression coverage for the path-traversal-impossible-by-construction
+// invariant documented in the comment above `serveStaticFile` in
+// server.ts: `serveStaticFile` is only ever called with one of three
+// hardcoded literal filenames, never a value derived from `req.url`/`parts`.
+// If a future refactor introduced a generic `GET /public/:filename` route
+// that built a filesystem path from the request, these tests would start
+// failing.
+//
+// Node's `fetch`/`URL` normalize ".." segments client-side before a request
+// is ever sent on the wire -- verified by inspecting the raw request line a
+// `fetch()` call to these URLs actually produces: `/app.js/../server.ts`
+// is sent as `GET /server.ts HTTP/1.1`, and `/../../package.json` is sent
+// as `GET /package.json HTTP/1.1`. So this first test exercises "does a
+// path containing '..' ever result in an unexpected file being served",
+// but the ".." never reaches the server as a literal path segment through
+// this client.
+test("static routes reject path traversal attempts rather than serving arbitrary files", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res1 = await fetch(`${baseUrl}/app.js/../server.ts`);
+    assert.equal(res1.status, 404);
+
+    const res2 = await fetch(`${baseUrl}/../../package.json`);
+    assert.equal(res2.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+// This second test closes the gap above: it writes a raw HTTP request line
+// containing a literal ".." segment directly to a socket, bypassing
+// `fetch`'s client-side normalization entirely, to confirm what happens
+// when ".." genuinely reaches the server. Verified live: the server's own
+// `new URL(req.url, "http://localhost")` parsing (server.ts) also
+// normalizes the dot-segments per the WHATWG URL spec before route
+// matching runs, collapsing `/app.js/../../package.json` to `/package.json`
+// -- which then 404s because no route matches a bare "package.json" or
+// "server.ts" segment. Either way (client-side or server-side
+// normalization), no request can escape `serveStaticFile`'s three hardcoded
+// filenames.
+test("a literal '..' path segment that survives to the server's own URL parsing still 404s", async () => {
+  const { server, baseUrl } = await startTestServer();
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected server to bind a real port");
+  }
+  try {
+    const statusLine = await new Promise<string>((resolve, reject) => {
+      const socket = net.createConnection(address.port, "127.0.0.1", () => {
+        socket.write("GET /app.js/../../package.json HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+      });
+      let raw = "";
+      socket.on("data", (chunk) => { raw += chunk.toString("utf-8"); });
+      socket.on("end", () => resolve(raw.split("\r\n")[0] ?? ""));
+      socket.on("error", reject);
+    });
+    assert.match(statusLine, /^HTTP\/1\.1 404/);
   } finally {
     server.close();
   }

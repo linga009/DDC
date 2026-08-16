@@ -22,7 +22,8 @@ function serveStaticFile(res: ServerResponse, filename: string, contentType: str
     const content = readFileSync(join(PUBLIC_DIR, filename));
     res.writeHead(200, { "content-type": contentType });
     res.end(content);
-  } catch {
+  } catch (err) {
+    console.warn(`failed to serve static file ${filename}:`, err);
     res.writeHead(404);
     res.end();
   }

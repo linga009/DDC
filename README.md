@@ -156,6 +156,11 @@ Endpoints:
   spot-check computation (204, or 404 if `nodeId` is unknown)
 - `GET /nodes/:nodeId/reputation` — report a node's reputation stats:
   `{ agreements: number, disagreements: number, trusted: boolean }`
+- `GET /` — serves the web dashboard (see Web client section below)
+- `GET /app.js` — serves the web dashboard's client-side JavaScript (see Web
+  client section below)
+- `GET /style.css` — serves the web dashboard's stylesheet (see Web client
+  section below)
 
 A node with zero recorded checks is trusted by default. Ejection (excluding
 the node from `GET /nodes`, `GET /capacity`, and `/catalog`'s active-node
@@ -249,7 +254,8 @@ Both are expected to be built against this interface later.
 When the coordinator is running, it serves a small browser dashboard at `/`
 (plain HTML/CSS/vanilla JS — no build step, no framework, no new npm
 dependency; the files live in `coordinator/public/` and are served by the
-same static routes documented above). It shows:
+`GET /`, `GET /app.js`, and `GET /style.css` routes listed in the endpoint
+list above). It shows:
 
 - **Swarm status** — the active node count (local + federated, from
   `GET /capacity`) and the model catalog with each entry's minimum
@@ -263,4 +269,7 @@ existing safety-gate endpoint; there is no request-routing/pipeline-assembly
 system anywhere in this repo yet to actually generate a response from a
 model, so the client visibly discloses this in its own UI rather than
 faking it. The client is same-origin only, with no authentication — matching
-the coordinator's existing no-auth posture described above.
+the coordinator's existing no-auth posture described above. As with the
+`/classify` endpoint itself (see above), the shipped classifier has zero
+rules by default, so the demo currently reports every prompt as `safe:
+true`; the dashboard's own notice discloses this.
