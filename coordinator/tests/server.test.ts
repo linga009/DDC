@@ -5,6 +5,7 @@ import { createServer } from "../src/server.ts";
 import { NodeRegistry } from "../src/registry.ts";
 import { ModelCatalog, type CatalogEntry } from "../src/catalog.ts";
 import { PeerRegistry } from "../src/peer_registry.ts";
+import { KeywordSafetyClassifier, type SafetyClassifier } from "../src/safety_classifier.ts";
 
 const DEFAULT_TEST_CATALOG: CatalogEntry[] = [
   { id: "tinyllama-1.1b", displayName: "TinyLlama 1.1B", minActiveNodes: 0 },
@@ -14,10 +15,11 @@ const DEFAULT_TEST_CATALOG: CatalogEntry[] = [
 async function startTestServer(
   catalogEntries: CatalogEntry[] = DEFAULT_TEST_CATALOG,
   peers: PeerRegistry = new PeerRegistry(),
+  classifier: SafetyClassifier = new KeywordSafetyClassifier([]),
 ) {
   const registry = new NodeRegistry();
   const catalog = new ModelCatalog(catalogEntries);
-  const server = createServer(registry, catalog, peers);
+  const server = createServer(registry, catalog, peers, classifier);
 
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -475,5 +477,78 @@ test("GET /catalog correctly reflects a peer's capacity even when registered wit
   } finally {
     server.close();
     testPeer.close();
+  }
+});
+
+test("POST /classify returns safe:true for a prompt matching no configured rules", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/classify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "an ordinary prompt" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.safe, true);
+    assert.deepEqual(body.categories, []);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /classify returns safe:false and categories for a prompt matching a configured rule", async () => {
+  const classifier = new KeywordSafetyClassifier([
+    { pattern: /UNSAFE_TEST_TOKEN/, category: "test_category" },
+  ]);
+  const { server, baseUrl } = await startTestServer(undefined, undefined, classifier);
+  try {
+    const res = await fetch(`${baseUrl}/classify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "contains UNSAFE_TEST_TOKEN here" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.safe, false);
+    assert.deepEqual(body.categories, ["test_category"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /classify rejects a request with a missing or non-string prompt", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/classify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: 12345 }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /classify fails closed (safe:false) if the classifier itself throws", async () => {
+  const throwingClassifier: SafetyClassifier = {
+    classify: async () => {
+      throw new Error("classifier backend unavailable");
+    },
+  };
+  const { server, baseUrl } = await startTestServer(undefined, undefined, throwingClassifier);
+  try {
+    const res = await fetch(`${baseUrl}/classify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "anything" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.safe, false);
+    assert.ok(body.categories.length > 0);
+  } finally {
+    server.close();
   }
 });

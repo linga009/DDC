@@ -2,6 +2,7 @@ import { createServer as createHttpServer, IncomingMessage, ServerResponse } fro
 import { NodeRegistry, type DeviceTier } from "./registry.ts";
 import { ModelCatalog } from "./catalog.ts";
 import { PeerRegistry } from "./peer_registry.ts";
+import type { SafetyClassifier } from "./safety_classifier.ts";
 
 const VALID_DEVICE_TIERS: readonly DeviceTier[] = ["desktop", "android", "ios"];
 
@@ -53,7 +54,7 @@ async function federatedActiveNodeCount(registry: NodeRegistry, peers: PeerRegis
   return local + peerCounts.reduce((sum, n) => sum + n, 0);
 }
 
-export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry) {
+export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier) {
   return createHttpServer(async (req, res) => {
     try {
       const method = req.method ?? "GET";
@@ -168,6 +169,27 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
       if (method === "GET" && parts[0] === "catalog" && parts.length === 1) {
         const activeNodeCount = await federatedActiveNodeCount(registry, peers);
         sendJson(res, 200, catalog.availability(activeNodeCount));
+        return;
+      }
+
+      if (method === "POST" && parts[0] === "classify" && parts.length === 1) {
+        const body = await readJsonBody(req);
+        if (typeof body !== "object" || body === null) {
+          sendJson(res, 400, { error: "request body must be a JSON object" });
+          return;
+        }
+        const candidate = body as Record<string, unknown>;
+        if (typeof candidate.prompt !== "string") {
+          sendJson(res, 400, { error: "prompt must be a string" });
+          return;
+        }
+        try {
+          const result = await classifier.classify(candidate.prompt);
+          sendJson(res, 200, result);
+        } catch {
+          // Fail closed: a classifier error must never be treated as "safe".
+          sendJson(res, 200, { safe: false, categories: ["classifier_error"] });
+        }
         return;
       }
 
