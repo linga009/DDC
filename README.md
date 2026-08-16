@@ -242,7 +242,12 @@ Endpoints:
 
 - `POST /nodes/register` — register a node, returns a `nodeId`. Accepts an
   optional `localityGroup` string field (must be non-empty when provided) —
-  see the locality-grouping note below.
+  see the locality-grouping note below. Also accepts an optional
+  `servesModel` string field (must be a known catalog model id when
+  provided) declaring which model this node can serve inference requests
+  for. Like `localityGroup`, this is **self-reported and unverified** — the
+  coordinator does not check that a node actually has the declared model
+  loaded and ready; `POST /generate` (see below) trusts it at routing time.
 - `POST /nodes/:nodeId/heartbeat` — refresh a node's liveness
 - `GET /nodes` — list currently active nodes
 - `GET /nodes/locality` — active nodes bucketed by their self-reported
@@ -262,9 +267,23 @@ Endpoints:
   real content moderation — it exists only to prove the gate's plumbing
   (fail-closed error handling, request/response shape, timeout behavior). A
   real classifier must be supplied by implementing the `SafetyClassifier`
-  interface (`coordinator/src/safety_classifier.ts`).** `/classify` is also
-  not yet wired into any request-submission path — nothing currently calls
-  it automatically before routing a prompt for inference.
+  interface (`coordinator/src/safety_classifier.ts`).** `/classify` is
+  also callable directly and independently of `/generate` below — it is
+  not exclusively an internal implementation detail of routing.
+- `POST /generate` — submit `{ "prompt": string, "modelId": string,
+  "n_predict"?: number }`, get back `{ "text": string }`. Classifies the
+  prompt first (fails closed on an unsafe prompt or a classifier error,
+  same posture as `/classify`), finds an active node whose self-reported
+  `servesModel` matches `modelId`, forwards the request to that node's
+  `swarm-node-agent` `POST /complete` endpoint, and returns its generated
+  text. Returns `400` if the request is invalid or the prompt was
+  classified unsafe, `503` if no active node currently serves the
+  requested model, `502` if the selected node is unreachable or returns a
+  malformed response. `n_predict` defaults to 64 and is capped at 512,
+  mirroring `swarm-node-agent`'s own cap. Single attempt only — no retry,
+  no fallback to a different node on failure, no streaming (the response
+  arrives complete or not at all). See the paragraph below for what this
+  endpoint does and doesn't do yet.
 - `POST /nodes/:nodeId/reputation/agree` / `POST /nodes/:nodeId/reputation/disagree`
   — record that a node's output agreed or disagreed with a redundant
   spot-check computation (204, or 404 if `nodeId` is unknown)
@@ -277,6 +296,24 @@ Endpoints:
   section below)
 - `GET /openapi.json` — serves the hand-written OpenAPI 3.0 document
   describing the JSON API routes above (see Developer API section below)
+
+**`POST /generate` is the first endpoint in this repo that produces a real
+generated response.** Every other endpoint above it was groundwork —
+registry, capacity, safety gate, reputation, locality — built ahead of a
+request-routing system that didn't exist yet; this is that system's first
+piece. It requires at least one `swarm-node-agent` process (see the Node
+agent section above) to be running and registered via `POST
+/nodes/register` with a `servesModel` value matching the requested
+`modelId` — without one, every call to `/generate` returns `503`. This is
+still only Phase A of the request-routing initiative: node selection is a
+simple first-match scan over active nodes (not load- or locality-aware),
+there is no background pre-warming of pipelines ahead of demand, and there
+is no token streaming (a `/generate` call blocks until the full response
+is ready or the request fails). See
+[`docs/superpowers/specs/2026-08-16-request-routing-design.md`](docs/superpowers/specs/2026-08-16-request-routing-design.md)
+for Phases B (dynamic, coordinator-driven pipeline assembly), C
+(pre-warming and demand-based autoscaling), and D (token streaming) — none
+of which are implemented yet.
 
 A node with zero recorded checks is trusted by default. Ejection (excluding
 the node from `GET /nodes`, `GET /capacity`, and `/catalog`'s active-node
@@ -390,12 +427,13 @@ For programmatic access to the coordinator, two things exist:
   caller can bound a request (e.g. `client.getCapacity(AbortSignal.timeout(2000))`);
   the client itself imposes no default or automatic timeout.
 
-**There is still no inference-request endpoint.** Both of the above only
-wrap or describe the coordinator's existing registry, capacity, federation,
-safety-gate, reputation, and locality routes — no request-routing or
-pipeline-assembly system exists yet in this repo (see the Coordinator
-service section above), so neither one has anything that actually submits a
-prompt for inference and returns a generated response.
+**`POST /generate` (and `SwarmClient.generate()`) is the one inference-request
+path that exists today** — both the OpenAPI document and `SwarmClient`
+describe/wrap it the same way as every other route. See the Coordinator
+service section above for what it requires (a running, registered
+`swarm-node-agent` with a matching `servesModel`) and what it still doesn't
+do (dynamic node selection, pre-warming, or streaming — Phases B–D of the
+request-routing design).
 
 ## Web client
 

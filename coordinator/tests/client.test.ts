@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "../src/server.ts";
 import { NodeRegistry } from "../src/registry.ts";
 import { ModelCatalog } from "../src/catalog.ts";
@@ -22,6 +23,23 @@ async function startTestServer() {
   }
   const baseUrl = `http://127.0.0.1:${address.port}`;
   return { server, baseUrl };
+}
+
+async function startStubNodeAgent(handler: (body: unknown) => { status: number; body: unknown }) {
+  const server = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
+    const { status, body: responseBody } = handler(body);
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(responseBody));
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected stub node agent to bind to a port");
+  }
+  return { server, endpoint: `http://127.0.0.1:${address.port}` };
 }
 
 test("SwarmClient registers a node and lists it", async () => {
@@ -140,5 +158,33 @@ test("SwarmClient.registerNode rejects with the server's error detail on a 400",
     );
   } finally {
     server.close();
+  }
+});
+
+test("SwarmClient.registerNode accepts an optional servesModel", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const client = new SwarmClient(baseUrl);
+    const nodeId = await client.registerNode("http://127.0.0.1:50052", "desktop", undefined, "tinyllama-1.1b");
+    const nodes = await client.listNodes();
+    assert.equal((nodes as { nodeId: string; servesModel?: string }[])[0].servesModel, "tinyllama-1.1b");
+    assert.equal(typeof nodeId, "string");
+  } finally {
+    server.close();
+  }
+});
+
+test("SwarmClient.generate returns the generated text from a matching stub node", async () => {
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "Paris." } }));
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const client = new SwarmClient(baseUrl);
+    await client.registerNode(stub.endpoint, "desktop", undefined, "tinyllama-1.1b");
+
+    const result = await client.generate("The capital of France is", "tinyllama-1.1b");
+    assert.deepEqual(result, { text: "Paris." });
+  } finally {
+    server.close();
+    stub.server.close();
   }
 });

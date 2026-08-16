@@ -14,14 +14,29 @@ export class SwarmClient {
     });
   }
 
-  async registerNode(endpoint: string, deviceTier: "desktop" | "android" | "ios", localityGroup?: string, signal?: AbortSignal): Promise<string> {
-    const res = await this.postJson("/nodes/register", { endpoint, deviceTier, localityGroup }, signal);
+  async registerNode(
+    endpoint: string,
+    deviceTier: "desktop" | "android" | "ios",
+    localityGroup?: string,
+    servesModel?: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const res = await this.postJson("/nodes/register", { endpoint, deviceTier, localityGroup, servesModel }, signal);
     if (!res.ok) {
       const detail = await res.text();
       throw new Error(`registerNode failed: ${res.status} ${detail}`);
     }
     const body = await res.json();
     return body.nodeId;
+  }
+
+  async generate(prompt: string, modelId: string, n_predict?: number, signal?: AbortSignal): Promise<{ text: string }> {
+    const res = await this.postJson("/generate", { prompt, modelId, n_predict }, signal);
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(`generate failed: ${res.status} ${detail}`);
+    }
+    return res.json();
   }
 
   async heartbeat(nodeId: string, signal?: AbortSignal): Promise<boolean> {

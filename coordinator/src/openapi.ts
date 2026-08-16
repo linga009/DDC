@@ -23,6 +23,7 @@ export const openApiDocument = {
                   endpoint: { type: "string" },
                   deviceTier: { type: "string", enum: ["desktop", "android", "ios"] },
                   localityGroup: { type: "string" },
+                  servesModel: { type: "string" },
                 },
               },
             },
@@ -207,6 +208,32 @@ export const openApiDocument = {
             description: "Invalid request body",
             content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
           },
+        },
+      },
+    },
+    "/generate": {
+      post: {
+        summary: "Classify a prompt, route it to an active node serving the requested model, and return the generated text. No inference-request endpoint existed before this; still no streaming (the response arrives complete or not at all), no retry, and no fallback to a different node on failure.",
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["prompt", "modelId"],
+                properties: {
+                  prompt: { type: "string" },
+                  modelId: { type: "string" },
+                  n_predict: { type: "integer", minimum: 1, maximum: 512 },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": { description: "Generated text", content: { "application/json": { schema: { type: "object", properties: { text: { type: "string" } } } } } },
+          "400": { description: "Invalid request, or the prompt was classified unsafe", content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } } },
+          "503": { description: "No active node currently serves the requested model" },
+          "502": { description: "The selected node was unreachable or returned a malformed response" },
         },
       },
     },
