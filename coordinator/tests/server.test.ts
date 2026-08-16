@@ -1040,3 +1040,152 @@ test("every path+method documented in openapi.json resolves to a real route (not
     server.close();
   }
 });
+
+// A minimal stand-in for a swarm-node-agent's HTTP interface: responds to
+// POST /complete with a canned body. Used so this test file can exercise
+// /generate's routing logic without a real C++ process or model -- the
+// real cross-language path is covered separately by the opt-in e2e test
+// (Task 3), not here.
+async function startStubNodeAgent(handler: (body: unknown) => { status: number; body: unknown }) {
+  const server = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
+    const { status, body: responseBody } = handler(body);
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(responseBody));
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected stub node agent to bind to a port");
+  }
+  return { server, endpoint: `http://127.0.0.1:${address.port}` };
+}
+
+test("POST /generate classifies, routes to a matching node, and returns its response", async () => {
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "Paris." } }));
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await fetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "The capital of France is", modelId: "tinyllama-1.1b" }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { text: "Paris." });
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /generate returns 400 when prompt is missing", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ modelId: "tinyllama-1.1b" }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /generate returns 400 when modelId is not a known catalog id", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "nonexistent-model" }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /generate returns 400 with n_predict out of the allowed range", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b", n_predict: 9999 }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /generate returns 503 when no active node serves the requested model", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
+    });
+    assert.equal(res.status, 503);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /generate returns 502 when the selected node is unreachable", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:1", deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await fetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
+    });
+    assert.equal(res.status, 502);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /generate excludes a reputation-ejected node from routing", async () => {
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "should not be reached" } }));
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const registerRes = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+    const { nodeId } = await registerRes.json();
+
+    for (let i = 0; i < 5; i++) {
+      await fetch(`${baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST" });
+    }
+
+    const res = await fetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
+    });
+    assert.equal(res.status, 503);
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});

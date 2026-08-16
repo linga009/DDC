@@ -55,6 +55,9 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 const CLASSIFY_TIMEOUT_MS = 2000;
+const DEFAULT_N_PREDICT = 64;
+const MAX_N_PREDICT = 512;
+const GENERATE_TIMEOUT_MS = 120000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -120,7 +123,15 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           }
           localityGroup = candidate.localityGroup;
         }
-        const nodeId = registry.register(candidate.endpoint, candidate.deviceTier as DeviceTier, localityGroup);
+        let servesModel: string | undefined;
+        if (candidate.servesModel !== undefined) {
+          if (typeof candidate.servesModel !== "string" || !catalog.hasModel(candidate.servesModel)) {
+            sendJson(res, 400, { error: "servesModel must be a known catalog model id when provided" });
+            return;
+          }
+          servesModel = candidate.servesModel;
+        }
+        const nodeId = registry.register(candidate.endpoint, candidate.deviceTier as DeviceTier, localityGroup, servesModel);
         sendJson(res, 200, { nodeId });
         return;
       }
@@ -304,6 +315,85 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           // Fail closed: a classifier error (including a malformed result or
           // a timeout) must never be treated as "safe".
           sendJson(res, 200, { safe: false, categories: ["classifier_error"] });
+        }
+        return;
+      }
+
+      if (method === "POST" && parts[0] === "generate" && parts.length === 1) {
+        const body = await readJsonBody(req);
+        if (typeof body !== "object" || body === null) {
+          sendJson(res, 400, { error: "request body must be a JSON object" });
+          return;
+        }
+        const candidate = body as Record<string, unknown>;
+
+        if (typeof candidate.prompt !== "string") {
+          sendJson(res, 400, { error: "prompt must be a string" });
+          return;
+        }
+        if (typeof candidate.modelId !== "string" || !catalog.hasModel(candidate.modelId)) {
+          sendJson(res, 400, { error: "modelId must be a known catalog model id" });
+          return;
+        }
+        let nPredict = DEFAULT_N_PREDICT;
+        if (candidate.n_predict !== undefined) {
+          if (
+            typeof candidate.n_predict !== "number" ||
+            !Number.isInteger(candidate.n_predict) ||
+            candidate.n_predict < 1 ||
+            candidate.n_predict > MAX_N_PREDICT
+          ) {
+            sendJson(res, 400, { error: `n_predict must be an integer between 1 and ${MAX_N_PREDICT}` });
+            return;
+          }
+          nPredict = candidate.n_predict;
+        }
+
+        try {
+          const result = await withTimeout(classifier.classify(candidate.prompt), CLASSIFY_TIMEOUT_MS);
+          const safe = result?.safe;
+          const categories = result?.categories;
+          if (typeof safe !== "boolean" || !Array.isArray(categories)) {
+            throw new Error("classifier returned a malformed result");
+          }
+          if (!safe) {
+            sendJson(res, 400, { safe: false, categories: categories.map(String) });
+            return;
+          }
+        } catch {
+          // Fail closed, matching /classify's own established behavior: a
+          // classifier error (including a malformed result or a timeout) must
+          // never be treated as "safe enough to route."
+          sendJson(res, 400, { safe: false, categories: ["classifier_error"] });
+          return;
+        }
+
+        const node = registry.listActive(reputation).find(n => n.servesModel === candidate.modelId);
+        if (!node) {
+          sendJson(res, 503, { error: `no active node currently serves model "${candidate.modelId}"` });
+          return;
+        }
+
+        try {
+          const nodeRes = await fetch(`${node.endpoint}/complete`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ prompt: candidate.prompt, n_predict: nPredict }),
+            signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
+          });
+          if (!nodeRes.ok) {
+            sendJson(res, 502, { error: `node returned status ${nodeRes.status}` });
+            return;
+          }
+          const nodeBody = await nodeRes.json();
+          if (typeof nodeBody.text !== "string") {
+            sendJson(res, 502, { error: "node returned a malformed response" });
+            return;
+          }
+          sendJson(res, 200, { text: nodeBody.text });
+        } catch (err) {
+          console.warn(`failed to forward /generate to node ${node.endpoint}:`, err);
+          sendJson(res, 502, { error: "failed to reach the selected node" });
         }
         return;
       }
