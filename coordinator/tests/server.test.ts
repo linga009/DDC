@@ -729,3 +729,93 @@ test("a node ejected by reputation disappears from GET /nodes and stops counting
     server.close();
   }
 });
+
+test("POST /nodes/register accepts an optional localityGroup and it is echoed back via GET /nodes", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const registerRes = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop", localityGroup: "kitchen-mesh" }),
+    });
+    assert.equal(registerRes.status, 200);
+
+    const nodes = await (await fetch(`${baseUrl}/nodes`)).json();
+    assert.equal(nodes[0].localityGroup, "kitchen-mesh");
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /nodes/register rejects a non-string localityGroup", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop", localityGroup: 42 }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /nodes/register rejects an empty-string localityGroup", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop", localityGroup: "" }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /nodes/locality groups registered nodes by their localityGroup, with ungrouped nodes bucketed separately", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop", localityGroup: "kitchen-mesh" }),
+    });
+    await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50053", deviceTier: "android" }),
+    });
+
+    const res = await fetch(`${baseUrl}/nodes/locality`);
+    assert.equal(res.status, 200);
+    const groups = await res.json();
+    assert.equal(groups["kitchen-mesh"].length, 1);
+    assert.equal(groups["ungrouped"].length, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test("GET /nodes/locality excludes a node ejected by reputation", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const registerRes = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop", localityGroup: "kitchen-mesh" }),
+    });
+    const { nodeId } = await registerRes.json();
+
+    for (let i = 0; i < 5; i++) {
+      await fetch(`${baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST" });
+    }
+
+    const groups = await (await fetch(`${baseUrl}/nodes/locality`)).json();
+    assert.equal(groups["kitchen-mesh"], undefined);
+  } finally {
+    server.close();
+  }
+});

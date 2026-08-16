@@ -89,7 +89,15 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           sendJson(res, 400, { error: "deviceTier must be one of: desktop, android, ios" });
           return;
         }
-        const nodeId = registry.register(candidate.endpoint, candidate.deviceTier as DeviceTier);
+        let localityGroup: string | undefined;
+        if (candidate.localityGroup !== undefined) {
+          if (typeof candidate.localityGroup !== "string" || candidate.localityGroup.length === 0) {
+            sendJson(res, 400, { error: "localityGroup must be a non-empty string when provided" });
+            return;
+          }
+          localityGroup = candidate.localityGroup;
+        }
+        const nodeId = registry.register(candidate.endpoint, candidate.deviceTier as DeviceTier, localityGroup);
         sendJson(res, 200, { nodeId });
         return;
       }
@@ -144,6 +152,16 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
 
       if (method === "GET" && parts[0] === "nodes" && parts.length === 1) {
         sendJson(res, 200, registry.listActive(reputation));
+        return;
+      }
+
+      if (method === "GET" && parts[0] === "nodes" && parts.length === 2 && parts[1] === "locality") {
+        const groups = registry.groupByLocality(reputation);
+        const asObject: Record<string, unknown> = {};
+        for (const [key, nodes] of groups) {
+          asObject[key] = nodes;
+        }
+        sendJson(res, 200, asObject);
         return;
       }
 
