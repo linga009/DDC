@@ -249,6 +249,32 @@ client-side mesh-discovery mechanism (WiFi Direct, Multipeer Connectivity,
 LAN broadcast) yet exists to produce real, verifiable locality identifiers.
 Both are expected to be built against this interface later.
 
+## Developer API
+
+For programmatic access to the coordinator, two things exist:
+
+- **`GET /openapi.json`** — a hand-written OpenAPI 3.0 document describing
+  every endpoint listed above. Point standard OpenAPI tooling (Swagger UI,
+  client codegen, Postman, etc.) at `http://<host>:<port>/openapi.json` on a
+  running instance to explore the API or generate a client for it. It is
+  hand-written, not generated from the route code, so it can drift from
+  actual behavior if a route's request/response shape changes without the
+  doc being updated — a test in `coordinator/tests/server.test.ts` only
+  catches a documented path disappearing, not a shape drifting.
+- **`coordinator/src/client.ts`** — a minimal `SwarmClient` class, one typed
+  method per endpoint listed above, that talks to those routes directly
+  (independent of the OpenAPI document). It is plain TypeScript with zero
+  dependencies (only native `fetch`) and runs directly under Node.js's
+  native TypeScript execution, no build step — developers can import it
+  as-is or copy it as a starting point for their own client.
+
+**There is still no inference-request endpoint.** Both of the above only
+wrap or describe the coordinator's existing registry, capacity, federation,
+safety-gate, reputation, and locality routes — no request-routing or
+pipeline-assembly system exists yet in this repo (see the Coordinator
+service section above), so neither one has anything that actually submits a
+prompt for inference and returns a generated response.
+
 ## Web client
 
 When the coordinator is running, it serves a small browser dashboard at `/`
