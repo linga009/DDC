@@ -105,6 +105,23 @@ This downloads a small TinyLlama GGUF model into `models/` for use by the
 test suite and the `swarm-cli` example below. The second script fetches a
 ~90MB MoE (mixture-of-experts) model used by the layer-placement tests.
 
+Two more small models are available for testing against real, current
+open-weight model families rather than only the TinyLlama fixture above:
+
+```bash
+./scripts/download_qwen_test_model.sh       # Qwen2.5 0.5B Instruct, ~490MB
+./scripts/download_deepseek_test_model.sh   # DeepSeek-R1-Distill-Qwen 1.5B, ~1.1GB
+```
+
+Both are already wired into the coordinator's default model catalog
+(`qwen2.5-0.5b`, `deepseek-r1-distill-qwen-1.5b` — see the Coordinator
+service section below) and have been verified end-to-end through
+`swarm-node-agent` and `POST /generate`. The DeepSeek download script uses
+`curl -C -` (resume) with 8 retries — this specific file has been observed
+to have its connection drop mid-transfer without curl reporting an error,
+leaving a truncated file that still parses as a valid GGUF header but fails
+to load at runtime; the checksum check catches this if it happens again.
+
 ## Build
 
 ```bash

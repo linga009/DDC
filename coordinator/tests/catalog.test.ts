@@ -2,16 +2,22 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { ModelCatalog } from "../src/catalog.ts";
 
-test("default catalog has four tiers with increasing thresholds, tier 0 always available", () => {
+test("default catalog has six tiers with increasing thresholds, zero-threshold tiers always available", () => {
   const catalog = new ModelCatalog();
   const result = catalog.availability(0);
 
-  assert.equal(result.length, 4);
+  assert.equal(result.length, 6);
+  // The three zero-threshold (small, always-on) models are available with
+  // no active nodes at all; the three larger tiers are not.
   assert.equal(result[0].minActiveNodes, 0);
   assert.equal(result[0].available, true);
-  assert.equal(result[1].available, false);
-  assert.equal(result[2].available, false);
+  assert.equal(result[1].minActiveNodes, 0);
+  assert.equal(result[1].available, true);
+  assert.equal(result[2].minActiveNodes, 0);
+  assert.equal(result[2].available, true);
   assert.equal(result[3].available, false);
+  assert.equal(result[4].available, false);
+  assert.equal(result[5].available, false);
 });
 
 test("models unlock exactly at their threshold, not one below", () => {

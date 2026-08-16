@@ -14,6 +14,8 @@ export interface AvailabilityEntry extends CatalogEntry {
 // and this plan's Global Constraints for why).
 const DEFAULT_CATALOG: CatalogEntry[] = [
   { id: "tinyllama-1.1b", displayName: "TinyLlama 1.1B", minActiveNodes: 0 },
+  { id: "qwen2.5-0.5b", displayName: "Qwen2.5 0.5B Instruct", minActiveNodes: 0 },
+  { id: "deepseek-r1-distill-qwen-1.5b", displayName: "DeepSeek-R1-Distill-Qwen 1.5B", minActiveNodes: 0 },
   { id: "small-7b", displayName: "Small 7-8B dense model", minActiveNodes: 2 },
   { id: "mixtral-8x7b", displayName: "Mixtral 8x7B", minActiveNodes: 5 },
   { id: "mixtral-8x22b", displayName: "Mixtral 8x22B", minActiveNodes: 10 },
