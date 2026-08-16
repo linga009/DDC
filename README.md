@@ -135,6 +135,15 @@ Endpoints:
 - `POST /peers/:peerId/heartbeat` — refresh a peer's liveness
 - `GET /peers` — list currently active peers
 - `DELETE /peers/:peerId` — deregister a peer
+- `POST /classify` — pluggable safety gate: submit `{ "prompt": string }`,
+  get back `{ safe: boolean, categories: string[] }`. **The shipped
+  `KeywordSafetyClassifier` ships with zero rules by default and performs no
+  real content moderation — it exists only to prove the gate's plumbing
+  (fail-closed error handling, request/response shape, timeout behavior). A
+  real classifier must be supplied by implementing the `SafetyClassifier`
+  interface (`coordinator/src/safety_classifier.ts`).** `/classify` is also
+  not yet wired into any request-submission path — nothing currently calls
+  it automatically before routing a prompt for inference.
 
 **Caveat:** there is no authentication, and by default the server binds only
 to `127.0.0.1`; setting `HOST` to bind wider (e.g. `0.0.0.0`) should only be
