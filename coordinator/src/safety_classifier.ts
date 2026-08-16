@@ -23,7 +23,24 @@ export class KeywordSafetyClassifier implements SafetyClassifier {
   private readonly rules: KeywordRule[];
 
   constructor(rules: KeywordRule[]) {
-    this.rules = rules;
+    // Rebuild every rule rather than storing the caller's array/patterns by
+    // reference. Two independent problems this fixes:
+    //
+    // 1. RegExp.prototype.test mutates .lastIndex when the pattern carries
+    //    the `g` or `y` flag, so a rule written the natural way (/token/g)
+    //    would make the SAME prompt alternate between matching and not
+    //    matching across successive classify() calls -- a real fail-open.
+    //    Stripping g/y (order/behavior is otherwise unaffected for a single
+    //    test() per call) makes matching stateless and deterministic.
+    // 2. `.map()` produces a fresh array, so a caller who mutates their own
+    //    rules array after construction (e.g. pushing a new rule) cannot
+    //    silently alter the classifier's already-constructed policy.
+    this.rules = rules.map(r => ({
+      category: r.category,
+      pattern: /[gy]/.test(r.pattern.flags)
+        ? new RegExp(r.pattern.source, r.pattern.flags.replace(/[gy]/g, ""))
+        : r.pattern,
+    }));
   }
 
   async classify(prompt: string): Promise<ClassificationResult> {
