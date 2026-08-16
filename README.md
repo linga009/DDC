@@ -215,10 +215,31 @@ arbitrary string a node supplies at registration time — the coordinator
 performs no check that it reflects real physical or network proximity. A
 node can claim membership in any group, including one it has no actual
 adjacency to, with no cost or detection (the same no-auth caveat above
-applies here too). `GET /nodes/locality` exists purely as a stable,
-queryable interface for grouping; no pipeline-assembly or request-routing
-system in this repo yet consumes it (see the federation caveat above — this
-repo has no cross-instance or cross-node request routing at all yet), and no
+applies here too). This is worse than a single false claim: because
+`NodeRegistry.register()` mints a fresh `randomUUID()` on every call with no
+endpoint dedupe (the same gap noted in the reputation gaming-vectors above),
+one physical device can register itself repeatedly under different
+`localityGroup` values and appear in multiple groups simultaneously —
+inflating any group's apparent size for free, or flooding every group at
+once. Verified live: the same endpoint registered under `"kitchen-mesh"`,
+`"office-mesh"`, and `"garage-mesh"` produced 3 distinct nodeIds, all live
+simultaneously in `GET /nodes/locality`, all backed by the same physical
+endpoint; re-registering under a new group does not remove the old
+registration either, so the stale entry persists in its original group
+until its normal liveness/heartbeat timeout (currently 30s) expires. This
+matters beyond the general no-auth caveat because `GET /nodes/locality`
+exists as groundwork for a future pipeline assembler that will likely
+prefer larger or majority locality clusters when selecting nodes — making
+this a vector against the exact consumer this endpoint is groundwork for.
+The root cause is the same missing stable-node-identity fix already named
+as a prerequisite in the reputation gaming-vectors note above; see that
+paragraph rather than repeating it here. Separately, a node can also
+register with `localityGroup: "ungrouped"` verbatim, which is
+indistinguishable from a node that never set the field at all. `GET
+/nodes/locality` exists purely as a stable, queryable interface for
+grouping; no pipeline-assembly or request-routing system in this repo yet
+consumes it (see the federation caveat above — this repo has no
+cross-instance or cross-node request routing at all yet), and no
 client-side mesh-discovery mechanism (WiFi Direct, Multipeer Connectivity,
 LAN broadcast) yet exists to produce real, verifiable locality identifiers.
 Both are expected to be built against this interface later.

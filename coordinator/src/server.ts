@@ -157,6 +157,12 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
 
       if (method === "GET" && parts[0] === "nodes" && parts.length === 2 && parts[1] === "locality") {
         const groups = registry.groupByLocality(reputation);
+        // Object.fromEntries (not a manual loop) avoids invoking Object.prototype's
+        // legacy __proto__ setter when a self-reported localityGroup is literally
+        // "__proto__" (see commit 7060b00). Side effect: integer-like group names
+        // sort first in the JSON output instead of preserving Map insertion order
+        // — a documented own-property-ordering quirk, not a bug (JSON objects are
+        // formally unordered).
         const asObject = Object.fromEntries(groups);
         sendJson(res, 200, asObject);
         return;
