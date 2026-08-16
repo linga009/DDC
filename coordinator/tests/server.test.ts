@@ -819,3 +819,36 @@ test("GET /nodes/locality excludes a node ejected by reputation", async () => {
     server.close();
   }
 });
+
+test("GET /nodes/locality safely handles a node that self-reports localityGroup \"__proto__\"", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop", localityGroup: "__proto__" }),
+    });
+
+    const res = await fetch(`${baseUrl}/nodes/locality`);
+    assert.equal(res.status, 200);
+    const rawText = await res.text();
+    const body = JSON.parse(rawText);
+
+    // Must be an OWN property, not the inherited Object.prototype accessor
+    // (a buggy implementation that assigns via `obj["__proto__"] = nodes`
+    // would trigger the legacy setter instead of creating an own key, so
+    // `hasOwnProperty` is the only check that actually distinguishes the
+    // two cases -- a truthiness check on body["__proto__"] would pass in
+    // both the buggy and fixed cases).
+    assert.equal(Object.prototype.hasOwnProperty.call(body, "__proto__"), true);
+    assert.equal(body["__proto__"].length, 1);
+    assert.equal(body["__proto__"][0].endpoint, "127.0.0.1:50052");
+
+    // The object's actual prototype must remain untouched -- a buggy
+    // implementation reassigns it to the nodes array via the legacy
+    // __proto__ setter.
+    assert.equal(Object.getPrototypeOf(body), Object.prototype);
+  } finally {
+    server.close();
+  }
+});

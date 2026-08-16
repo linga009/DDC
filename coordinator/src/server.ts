@@ -157,10 +157,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
 
       if (method === "GET" && parts[0] === "nodes" && parts.length === 2 && parts[1] === "locality") {
         const groups = registry.groupByLocality(reputation);
-        const asObject: Record<string, unknown> = {};
-        for (const [key, nodes] of groups) {
-          asObject[key] = nodes;
-        }
+        const asObject = Object.fromEntries(groups);
         sendJson(res, 200, asObject);
         return;
       }
