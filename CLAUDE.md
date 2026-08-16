@@ -119,7 +119,7 @@ Spec: [`docs/superpowers/specs/2026-08-14-distributed-llm-inference-design.md`](
 | 6 | [Federation protocol](docs/superpowers/plans/2026-08-15-federation-protocol.md) (peer registry) | Done |
 | 7 | [Safety classifier gateway](docs/superpowers/plans/2026-08-16-safety-classifier-gateway.md) (`/classify`) | Done |
 | 8 | [Trust/reputation tracking](docs/superpowers/plans/2026-08-16-trust-reputation-tracking.md) (ejection policy) | Done |
-| 9 | [Locality-aware node clustering](docs/superpowers/plans/2026-08-16-locality-clustering.md) | In progress |
+| 9 | [Locality-aware node clustering](docs/superpowers/plans/2026-08-16-locality-clustering.md) | Done |
 | 10 | Client apps (Android, iOS, Linux, Windows, macOS) | Not yet designed |
 | 11 | Developer API | Not yet designed |
 
