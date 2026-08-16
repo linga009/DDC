@@ -161,6 +161,8 @@ Endpoints:
   client section below)
 - `GET /style.css` — serves the web dashboard's stylesheet (see Web client
   section below)
+- `GET /openapi.json` — serves the hand-written OpenAPI 3.0 document
+  describing the JSON API routes above (see Developer API section below)
 
 A node with zero recorded checks is trusted by default. Ejection (excluding
 the node from `GET /nodes`, `GET /capacity`, and `/catalog`'s active-node
@@ -254,19 +256,25 @@ Both are expected to be built against this interface later.
 For programmatic access to the coordinator, two things exist:
 
 - **`GET /openapi.json`** — a hand-written OpenAPI 3.0 document describing
-  every endpoint listed above. Point standard OpenAPI tooling (Swagger UI,
-  client codegen, Postman, etc.) at `http://<host>:<port>/openapi.json` on a
-  running instance to explore the API or generate a client for it. It is
-  hand-written, not generated from the route code, so it can drift from
-  actual behavior if a route's request/response shape changes without the
-  doc being updated — a test in `coordinator/tests/server.test.ts` only
-  catches a documented path disappearing, not a shape drifting.
+  every JSON API endpoint listed above (the static dashboard routes and
+  `/openapi.json` itself are excluded). Point standard OpenAPI tooling
+  (Swagger UI, client codegen, Postman, etc.) at
+  `http://<host>:<port>/openapi.json` on a running instance to explore the
+  API or generate a client for it. It is hand-written, not generated from
+  the route code, so it can drift from actual behavior if a route's
+  request/response shape changes without the doc being updated — a test in
+  `coordinator/tests/server.test.ts` only catches a documented path
+  disappearing, not a shape drifting.
 - **`coordinator/src/client.ts`** — a minimal `SwarmClient` class, one typed
-  method per endpoint listed above, that talks to those routes directly
-  (independent of the OpenAPI document). It is plain TypeScript with zero
-  dependencies (only native `fetch`) and runs directly under Node.js's
-  native TypeScript execution, no build step — developers can import it
-  as-is or copy it as a starting point for their own client.
+  method per JSON API endpoint listed above (the static dashboard routes
+  and `/openapi.json` itself are excluded), that talks to those routes
+  directly (independent of the OpenAPI document). It is plain TypeScript
+  with zero dependencies (only native `fetch`) and runs directly under
+  Node.js's native TypeScript execution, no build step — developers can
+  import it as-is or copy it as a starting point for their own client.
+  Every method accepts an optional trailing `signal?: AbortSignal` so a
+  caller can bound a request (e.g. `client.getCapacity(AbortSignal.timeout(2000))`);
+  the client itself imposes no default or automatic timeout.
 
 **There is still no inference-request endpoint.** Both of the above only
 wrap or describe the coordinator's existing registry, capacity, federation,

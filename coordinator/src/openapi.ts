@@ -30,31 +30,38 @@ export const openApiDocument = {
         },
         responses: {
           "200": { description: "Registered", content: { "application/json": { schema: { type: "object", properties: { nodeId: { type: "string" } } } } } },
-          "400": { description: "Invalid request body" },
+          "400": {
+            description: "Invalid request body",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
         },
       },
     },
     "/nodes/{nodeId}/heartbeat": {
       post: {
         summary: "Refresh a node's liveness",
+        parameters: [{ name: "nodeId", in: "path", required: true, schema: { type: "string" } }],
         responses: { "204": { description: "Heartbeat accepted" }, "404": { description: "Unknown nodeId" } },
       },
     },
     "/nodes/{nodeId}/reputation/agree": {
       post: {
         summary: "Record that a node's output agreed with a redundant spot-check",
+        parameters: [{ name: "nodeId", in: "path", required: true, schema: { type: "string" } }],
         responses: { "204": { description: "Recorded" }, "404": { description: "Unknown nodeId" } },
       },
     },
     "/nodes/{nodeId}/reputation/disagree": {
       post: {
         summary: "Record that a node's output disagreed with a redundant spot-check",
+        parameters: [{ name: "nodeId", in: "path", required: true, schema: { type: "string" } }],
         responses: { "204": { description: "Recorded" }, "404": { description: "Unknown nodeId" } },
       },
     },
     "/nodes/{nodeId}/reputation": {
       get: {
         summary: "Get a node's reputation stats",
+        parameters: [{ name: "nodeId", in: "path", required: true, schema: { type: "string" } }],
         responses: {
           "200": {
             description: "Reputation stats",
@@ -67,7 +74,27 @@ export const openApiDocument = {
     "/nodes": {
       get: {
         summary: "List currently active nodes",
-        responses: { "200": { description: "Active nodes", content: { "application/json": { schema: { type: "array" } } } } },
+        responses: {
+          "200": {
+            description: "Active nodes",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      nodeId: { type: "string" },
+                      endpoint: { type: "string" },
+                      deviceTier: { type: "string" },
+                      localityGroup: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
     },
     "/nodes/locality": {
@@ -90,32 +117,75 @@ export const openApiDocument = {
         },
         responses: {
           "200": { description: "Registered", content: { "application/json": { schema: { type: "object", properties: { peerId: { type: "string" } } } } } },
-          "400": { description: "Invalid endpoint" },
+          "400": {
+            description: "Invalid endpoint",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
         },
       },
     },
     "/peers/{peerId}/heartbeat": {
       post: {
         summary: "Refresh a peer's liveness",
+        parameters: [{ name: "peerId", in: "path", required: true, schema: { type: "string" } }],
         responses: { "204": { description: "Heartbeat accepted" }, "404": { description: "Unknown peerId" } },
       },
     },
     "/peers": {
       get: {
         summary: "List currently active peers",
-        responses: { "200": { description: "Active peers", content: { "application/json": { schema: { type: "array" } } } } },
+        responses: {
+          "200": {
+            description: "Active peers",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      peerId: { type: "string" },
+                      endpoint: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
     },
     "/peers/{peerId}": {
       delete: {
         summary: "Deregister a peer",
+        parameters: [{ name: "peerId", in: "path", required: true, schema: { type: "string" } }],
         responses: { "204": { description: "Deregistered" }, "404": { description: "Unknown peerId" } },
       },
     },
     "/catalog": {
       get: {
         summary: "List models with availability gated on active node count (local + federated)",
-        responses: { "200": { description: "Catalog", content: { "application/json": { schema: { type: "array" } } } } },
+        responses: {
+          "200": {
+            description: "Catalog",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      id: { type: "string" },
+                      displayName: { type: "string" },
+                      minActiveNodes: { type: "integer" },
+                      available: { type: "boolean" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
     },
     "/classify": {
@@ -125,8 +195,18 @@ export const openApiDocument = {
           content: { "application/json": { schema: { type: "object", required: ["prompt"], properties: { prompt: { type: "string" } } } } },
         },
         responses: {
-          "200": { description: "Classification result", content: { "application/json": { schema: { type: "object", properties: { safe: { type: "boolean" }, categories: { type: "array", items: { type: "string" } } } } } } },
-          "400": { description: "Invalid request body" },
+          "200": {
+            description:
+              "Classification result. If the underlying classifier throws or times out, the endpoint fails " +
+              'closed and returns { safe: false, categories: ["classifier_error"] } rather than a distinct ' +
+              "error status -- callers should treat the literal category \"classifier_error\" as a signal " +
+              "that classification did not actually run.",
+            content: { "application/json": { schema: { type: "object", properties: { safe: { type: "boolean" }, categories: { type: "array", items: { type: "string" } } } } } },
+          },
+          "400": {
+            description: "Invalid request body",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
         },
       },
     },

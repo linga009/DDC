@@ -126,3 +126,19 @@ test("SwarmClient classifies a prompt", async () => {
     server.close();
   }
 });
+
+test("SwarmClient.registerNode rejects with the server's error detail on a 400", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const client = new SwarmClient(baseUrl);
+    await assert.rejects(
+      () => client.registerNode("127.0.0.1:50052", "toaster" as any),
+      (err: Error) => {
+        assert.match(err.message, /deviceTier must be one of/);
+        return true;
+      },
+    );
+  } finally {
+    server.close();
+  }
+});
