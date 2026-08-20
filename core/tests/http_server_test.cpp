@@ -175,4 +175,24 @@ TEST_F(HttpServerFixture, ReturnsA400ForHeadersExceedingTheSizeCap) {
     EXPECT_NE(response.find("HTTP/1.1 400"), std::string::npos);
 }
 
+TEST_F(HttpServerFixture, ParsesRequestHeadersIntoTheHandler) {
+    swarm::HttpServer server(kTestPort + 7);
+    std::string capturedAuth;
+    bool foundHeader = false;
+    server.route("GET", "/health", [&capturedAuth, &foundHeader](const swarm::HttpRequest& req) {
+        auto it = req.headers.find("authorization");
+        foundHeader = it != req.headers.end();
+        if (foundHeader) {
+            capturedAuth = it->second;
+        }
+        return swarm::HttpResponse{200, "{}"};
+    });
+    startServer(server);
+
+    sendRawRequest(kTestPort + 7, "GET /health HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer abc123\r\n\r\n");
+
+    EXPECT_TRUE(foundHeader);
+    EXPECT_EQ(capturedAuth, "Bearer abc123");
+}
+
 }  // namespace

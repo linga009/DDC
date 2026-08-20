@@ -3,6 +3,7 @@
 #include <cctype>
 #include <csignal>
 #include <cstdint>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -86,6 +87,7 @@ struct ParsedHead {
     std::string method;
     std::string path;
     size_t contentLength = 0;
+    std::map<std::string, std::string> headers;
 };
 
 // Parses the request line and headers out of `head` (which starts at the
@@ -132,25 +134,29 @@ ParsedHead parseHead(const std::string& head, std::string& bodySoFar) {
         for (char& c : name) {
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
+        std::string value = headerLine.substr(colon + 1);
+        size_t firstNonSpace = value.find_first_not_of(" \t");
+        value = (firstNonSpace == std::string::npos) ? std::string() : value.substr(firstNonSpace);
+        result.headers[name] = value;
+
         if (name == "content-length") {
-            std::string value = headerLine.substr(colon + 1);
-            size_t firstDigit = value.find_first_not_of(" \t");
-            if (firstDigit != std::string::npos) {
-                if (value[firstDigit] == '-') {
-                    // std::stoul accepts a leading '-' and silently wraps it
-                    // into a huge unsigned value (per strtoul's documented
-                    // behavior) instead of throwing -- reject explicitly so
-                    // "Content-Length: -5" is treated as malformed rather
-                    // than as a request to read billions of bytes of body.
-                    throw std::runtime_error("invalid Content-Length");
-                }
-                unsigned long parsed = std::stoul(value.substr(firstDigit));
-                if (parsed > kMaxRequestBodyBytes) {
-                    throw std::runtime_error(
-                        "Content-Length exceeds maximum allowed request body size");
-                }
-                result.contentLength = static_cast<size_t>(parsed);
+            if (value.empty()) {
+                continue;
             }
+            if (value[0] == '-') {
+                // std::stoul accepts a leading '-' and silently wraps it
+                // into a huge unsigned value (per strtoul's documented
+                // behavior) instead of throwing -- reject explicitly so
+                // "Content-Length: -5" is treated as malformed rather
+                // than as a request to read billions of bytes of body.
+                throw std::runtime_error("invalid Content-Length");
+            }
+            unsigned long parsed = std::stoul(value);
+            if (parsed > kMaxRequestBodyBytes) {
+                throw std::runtime_error(
+                    "Content-Length exceeds maximum allowed request body size");
+            }
+            result.contentLength = static_cast<size_t>(parsed);
         }
     }
     return result;
@@ -174,6 +180,7 @@ void writeResponse(socket_t s, const HttpResponse& response) {
     const char* statusText = response.status == 200 ? "OK"
                               : response.status == 404 ? "Not Found"
                               : response.status == 400 ? "Bad Request"
+                              : response.status == 401 ? "Unauthorized"
                                                         : "Error";
     std::ostringstream out;
     out << "HTTP/1.1 " << response.status << " " << statusText << "\r\n"
@@ -253,7 +260,7 @@ void HttpServer::run() {
             ParsedHead parsed = parseHead(head, bodySoFar);
             std::string body = readBody(client, std::move(bodySoFar), parsed.contentLength);
 
-            HttpRequest request{parsed.method, parsed.path, body};
+            HttpRequest request{parsed.method, parsed.path, body, parsed.headers};
 
             HttpResponse response{404, ""};
             for (const auto& routeEntry : routes_) {

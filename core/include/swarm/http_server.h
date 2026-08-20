@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -11,6 +12,9 @@ struct HttpRequest {
     std::string method;
     std::string path;
     std::string body;
+    // Header names are lowercased during parsing -- look up with a
+    // lowercase key (e.g. headers.find("authorization"), not "Authorization").
+    std::map<std::string, std::string> headers;
 };
 
 struct HttpResponse {
