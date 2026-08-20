@@ -1,4 +1,5 @@
 import { createServer as createHttpServer, IncomingMessage, ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
@@ -54,6 +55,23 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+function isAuthorized(req: IncomingMessage, authToken: string): boolean {
+  const header = req.headers.authorization;
+  if (typeof header !== "string" || !header.startsWith("Bearer ")) {
+    return false;
+  }
+  const provided = Buffer.from(header.slice("Bearer ".length));
+  const expected = Buffer.from(authToken);
+  // timingSafeEqual throws on mismatched lengths rather than returning
+  // false -- checking length first is fine (it doesn't leak anything
+  // about the token's *content*, only its fixed, publicly-known length),
+  // it's the byte-by-byte comparison that must be constant-time.
+  if (provided.length !== expected.length) {
+    return false;
+  }
+  return timingSafeEqual(provided, expected);
+}
+
 const CLASSIFY_TIMEOUT_MS = 2000;
 const DEFAULT_N_PREDICT = 64;
 const MAX_N_PREDICT = 512;
@@ -69,9 +87,20 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-async function fetchPeerCapacity(endpoint: string): Promise<number> {
+async function fetchPeerCapacity(endpoint: string, authToken: string): Promise<number> {
   try {
-    const res = await fetch(`${endpoint}/capacity`, { signal: AbortSignal.timeout(2000) });
+    // Same reasoning as POST /generate's outbound fetch to a node agent:
+    // the coordinator is itself a client of the peer here, not just a
+    // server to the outside world, and now that GET /capacity requires a
+    // token, this hop needs to authenticate too. This assumes same-operator
+    // federation (peers sharing one token) -- cross-operator federation
+    // with differing secrets remains the open question named in the design
+    // doc; a peer that rejects this token degrades gracefully below, the
+    // same as an unreachable or erroring peer already did.
+    const res = await fetch(`${endpoint}/capacity`, {
+      headers: { authorization: `Bearer ${authToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
     if (!res.ok) {
       console.warn(`peer ${endpoint} returned non-OK status from /capacity: ${res.status}`);
       return 0;
@@ -86,19 +115,34 @@ async function fetchPeerCapacity(endpoint: string): Promise<number> {
   }
 }
 
-async function federatedActiveNodeCount(registry: NodeRegistry, peers: PeerRegistry, reputation: ReputationTracker): Promise<number> {
+async function federatedActiveNodeCount(registry: NodeRegistry, peers: PeerRegistry, reputation: ReputationTracker, authToken: string): Promise<number> {
   const local = registry.listActive(reputation).length;
   const peerCounts = await Promise.all(
-    peers.listActive().map(peer => fetchPeerCapacity(peer.endpoint)));
+    peers.listActive().map(peer => fetchPeerCapacity(peer.endpoint, authToken)));
   return local + peerCounts.reduce((sum, n) => sum + n, 0);
 }
 
-export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier, reputation: ReputationTracker) {
+export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier, reputation: ReputationTracker, authToken: string) {
   return createHttpServer(async (req, res) => {
     try {
       const method = req.method ?? "GET";
       const url = new URL(req.url ?? "/", "http://localhost");
       const parts = url.pathname.split("/").filter(Boolean);
+
+      // These four are the only routes reachable with no token: the static
+      // dashboard shell (you need to load the page before you have
+      // anywhere to paste a token into) and the OpenAPI document (a fixed
+      // API schema, not live swarm data -- a developer needs to be able to
+      // read it to find out a token is even required).
+      const isPublicRoute =
+        (method === "GET" && parts.length === 0) ||
+        (method === "GET" && parts.length === 1 &&
+          (parts[0] === "app.js" || parts[0] === "style.css" || parts[0] === "openapi.json"));
+
+      if (!isPublicRoute && !isAuthorized(req, authToken)) {
+        sendJson(res, 401, { error: "missing or invalid Authorization header" });
+        return;
+      }
 
       if (method === "POST" && parts[0] === "nodes" && parts.length === 2 && parts[1] === "register") {
         const body = await readJsonBody(req);
@@ -295,7 +339,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
       }
 
       if (method === "GET" && parts[0] === "catalog" && parts.length === 1) {
-        const activeNodeCount = await federatedActiveNodeCount(registry, peers, reputation);
+        const activeNodeCount = await federatedActiveNodeCount(registry, peers, reputation, authToken);
         sendJson(res, 200, catalog.availability(activeNodeCount));
         return;
       }
@@ -395,7 +439,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         try {
           const nodeRes = await fetch(`${node.endpoint}/complete`, {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: { "content-type": "application/json", "authorization": `Bearer ${authToken}` },
             body: JSON.stringify({ prompt: candidate.prompt, n_predict: nPredict }),
             signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
           });

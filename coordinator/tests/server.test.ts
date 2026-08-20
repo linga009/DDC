@@ -15,15 +15,18 @@ const DEFAULT_TEST_CATALOG: CatalogEntry[] = [
   { id: "small-7b", displayName: "Small 7-8B dense model", minActiveNodes: 1 },
 ];
 
+const TEST_AUTH_TOKEN = "test-secret-token-1234";
+
 async function startTestServer(
   catalogEntries: CatalogEntry[] = DEFAULT_TEST_CATALOG,
   peers: PeerRegistry = new PeerRegistry(),
   classifier: SafetyClassifier = new KeywordSafetyClassifier([]),
   reputation: ReputationTracker = new ReputationTracker(),
+  authToken: string = TEST_AUTH_TOKEN,
 ) {
   const registry = new NodeRegistry();
   const catalog = new ModelCatalog(catalogEntries);
-  const server = createServer(registry, catalog, peers, classifier, reputation);
+  const server = createServer(registry, catalog, peers, classifier, reputation, authToken);
 
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -31,13 +34,136 @@ async function startTestServer(
     throw new Error("expected server to bind a real port");
   }
   const baseUrl = `http://127.0.0.1:${address.port}`;
-  return { server, baseUrl, registry, peers };
+  return { server, baseUrl, registry, peers, authToken };
 }
+
+// Every existing test in this file that calls bare `fetch(...)` is being
+// migrated to call `authFetch(...)` instead (same signature, one line
+// each) -- this helper is what actually attaches the token, so tests read
+// almost identically to before but keep working once the server enforces
+// auth on every route.
+function authFetch(url: string, options: RequestInit = {}, token: string = TEST_AUTH_TOKEN): Promise<Response> {
+  return fetch(url, {
+    ...options,
+    headers: { ...(options.headers ?? {}), authorization: `Bearer ${token}` },
+  });
+}
+
+test("a mutating route rejects a request with no Authorization header with 401", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
+    });
+    assert.equal(res.status, 401);
+    // No side effect: the node must not have been registered.
+    const nodesRes = await authFetch(`${baseUrl}/nodes`);
+    const nodes = await nodesRes.json();
+    assert.equal(nodes.length, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test("a mutating route rejects a request with the wrong token with 401", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(
+      `${baseUrl}/nodes/register`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }) },
+      "wrong-token",
+    );
+    assert.equal(res.status, 401);
+  } finally {
+    server.close();
+  }
+});
+
+test("a read route rejects a request with no Authorization header with 401", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes`);
+    assert.equal(res.status, 401);
+  } finally {
+    server.close();
+  }
+});
+
+test("a read route succeeds with a valid Authorization header", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/nodes`);
+    assert.equal(res.status, 200);
+  } finally {
+    server.close();
+  }
+});
+
+test("the static dashboard routes stay unauthenticated", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const indexRes = await fetch(baseUrl);
+    assert.equal(indexRes.status, 200);
+    const appJsRes = await fetch(`${baseUrl}/app.js`);
+    assert.equal(appJsRes.status, 200);
+    const styleCssRes = await fetch(`${baseUrl}/style.css`);
+    assert.equal(styleCssRes.status, 200);
+    const openApiRes = await fetch(`${baseUrl}/openapi.json`);
+    assert.equal(openApiRes.status, 200);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /generate forwards the shared auth token to the node agent", async () => {
+  let receivedAuth: string | null = null;
+  const stubAgent = createHttpServer((req, res) => {
+    receivedAuth = req.headers.authorization ?? null;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ text: "hello" }));
+  });
+  await new Promise<void>(resolve => stubAgent.listen(0, "127.0.0.1", resolve));
+  const stubAddress = stubAgent.address();
+  if (stubAddress === null || typeof stubAddress === "string") {
+    throw new Error("expected stub agent to bind a real port");
+  }
+  const stubEndpoint = `http://127.0.0.1:${stubAddress.port}`;
+
+  // registry is built directly here (not via startTestServer, which owns
+  // its own internal registry with no way to pre-register a node into it
+  // before the server starts) so the stub agent above can be registered
+  // into it before createServer is called.
+  const registry = new NodeRegistry();
+  registry.register(stubEndpoint, "desktop", undefined, "tinyllama-1.1b");
+  const catalog = new ModelCatalog(DEFAULT_TEST_CATALOG);
+  const server = createServer(registry, catalog, new PeerRegistry(), new KeywordSafetyClassifier([]), new ReputationTracker(), TEST_AUTH_TOKEN);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected server to bind a real port");
+  }
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(receivedAuth, `Bearer ${TEST_AUTH_TOKEN}`);
+  } finally {
+    server.close();
+    stubAgent.close();
+  }
+});
 
 test("POST /nodes/register returns a nodeId and the node appears in the catalog's active count", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const registerRes = await fetch(`${baseUrl}/nodes/register`, {
+    const registerRes = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
@@ -46,7 +172,7 @@ test("POST /nodes/register returns a nodeId and the node appears in the catalog'
     const { nodeId } = await registerRes.json();
     assert.equal(typeof nodeId, "string");
 
-    const catalogRes = await fetch(`${baseUrl}/catalog`);
+    const catalogRes = await authFetch(`${baseUrl}/catalog`);
     assert.equal(catalogRes.status, 200);
     const catalog = await catalogRes.json();
     const smallModel = catalog.find((e: any) => e.id === "small-7b");
@@ -59,17 +185,17 @@ test("POST /nodes/register returns a nodeId and the node appears in the catalog'
 test("POST /nodes/:nodeId/heartbeat returns 204 for a known node and 404 for an unknown one", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const registerRes = await fetch(`${baseUrl}/nodes/register`, {
+    const registerRes = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
     const { nodeId } = await registerRes.json();
 
-    const goodHeartbeat = await fetch(`${baseUrl}/nodes/${nodeId}/heartbeat`, { method: "POST" });
+    const goodHeartbeat = await authFetch(`${baseUrl}/nodes/${nodeId}/heartbeat`, { method: "POST" });
     assert.equal(goodHeartbeat.status, 204);
 
-    const badHeartbeat = await fetch(`${baseUrl}/nodes/not-a-real-id/heartbeat`, { method: "POST" });
+    const badHeartbeat = await authFetch(`${baseUrl}/nodes/not-a-real-id/heartbeat`, { method: "POST" });
     assert.equal(badHeartbeat.status, 404);
   } finally {
     server.close();
@@ -79,13 +205,13 @@ test("POST /nodes/:nodeId/heartbeat returns 204 for a known node and 404 for an 
 test("GET /nodes lists active nodes", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    await fetch(`${baseUrl}/nodes/register`, {
+    await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
 
-    const res = await fetch(`${baseUrl}/nodes`);
+    const res = await authFetch(`${baseUrl}/nodes`);
     const nodes = await res.json();
     assert.equal(nodes.length, 1);
     assert.equal(nodes[0].endpoint, "http://127.0.0.1:50052");
@@ -97,7 +223,7 @@ test("GET /nodes lists active nodes", async () => {
 test("POST /nodes/register with malformed JSON returns 400 and the server survives to handle further requests", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const badRes = await fetch(`${baseUrl}/nodes/register`, {
+    const badRes = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: "not valid json{",
@@ -109,7 +235,7 @@ test("POST /nodes/register with malformed JSON returns 400 and the server surviv
     // Prove the process/server is still alive and functioning: a subsequent,
     // well-formed request must still succeed rather than hanging or erroring
     // due to a crashed/unhandled-rejection process.
-    const goodRes = await fetch(`${baseUrl}/nodes/register`, {
+    const goodRes = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
@@ -125,7 +251,7 @@ test("POST /nodes/register with malformed JSON returns 400 and the server surviv
 test("POST /nodes/register rejects a non-string endpoint with 400", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/nodes/register`, {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: { a: 1 }, deviceTier: "desktop" }),
@@ -141,7 +267,7 @@ test("POST /nodes/register rejects a non-string endpoint with 400", async () => 
 test("POST /nodes/register rejects a scheme-less endpoint with 400", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/nodes/register`, {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "127.0.0.1:50052", deviceTier: "desktop" }),
@@ -151,7 +277,7 @@ test("POST /nodes/register rejects a scheme-less endpoint with 400", async () =>
     assert.equal(typeof body.error, "string");
 
     // Confirm nothing was actually registered.
-    const nodesRes = await fetch(`${baseUrl}/nodes`);
+    const nodesRes = await authFetch(`${baseUrl}/nodes`);
     assert.equal((await nodesRes.json()).length, 0);
   } finally {
     server.close();
@@ -161,7 +287,7 @@ test("POST /nodes/register rejects a scheme-less endpoint with 400", async () =>
 test("POST /nodes/register rejects a non-http(s) scheme endpoint with 400", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/nodes/register`, {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "ftp://127.0.0.1:50052", deviceTier: "desktop" }),
@@ -171,7 +297,7 @@ test("POST /nodes/register rejects a non-http(s) scheme endpoint with 400", asyn
     assert.equal(typeof body.error, "string");
 
     // Confirm nothing was actually registered.
-    const nodesRes = await fetch(`${baseUrl}/nodes`);
+    const nodesRes = await authFetch(`${baseUrl}/nodes`);
     assert.equal((await nodesRes.json()).length, 0);
   } finally {
     server.close();
@@ -181,14 +307,14 @@ test("POST /nodes/register rejects a non-http(s) scheme endpoint with 400", asyn
 test("POST /nodes/register normalizes away a trailing slash on endpoint", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/nodes/register`, {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052/", deviceTier: "desktop" }),
     });
     assert.equal(res.status, 200);
 
-    const nodes = await (await fetch(`${baseUrl}/nodes`)).json();
+    const nodes = await (await authFetch(`${baseUrl}/nodes`)).json();
     assert.equal(nodes[0].endpoint, "http://127.0.0.1:50052");
   } finally {
     server.close();
@@ -198,7 +324,7 @@ test("POST /nodes/register normalizes away a trailing slash on endpoint", async 
 test("POST /nodes/register rejects an invalid deviceTier with 400", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/nodes/register`, {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "toaster" }),
@@ -214,7 +340,7 @@ test("POST /nodes/register rejects an invalid deviceTier with 400", async () => 
 test("POST /nodes/register with a JSON body of literal null returns 400, not 500", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/nodes/register`, {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: "null",
@@ -230,7 +356,7 @@ test("POST /nodes/register with a JSON body of literal null returns 400, not 500
 test("GET /catalog with zero active nodes only shows the zero-threshold model available", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/catalog`);
+    const res = await authFetch(`${baseUrl}/catalog`);
     const catalog = await res.json();
     assert.equal(catalog.find((e: any) => e.id === "tinyllama-1.1b").available, true);
     assert.equal(catalog.find((e: any) => e.id === "small-7b").available, false);
@@ -242,13 +368,13 @@ test("GET /catalog with zero active nodes only shows the zero-threshold model av
 test("GET /capacity reports the active node count", async () => {
   const { server, baseUrl, registry } = await startTestServer();
   try {
-    await fetch(`${baseUrl}/nodes/register`, {
+    await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
 
-    const res = await fetch(`${baseUrl}/capacity`);
+    const res = await authFetch(`${baseUrl}/capacity`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.activeNodes, 1);
@@ -260,7 +386,7 @@ test("GET /capacity reports the active node count", async () => {
 test("POST /peers/register returns a peerId, and GET /peers lists it", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const registerRes = await fetch(`${baseUrl}/peers/register`, {
+    const registerRes = await authFetch(`${baseUrl}/peers/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://192.168.1.50:9090" }),
@@ -269,7 +395,7 @@ test("POST /peers/register returns a peerId, and GET /peers lists it", async () 
     const { peerId } = await registerRes.json();
     assert.equal(typeof peerId, "string");
 
-    const listRes = await fetch(`${baseUrl}/peers`);
+    const listRes = await authFetch(`${baseUrl}/peers`);
     const peers = await listRes.json();
     assert.equal(peers.length, 1);
     assert.equal(peers[0].endpoint, "http://192.168.1.50:9090");
@@ -281,20 +407,20 @@ test("POST /peers/register returns a peerId, and GET /peers lists it", async () 
 test("DELETE /peers/:peerId deregisters a peer, 204 for known, 404 for unknown", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const registerRes = await fetch(`${baseUrl}/peers/register`, {
+    const registerRes = await authFetch(`${baseUrl}/peers/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://192.168.1.50:9090" }),
     });
     const { peerId } = await registerRes.json();
 
-    const deleteRes = await fetch(`${baseUrl}/peers/${peerId}`, { method: "DELETE" });
+    const deleteRes = await authFetch(`${baseUrl}/peers/${peerId}`, { method: "DELETE" });
     assert.equal(deleteRes.status, 204);
 
-    const listRes = await fetch(`${baseUrl}/peers`);
+    const listRes = await authFetch(`${baseUrl}/peers`);
     assert.equal((await listRes.json()).length, 0);
 
-    const deleteAgain = await fetch(`${baseUrl}/peers/${peerId}`, { method: "DELETE" });
+    const deleteAgain = await authFetch(`${baseUrl}/peers/${peerId}`, { method: "DELETE" });
     assert.equal(deleteAgain.status, 404);
   } finally {
     server.close();
@@ -304,7 +430,7 @@ test("DELETE /peers/:peerId deregisters a peer, 204 for known, 404 for unknown",
 test("POST /peers/register rejects a non-URL endpoint with 400", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/peers/register`, {
+    const res = await authFetch(`${baseUrl}/peers/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "not-a-url-at-all" }),
@@ -314,7 +440,7 @@ test("POST /peers/register rejects a non-URL endpoint with 400", async () => {
     assert.equal(typeof body.error, "string");
 
     // Confirm nothing was actually registered.
-    const listRes = await fetch(`${baseUrl}/peers`);
+    const listRes = await authFetch(`${baseUrl}/peers`);
     assert.equal((await listRes.json()).length, 0);
   } finally {
     server.close();
@@ -324,7 +450,7 @@ test("POST /peers/register rejects a non-URL endpoint with 400", async () => {
 test("POST /peers/register rejects a non-http(s) scheme endpoint with 400", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/peers/register`, {
+    const res = await authFetch(`${baseUrl}/peers/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "file:///etc/passwd" }),
@@ -334,7 +460,7 @@ test("POST /peers/register rejects a non-http(s) scheme endpoint with 400", asyn
     assert.equal(typeof body.error, "string");
 
     // Confirm nothing was actually registered.
-    const listRes = await fetch(`${baseUrl}/peers`);
+    const listRes = await authFetch(`${baseUrl}/peers`);
     assert.equal((await listRes.json()).length, 0);
   } finally {
     server.close();
@@ -349,7 +475,7 @@ test("POST /peers/:peerId/heartbeat keeps a peer active past what would otherwis
   const peers = new PeerRegistry(() => now, 1000);
   const { server, baseUrl } = await startTestServer(DEFAULT_TEST_CATALOG, peers);
   try {
-    const registerRes = await fetch(`${baseUrl}/peers/register`, {
+    const registerRes = await authFetch(`${baseUrl}/peers/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://192.168.1.50:9090" }),
@@ -359,7 +485,7 @@ test("POST /peers/:peerId/heartbeat keeps a peer active past what would otherwis
     // Still within the original 1000ms window -- heartbeat should succeed
     // and refresh lastSeen.
     now = 700;
-    const heartbeatRes = await fetch(`${baseUrl}/peers/${peerId}/heartbeat`, { method: "POST" });
+    const heartbeatRes = await authFetch(`${baseUrl}/peers/${peerId}/heartbeat`, { method: "POST" });
     assert.equal(heartbeatRes.status, 204);
 
     // 1500ms after registration -- past the ORIGINAL 1000ms window, but
@@ -367,7 +493,7 @@ test("POST /peers/:peerId/heartbeat keeps a peer active past what would otherwis
     // fresh window. Without the heartbeat route/refresh, this peer would
     // already be expired (1500 - 0 > 1000).
     now = 1500;
-    const listRes = await fetch(`${baseUrl}/peers`);
+    const listRes = await authFetch(`${baseUrl}/peers`);
     const list = await listRes.json();
     assert.equal(list.length, 1);
     assert.equal(list[0].peerId, peerId);
@@ -379,7 +505,7 @@ test("POST /peers/:peerId/heartbeat keeps a peer active past what would otherwis
 test("POST /peers/:peerId/heartbeat returns 404 for an unknown peer", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/peers/not-a-real-id/heartbeat`, { method: "POST" });
+    const res = await authFetch(`${baseUrl}/peers/not-a-real-id/heartbeat`, { method: "POST" });
     assert.equal(res.status, 404);
   } finally {
     server.close();
@@ -395,7 +521,7 @@ test("GET /catalog aggregates a live peer's reported capacity with local capacit
   ];
 
   const { server: serverB, baseUrl: baseUrlB } = await startTestServer(catalogEntries);
-  await fetch(`${baseUrlB}/nodes/register`, {
+  await authFetch(`${baseUrlB}/nodes/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
@@ -405,19 +531,19 @@ test("GET /catalog aggregates a live peer's reported capacity with local capacit
 
   try {
     // A has zero local nodes -- confirm the model is NOT available yet.
-    const beforeRes = await fetch(`${baseUrlA}/catalog`);
+    const beforeRes = await authFetch(`${baseUrlA}/catalog`);
     const before = await beforeRes.json();
     assert.equal(before.find((e: any) => e.id === "small").available, false);
 
     // A federates with B.
-    await fetch(`${baseUrlA}/peers/register`, {
+    await authFetch(`${baseUrlA}/peers/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: baseUrlB }),
     });
 
     // Now A's catalog should reflect B's capacity too.
-    const afterRes = await fetch(`${baseUrlA}/catalog`);
+    const afterRes = await authFetch(`${baseUrlA}/catalog`);
     const after = await afterRes.json();
     assert.equal(after.find((e: any) => e.id === "small").available, true);
   } finally {
@@ -433,13 +559,13 @@ test("GET /catalog degrades gracefully when a registered peer is unreachable", a
   const { server, baseUrl } = await startTestServer(catalogEntries);
   try {
     // Register a peer endpoint that nothing is listening on.
-    await fetch(`${baseUrl}/peers/register`, {
+    await authFetch(`${baseUrl}/peers/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:1" }),
     });
 
-    const res = await fetch(`${baseUrl}/catalog`);
+    const res = await authFetch(`${baseUrl}/catalog`);
     assert.equal(res.status, 200);
     const catalog = await res.json();
     // Should not throw, hang, or 500 -- the unreachable peer just
@@ -471,19 +597,19 @@ test("GET /catalog treats a peer reporting negative activeNodes as contributing 
   try {
     // Give the local instance enough REAL local capacity to serve the
     // model entirely on its own.
-    await fetch(`${baseUrl}/nodes/register`, {
+    await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
 
-    await fetch(`${baseUrl}/peers/register`, {
+    await authFetch(`${baseUrl}/peers/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: fakePeerUrl }),
     });
 
-    const res = await fetch(`${baseUrl}/catalog`);
+    const res = await authFetch(`${baseUrl}/catalog`);
     assert.equal(res.status, 200);
     const catalog = await res.json();
     // Local capacity alone (1) meets minActiveNodes (1). The malicious
@@ -521,13 +647,13 @@ test("GET /catalog correctly reflects a peer's capacity even when registered wit
 
   const { server, baseUrl } = await startTestServer(catalogEntries);
   try {
-    await fetch(`${baseUrl}/peers/register`, {
+    await authFetch(`${baseUrl}/peers/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: testPeerUrlWithSlash }),
     });
 
-    const res = await fetch(`${baseUrl}/catalog`);
+    const res = await authFetch(`${baseUrl}/catalog`);
     assert.equal(res.status, 200);
     const catalog = await res.json();
     // If the trailing slash weren't normalized away, the outbound fetch
@@ -544,7 +670,7 @@ test("GET /catalog correctly reflects a peer's capacity even when registered wit
 test("POST /classify returns safe:true for a prompt matching no configured rules", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/classify`, {
+    const res = await authFetch(`${baseUrl}/classify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "an ordinary prompt" }),
@@ -564,7 +690,7 @@ test("POST /classify returns safe:false and categories for a prompt matching a c
   ]);
   const { server, baseUrl } = await startTestServer(undefined, undefined, classifier);
   try {
-    const res = await fetch(`${baseUrl}/classify`, {
+    const res = await authFetch(`${baseUrl}/classify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "contains UNSAFE_TEST_TOKEN here" }),
@@ -581,7 +707,7 @@ test("POST /classify returns safe:false and categories for a prompt matching a c
 test("POST /classify rejects a request with a missing or non-string prompt", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/classify`, {
+    const res = await authFetch(`${baseUrl}/classify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: 12345 }),
@@ -600,7 +726,7 @@ test("POST /classify fails closed (safe:false) if the classifier itself throws",
   };
   const { server, baseUrl } = await startTestServer(undefined, undefined, throwingClassifier);
   try {
-    const res = await fetch(`${baseUrl}/classify`, {
+    const res = await authFetch(`${baseUrl}/classify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "anything" }),
@@ -628,7 +754,7 @@ for (const { name, value } of MALFORMED_CLASSIFIER_RESULTS) {
     };
     const { server, baseUrl } = await startTestServer(undefined, undefined, malformedClassifier);
     try {
-      const res = await fetch(`${baseUrl}/classify`, {
+      const res = await authFetch(`${baseUrl}/classify`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ prompt: "anything" }),
@@ -659,7 +785,7 @@ test("POST /classify serializes the VALIDATED safe/categories values, not whatev
   };
   const { server, baseUrl } = await startTestServer(undefined, undefined, deceptiveClassifier);
   try {
-    const res = await fetch(`${baseUrl}/classify`, {
+    const res = await authFetch(`${baseUrl}/classify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "anything" }),
@@ -683,7 +809,7 @@ test("POST /classify drops extra fields on the classifier's result object -- onl
   };
   const { server, baseUrl } = await startTestServer(undefined, undefined, chattyClassifier);
   try {
-    const res = await fetch(`${baseUrl}/classify`, {
+    const res = await authFetch(`${baseUrl}/classify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "anything" }),
@@ -702,7 +828,7 @@ test("POST /classify fails closed (safe:false) if the classifier hangs forever",
   };
   const { server, baseUrl } = await startTestServer(undefined, undefined, hangingClassifier);
   try {
-    const res = await fetch(`${baseUrl}/classify`, {
+    const res = await authFetch(`${baseUrl}/classify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "anything" }),
@@ -718,18 +844,18 @@ test("POST /classify fails closed (safe:false) if the classifier hangs forever",
 test("POST /nodes/:nodeId/reputation/agree and /disagree record events, GET reports them", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const registerRes = await fetch(`${baseUrl}/nodes/register`, {
+    const registerRes = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
     const { nodeId } = await registerRes.json();
 
-    await fetch(`${baseUrl}/nodes/${nodeId}/reputation/agree`, { method: "POST" });
-    await fetch(`${baseUrl}/nodes/${nodeId}/reputation/agree`, { method: "POST" });
-    await fetch(`${baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST" });
+    await authFetch(`${baseUrl}/nodes/${nodeId}/reputation/agree`, { method: "POST" });
+    await authFetch(`${baseUrl}/nodes/${nodeId}/reputation/agree`, { method: "POST" });
+    await authFetch(`${baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST" });
 
-    const statsRes = await fetch(`${baseUrl}/nodes/${nodeId}/reputation`);
+    const statsRes = await authFetch(`${baseUrl}/nodes/${nodeId}/reputation`);
     assert.equal(statsRes.status, 200);
     const stats = await statsRes.json();
     assert.equal(stats.agreements, 2);
@@ -743,7 +869,7 @@ test("POST /nodes/:nodeId/reputation/agree and /disagree record events, GET repo
 test("reputation endpoints return 404 for an unknown nodeId", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/nodes/never-registered/reputation/agree`, { method: "POST" });
+    const res = await authFetch(`${baseUrl}/nodes/never-registered/reputation/agree`, { method: "POST" });
     assert.equal(res.status, 404);
   } finally {
     server.close();
@@ -754,27 +880,27 @@ test("a node ejected by reputation disappears from GET /nodes and stops counting
   const catalogEntries = [{ id: "small", displayName: "Small", minActiveNodes: 1 }];
   const { server, baseUrl } = await startTestServer(catalogEntries);
   try {
-    const registerRes = await fetch(`${baseUrl}/nodes/register`, {
+    const registerRes = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
     const { nodeId } = await registerRes.json();
 
-    const beforeCatalog = await (await fetch(`${baseUrl}/catalog`)).json();
+    const beforeCatalog = await (await authFetch(`${baseUrl}/catalog`)).json();
     assert.equal(beforeCatalog.find((e: any) => e.id === "small").available, true);
 
     for (let i = 0; i < 5; i++) {
-      await fetch(`${baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST" });
+      await authFetch(`${baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST" });
     }
 
-    const nodesRes = await fetch(`${baseUrl}/nodes`);
+    const nodesRes = await authFetch(`${baseUrl}/nodes`);
     assert.equal((await nodesRes.json()).length, 0);
 
-    const afterCatalog = await (await fetch(`${baseUrl}/catalog`)).json();
+    const afterCatalog = await (await authFetch(`${baseUrl}/catalog`)).json();
     assert.equal(afterCatalog.find((e: any) => e.id === "small").available, false);
 
-    const capacityRes = await fetch(`${baseUrl}/capacity`);
+    const capacityRes = await authFetch(`${baseUrl}/capacity`);
     assert.equal(capacityRes.status, 200);
     assert.deepEqual(await capacityRes.json(), { activeNodes: 0 });
 
@@ -782,7 +908,7 @@ test("a node ejected by reputation disappears from GET /nodes and stops counting
     // GET /capacity, /catalog), it is still a real, registered node, and the
     // reputation endpoints must remain operable against it -- the existence
     // check for those routes deliberately uses the unfiltered listActive().
-    const agreeAfterEjection = await fetch(`${baseUrl}/nodes/${nodeId}/reputation/agree`, { method: "POST" });
+    const agreeAfterEjection = await authFetch(`${baseUrl}/nodes/${nodeId}/reputation/agree`, { method: "POST" });
     assert.equal(agreeAfterEjection.status, 204);
   } finally {
     server.close();
@@ -792,14 +918,14 @@ test("a node ejected by reputation disappears from GET /nodes and stops counting
 test("POST /nodes/register accepts an optional localityGroup and it is echoed back via GET /nodes", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const registerRes = await fetch(`${baseUrl}/nodes/register`, {
+    const registerRes = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: "kitchen-mesh" }),
     });
     assert.equal(registerRes.status, 200);
 
-    const nodes = await (await fetch(`${baseUrl}/nodes`)).json();
+    const nodes = await (await authFetch(`${baseUrl}/nodes`)).json();
     assert.equal(nodes[0].localityGroup, "kitchen-mesh");
   } finally {
     server.close();
@@ -809,7 +935,7 @@ test("POST /nodes/register accepts an optional localityGroup and it is echoed ba
 test("POST /nodes/register rejects a non-string localityGroup", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/nodes/register`, {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: 42 }),
@@ -823,7 +949,7 @@ test("POST /nodes/register rejects a non-string localityGroup", async () => {
 test("POST /nodes/register rejects an empty-string localityGroup", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/nodes/register`, {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: "" }),
@@ -837,18 +963,18 @@ test("POST /nodes/register rejects an empty-string localityGroup", async () => {
 test("GET /nodes/locality groups registered nodes by their localityGroup, with ungrouped nodes bucketed separately", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    await fetch(`${baseUrl}/nodes/register`, {
+    await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: "kitchen-mesh" }),
     });
-    await fetch(`${baseUrl}/nodes/register`, {
+    await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50053", deviceTier: "android" }),
     });
 
-    const res = await fetch(`${baseUrl}/nodes/locality`);
+    const res = await authFetch(`${baseUrl}/nodes/locality`);
     assert.equal(res.status, 200);
     const groups = await res.json();
     assert.equal(groups["kitchen-mesh"].length, 1);
@@ -861,7 +987,7 @@ test("GET /nodes/locality groups registered nodes by their localityGroup, with u
 test("GET /nodes/locality excludes a node ejected by reputation", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const registerRes = await fetch(`${baseUrl}/nodes/register`, {
+    const registerRes = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: "kitchen-mesh" }),
@@ -869,10 +995,10 @@ test("GET /nodes/locality excludes a node ejected by reputation", async () => {
     const { nodeId } = await registerRes.json();
 
     for (let i = 0; i < 5; i++) {
-      await fetch(`${baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST" });
+      await authFetch(`${baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST" });
     }
 
-    const groups = await (await fetch(`${baseUrl}/nodes/locality`)).json();
+    const groups = await (await authFetch(`${baseUrl}/nodes/locality`)).json();
     assert.equal(groups["kitchen-mesh"], undefined);
   } finally {
     server.close();
@@ -882,7 +1008,7 @@ test("GET /nodes/locality excludes a node ejected by reputation", async () => {
 test("GET / serves index.html with text/html content-type", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/`);
+    const res = await authFetch(`${baseUrl}/`);
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /text\/html/);
     const body = await res.text();
@@ -895,7 +1021,7 @@ test("GET / serves index.html with text/html content-type", async () => {
 test("GET /app.js serves app.js with application/javascript content-type", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/app.js`);
+    const res = await authFetch(`${baseUrl}/app.js`);
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /javascript/);
   } finally {
@@ -906,7 +1032,7 @@ test("GET /app.js serves app.js with application/javascript content-type", async
 test("GET /style.css serves style.css with text/css content-type", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/style.css`);
+    const res = await authFetch(`${baseUrl}/style.css`);
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /text\/css/);
   } finally {
@@ -917,7 +1043,7 @@ test("GET /style.css serves style.css with text/css content-type", async () => {
 test("GET /nonexistent-static-file.js still 404s (no interference with existing routes)", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/nonexistent-static-file.js`);
+    const res = await authFetch(`${baseUrl}/nonexistent-static-file.js`);
     assert.equal(res.status, 404);
   } finally {
     server.close();
@@ -943,10 +1069,10 @@ test("GET /nonexistent-static-file.js still 404s (no interference with existing 
 test("static routes reject path traversal attempts rather than serving arbitrary files", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res1 = await fetch(`${baseUrl}/app.js/../server.ts`);
+    const res1 = await authFetch(`${baseUrl}/app.js/../server.ts`);
     assert.equal(res1.status, 404);
 
-    const res2 = await fetch(`${baseUrl}/../../package.json`);
+    const res2 = await authFetch(`${baseUrl}/../../package.json`);
     assert.equal(res2.status, 404);
   } finally {
     server.close();
@@ -965,15 +1091,20 @@ test("static routes reject path traversal attempts rather than serving arbitrary
 // normalization), no request can escape `serveStaticFile`'s three hardcoded
 // filenames.
 test("a literal '..' path segment that survives to the server's own URL parsing still 404s", async () => {
-  const { server, baseUrl } = await startTestServer();
+  const { server, baseUrl, authToken } = await startTestServer();
   const address = server.address();
   if (address === null || typeof address === "string") {
     throw new Error("expected server to bind a real port");
   }
   try {
+    // Authorization header included: the auth gate runs before route
+    // matching, so an unauthenticated raw request would now hit 401 before
+    // ever reaching the route logic this test targets. With a valid token
+    // supplied, the request still reaches the same route-matching/404 path
+    // this test was written to exercise.
     const statusLine = await new Promise<string>((resolve, reject) => {
       const socket = net.createConnection(address.port, "127.0.0.1", () => {
-        socket.write("GET /app.js/../../package.json HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        socket.write(`GET /app.js/../../package.json HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ${authToken}\r\nConnection: close\r\n\r\n`);
       });
       let raw = "";
       socket.on("data", (chunk) => { raw += chunk.toString("utf-8"); });
@@ -989,7 +1120,7 @@ test("a literal '..' path segment that survives to the server's own URL parsing 
 test("existing GET /nodes route is unaffected by the new static routes", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/nodes`);
+    const res = await authFetch(`${baseUrl}/nodes`);
     assert.equal(res.status, 200);
     assert.deepEqual(await res.json(), []);
   } finally {
@@ -1000,7 +1131,7 @@ test("existing GET /nodes route is unaffected by the new static routes", async (
 test("index.html contains the expected element IDs app.js depends on, and the no-real-inference notice", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const body = await (await fetch(`${baseUrl}/`)).text();
+    const body = await (await authFetch(`${baseUrl}/`)).text();
     assert.match(body, /id="active-count"/);
     assert.match(body, /id="catalog-table"/);
     assert.match(body, /id="prompt-input"/);
@@ -1015,13 +1146,13 @@ test("index.html contains the expected element IDs app.js depends on, and the no
 test("GET /nodes/locality safely handles a node that self-reports localityGroup \"__proto__\"", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    await fetch(`${baseUrl}/nodes/register`, {
+    await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: "__proto__" }),
     });
 
-    const res = await fetch(`${baseUrl}/nodes/locality`);
+    const res = await authFetch(`${baseUrl}/nodes/locality`);
     assert.equal(res.status, 200);
     const rawText = await res.text();
     const body = JSON.parse(rawText);
@@ -1048,7 +1179,7 @@ test("GET /nodes/locality safely handles a node that self-reports localityGroup 
 test("GET /openapi.json serves the OpenAPI document", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/openapi.json`);
+    const res = await authFetch(`${baseUrl}/openapi.json`);
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /application\/json/);
     const body = await res.json();
@@ -1067,13 +1198,13 @@ test("every path+method documented in openapi.json resolves to a real route (not
     // (/nodes/{nodeId}/..., /peers/{peerId}/...) have a real ID to substitute
     // in and can be checked against their real (non-404) status rather than
     // failing for the unrelated reason of "no such id".
-    const nodeRes = await fetch(`${baseUrl}/nodes/register`, {
+    const nodeRes = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
     });
     const { nodeId } = await nodeRes.json();
-    const peerRes = await fetch(`${baseUrl}/peers/register`, {
+    const peerRes = await authFetch(`${baseUrl}/peers/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:9999" }),
@@ -1085,7 +1216,7 @@ test("every path+method documented in openapi.json resolves to a real route (not
     for (const [path, methods] of Object.entries(openApiDocument.paths as Record<string, Record<string, unknown>>)) {
       for (const method of Object.keys(methods)) {
         const url = `${baseUrl}${substitute(path)}`;
-        const res = await fetch(url, {
+        const res = await authFetch(url, {
           method: method.toUpperCase(),
           headers: method.toUpperCase() === "POST" ? { "content-type": "application/json" } : undefined,
           body: method.toUpperCase() === "POST" ? "{}" : undefined,
@@ -1124,13 +1255,13 @@ test("POST /generate classifies, routes to a matching node, and returns its resp
   const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "Paris." } }));
   const { server, baseUrl } = await startTestServer();
   try {
-    await fetch(`${baseUrl}/nodes/register`, {
+    await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
     });
 
-    const res = await fetch(`${baseUrl}/generate`, {
+    const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "The capital of France is", modelId: "tinyllama-1.1b" }),
@@ -1147,7 +1278,7 @@ test("POST /generate classifies, routes to a matching node, and returns its resp
 test("POST /generate returns 400 when prompt is missing", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/generate`, {
+    const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ modelId: "tinyllama-1.1b" }),
@@ -1161,7 +1292,7 @@ test("POST /generate returns 400 when prompt is missing", async () => {
 test("POST /generate returns 400 when modelId is not a known catalog id", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/generate`, {
+    const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "hi", modelId: "nonexistent-model" }),
@@ -1175,7 +1306,7 @@ test("POST /generate returns 400 when modelId is not a known catalog id", async 
 test("POST /generate returns 400 with n_predict out of the allowed range", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/generate`, {
+    const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b", n_predict: 9999 }),
@@ -1189,7 +1320,7 @@ test("POST /generate returns 400 with n_predict out of the allowed range", async
 test("POST /generate returns 503 when no active node serves the requested model", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const res = await fetch(`${baseUrl}/generate`, {
+    const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
@@ -1203,13 +1334,13 @@ test("POST /generate returns 503 when no active node serves the requested model"
 test("POST /generate returns 502 when the selected node is unreachable", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    await fetch(`${baseUrl}/nodes/register`, {
+    await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: "http://127.0.0.1:1", deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
     });
 
-    const res = await fetch(`${baseUrl}/generate`, {
+    const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
@@ -1224,7 +1355,7 @@ test("POST /generate excludes a reputation-ejected node from routing", async () 
   const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "should not be reached" } }));
   const { server, baseUrl } = await startTestServer();
   try {
-    const registerRes = await fetch(`${baseUrl}/nodes/register`, {
+    const registerRes = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
@@ -1232,10 +1363,10 @@ test("POST /generate excludes a reputation-ejected node from routing", async () 
     const { nodeId } = await registerRes.json();
 
     for (let i = 0; i < 5; i++) {
-      await fetch(`${baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST" });
+      await authFetch(`${baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST" });
     }
 
-    const res = await fetch(`${baseUrl}/generate`, {
+    const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
