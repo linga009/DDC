@@ -35,26 +35,26 @@ function waitForStartupLog(child: ReturnType<typeof spawn>, timeoutMs = 5000): P
   });
 }
 
-test("main.ts binds to 127.0.0.1 by default and discloses the no-auth caveat in its startup log", async () => {
-  const env = { ...process.env, PORT: "0" };
+test("main.ts binds to 127.0.0.1 by default and discloses that authentication is required in its startup log", async () => {
+  const env = { ...process.env, PORT: "0", SWARM_AUTH_TOKEN: "test-secret-token-1234" };
   delete env.HOST;
 
   const child = spawn(process.execPath, [mainPath], { env });
   try {
     const logLine = await waitForStartupLog(child);
-    assert.match(logLine, /^coordinator listening on 127\.0\.0\.1:0 \(no authentication -- trusted networks only\)$/);
+    assert.match(logLine, /^coordinator listening on 127\.0\.0\.1:0 \(authentication required -- see SWARM_AUTH_TOKEN\)$/);
   } finally {
     child.kill();
   }
 });
 
 test("main.ts binds to the host given via the HOST env var", async () => {
-  const env = { ...process.env, PORT: "0", HOST: "0.0.0.0" };
+  const env = { ...process.env, PORT: "0", HOST: "0.0.0.0", SWARM_AUTH_TOKEN: "test-secret-token-1234" };
 
   const child = spawn(process.execPath, [mainPath], { env });
   try {
     const logLine = await waitForStartupLog(child);
-    assert.match(logLine, /^coordinator listening on 0\.0\.0\.0:0 \(no authentication -- trusted networks only\)$/);
+    assert.match(logLine, /^coordinator listening on 0\.0\.0\.0:0 \(authentication required -- see SWARM_AUTH_TOKEN\)$/);
   } finally {
     child.kill();
   }
@@ -66,13 +66,34 @@ test("main.ts falls back to 127.0.0.1 when HOST is set but empty, not all interf
   // an empty string passed to server.listen() binds to all interfaces
   // (0.0.0.0 and ::) -- silently defeating the safe-default fix. Only a
   // falsy-string check (`||`, or an explicit `=== ""` check) catches this.
-  const env = { ...process.env, PORT: "0", HOST: "" };
+  const env = { ...process.env, PORT: "0", HOST: "", SWARM_AUTH_TOKEN: "test-secret-token-1234" };
 
   const child = spawn(process.execPath, [mainPath], { env });
   try {
     const logLine = await waitForStartupLog(child);
-    assert.match(logLine, /^coordinator listening on 127\.0\.0\.1:0 \(no authentication -- trusted networks only\)$/);
+    assert.match(logLine, /^coordinator listening on 127\.0\.0\.1:0 \(authentication required -- see SWARM_AUTH_TOKEN\)$/);
   } finally {
     child.kill();
   }
+});
+
+test("main.ts refuses to start when SWARM_AUTH_TOKEN is unset", async () => {
+  const env = { ...process.env, PORT: "0" };
+  delete env.SWARM_AUTH_TOKEN;
+
+  const child = spawn(process.execPath, [mainPath], { env });
+  const exitCode = await new Promise<number | null>(resolve => {
+    child.on("exit", code => resolve(code));
+  });
+  assert.notEqual(exitCode, 0);
+});
+
+test("main.ts refuses to start when SWARM_AUTH_TOKEN is set but empty", async () => {
+  const env = { ...process.env, PORT: "0", SWARM_AUTH_TOKEN: "" };
+
+  const child = spawn(process.execPath, [mainPath], { env });
+  const exitCode = await new Promise<number | null>(resolve => {
+    child.on("exit", code => resolve(code));
+  });
+  assert.notEqual(exitCode, 0);
 });
