@@ -175,7 +175,11 @@ on llama.cpp's RPC backend:
 > and insecure." **Never run `swarm-rpc-server` on an open or untrusted
 > network.** It has no authentication or encryption. It is suitable for
 > trusted LAN or same-host use only, and currently binds to `127.0.0.1` for
-> exactly this reason.
+> exactly this reason. If you need it reachable across more than one
+> trusted machine, put it behind an SSH tunnel (`ssh -L`) or WireGuard
+> rather than exposing the port directly — this gets you both
+> authentication (the tunnel's own key-based auth) and encryption for
+> free, without any code change here.
 
 ## Node agent
 
@@ -200,15 +204,14 @@ CLI flags:
   constructor.
 
 > [!WARNING]
-> `swarm-node-agent`'s HTTP endpoints (`/health`, `/complete`) have no
-> authentication or encryption of their own — matching the coordinator's
-> disclosed no-auth posture (see the Coordinator service section below)
-> and `swarm-rpc-server`'s warning above. It binds to `127.0.0.1` by
-> default for exactly this reason; there is currently no `--host` flag
-> to bind another interface. Anyone who can reach this port directly can
-> submit arbitrary prompts for inference at this node's expense,
-> bypassing the coordinator's safety-classifier gate entirely (that gate
-> only applies to requests routed through `POST /generate`).
+> `swarm-node-agent`'s HTTP endpoints (`/health`, `/complete`) require the
+> shared `SWARM_AUTH_TOKEN` (see the Coordinator service section's
+> Authentication subsection below) but still have no encryption of their
+> own — traffic is plain HTTP. It binds to `127.0.0.1` by default; there is
+> currently no `--host` flag to bind another interface. If you need it
+> reachable across more than one trusted machine, put it behind an SSH
+> tunnel or WireGuard rather than exposing the port directly, matching
+> `swarm-rpc-server`'s recommendation above.
 
 It exposes two HTTP endpoints:
 
@@ -259,8 +262,9 @@ turn back into a real character — live-verified, it round-trips as the
 unaffected" claim above does not fully cover this specific edge case.
 
 Like `swarm-rpc-server`, this is a minimal building block: it serves one
-request at a time, with no concurrency, request queueing, authentication,
-or clean-shutdown path — it runs until killed. The coordinator's
+request at a time, with no concurrency, request queueing, or clean-shutdown
+path — it runs until killed (see the Authentication warning above for its
+`SWARM_AUTH_TOKEN` requirement). The coordinator's
 `POST /generate` (see the Coordinator service section below) is now a real
 caller of this agent's `POST /complete` endpoint — the first thing in this
 repo to actually route a request to `InferenceEngine` over HTTP end to end.
@@ -278,11 +282,42 @@ Run its tests:
 cd coordinator && npm test
 ```
 
-Start it:
+Start it (see the Authentication subsection immediately below —
+`SWARM_AUTH_TOKEN` is required, the coordinator will not start without it):
 
 ```bash
-PORT=8080 node src/main.ts
+SWARM_AUTH_TOKEN=<your-secret> PORT=8080 node src/main.ts
 ```
+
+### Authentication
+
+Every coordinator endpoint except the static dashboard shell (`GET /`,
+`/app.js`, `/style.css`) and the OpenAPI document (`GET /openapi.json`)
+requires a shared secret, set as the `SWARM_AUTH_TOKEN` environment
+variable, sent as `Authorization: Bearer <token>`. The coordinator refuses
+to start if `SWARM_AUTH_TOKEN` is unset:
+
+```bash
+SWARM_AUTH_TOKEN=<your-secret> PORT=8080 node src/main.ts
+```
+
+`swarm-node-agent` requires the *same* token (one shared secret across the
+whole swarm, not per-node) on both `/health` and `/complete`:
+
+```bash
+SWARM_AUTH_TOKEN=<your-secret> ./build/core/swarm-node-agent.exe --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --port 8081
+```
+
+This closes "anyone can register a fake node, submit inference requests,
+or read swarm state" for anyone who doesn't have the token — it does
+**not** add encryption-in-transit (traffic is still plain HTTP) and it
+does **not** stop a legitimate token-holder from misbehaving (registering
+many fake nodes, claiming a `servesModel` they don't actually serve,
+etc. — see the gaming-vector notes throughout this doc, most of which are
+about token-holder behavior, not outsider access). For encryption, or for
+running nodes across anything wider than a single trusted LAN, put an SSH
+tunnel or WireGuard in front — see `swarm-rpc-server`'s note above, which
+applies equally here.
 
 Endpoints:
 
@@ -301,10 +336,12 @@ Endpoints:
   for. Like `localityGroup`, this is **self-reported and unverified** — the
   coordinator does not check that a node actually has the declared model
   loaded and ready; `POST /generate` (see below) trusts it at routing time.
-  Combined with the no-auth posture, this means anyone can register an
-  endpoint claiming to serve a given model and start receiving real
-  `/generate` traffic for it — see the known gaming vectors below for the
-  sharper version of this involving reputation ejection.
+  Combined with this, anyone who has the shared `SWARM_AUTH_TOKEN` — not
+  the general public, but any single compromised or dishonest swarm
+  member — can register an endpoint claiming to serve a given model and
+  start receiving real `/generate` traffic for it — see the known gaming
+  vectors below for the sharper version of this involving reputation
+  ejection.
 - `POST /nodes/:nodeId/heartbeat` — refresh a node's liveness
 - `GET /nodes` — list currently active nodes
 - `GET /nodes/locality` — active nodes bucketed by their self-reported
@@ -385,7 +422,9 @@ above threshold — the defaults are `minSamples=5` and
 defaults in `main.ts`). This means a node doesn't eject on a single sample.
 This is not a defense against a malicious caller — the minSamples/threshold
 gate exists to absorb noisy or unlucky spot-check results, not adversarial
-ones; see the no-auth caveat below. **The coordinator does not implement
+ones; see the shared-token caveat below (any token-holder, not just an
+outsider, can still call the reputation-recording endpoints maliciously).
+**The coordinator does not implement
 the actual redundant-computation spot-check mechanism** (running the same
 request on two independently-chosen nodes and comparing outputs) —
 `POST /generate` (Phase A, see below) only selects and calls a single node
@@ -396,14 +435,19 @@ dual-node dispatch path. Reputation endpoints themselves stay operable on an
 already-ejected node (so future spot-check results can still be recorded
 for it) — only capacity-facing views exclude it.
 
-**Caveat:** there is no authentication, and by default the server binds only
+**Caveat:** `POST /peers/register` now requires `SWARM_AUTH_TOKEN` (see
+Authentication above), and by default the server binds only
 to `127.0.0.1`; setting `HOST` to bind wider (e.g. `0.0.0.0`) should only be
 done on trusted networks. Federation compounds this: once a peer is
 registered, this instance makes an outbound HTTP request to it on every
-`GET /catalog` call, and `POST /peers/register` itself is unauthenticated,
-so anyone able to reach this instance can add outbound request targets.
-The reputation-recording endpoints are likewise unauthenticated — currently
-any caller can record arbitrary agreement/disagreement events for any node.
+`GET /catalog` call, so anyone who has the token can add outbound request
+targets — this is a smaller set than "anyone on the network" but is not
+"only operators who should be adding peers," since there's still only the
+one shared token, not per-operator credentials.
+The reputation-recording endpoints now require the same token — currently
+any token-holder can still record arbitrary agreement/disagreement events
+for any node, since the token is shared swarm-wide rather than scoped per
+node or per operator.
 Reputation state is in-memory only and does not persist across restarts.
 
 **Known gaming vectors:** reputation is keyed by `nodeId`, and
@@ -442,8 +486,10 @@ evasion path (go quiet for 30s to get a clean slate).
 arbitrary string a node supplies at registration time — the coordinator
 performs no check that it reflects real physical or network proximity. A
 node can claim membership in any group, including one it has no actual
-adjacency to, with no cost or detection (the same no-auth caveat above
-applies here too). This is worse than a single false claim: because
+adjacency to, with no cost or detection beyond holding the shared
+`SWARM_AUTH_TOKEN` (the same shared-token caveat above applies here too —
+registration now requires the token, but any token-holder can still claim
+any group for free). This is worse than a single false claim: because
 `NodeRegistry.register()` mints a fresh `randomUUID()` on every call with no
 endpoint dedupe (the same gap noted in the reputation gaming-vectors above),
 one physical device can register itself repeatedly under different
@@ -455,7 +501,7 @@ simultaneously in `GET /nodes/locality`, all backed by the same physical
 endpoint; re-registering under a new group does not remove the old
 registration either, so the stale entry persists in its original group
 until its normal liveness/heartbeat timeout (currently 30s) expires. This
-matters beyond the general no-auth caveat because `GET /nodes/locality`
+matters beyond the general shared-token caveat because `GET /nodes/locality`
 exists as groundwork for a future pipeline assembler that will likely
 prefer larger or majority locality clusters when selecting nodes — making
 this a vector against the exact consumer this endpoint is groundwork for.
@@ -527,8 +573,12 @@ calls `POST /classify`, not `POST /generate` — a real inference-request
 endpoint exists and works (see the Coordinator service section above), but
 this dashboard was never wired up to call it, and the client visibly
 discloses this gap in its own UI rather than faking it. The client is
-same-origin only, with no authentication — matching the coordinator's
-existing no-auth posture described above. As with the `/classify` endpoint
+same-origin only, and now requires an operator to paste a valid
+`SWARM_AUTH_TOKEN` into the dashboard's token field (kept in the browser
+tab's `sessionStorage`, sent as `Authorization: Bearer <token>` on every
+`/capacity`, `/catalog`, and `/classify` call) — matching the coordinator's
+Authentication requirement described above; this means anyone who has the
+token, not literally anyone, can use the dashboard. As with the `/classify` endpoint
 itself (see above), the shipped classifier has zero rules by default, so
 the demo currently reports every prompt as `safe: true`; the dashboard's
 own notice discloses this.
