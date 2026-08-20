@@ -199,6 +199,17 @@ CLI flags:
   `--remote` endpoints), same as `InferenceEngine`'s layer-placement
   constructor.
 
+> [!WARNING]
+> `swarm-node-agent`'s HTTP endpoints (`/health`, `/complete`) have no
+> authentication or encryption of their own — matching the coordinator's
+> disclosed no-auth posture (see the Coordinator service section below)
+> and `swarm-rpc-server`'s warning above. It binds to `127.0.0.1` by
+> default for exactly this reason; there is currently no `--host` flag
+> to bind another interface. Anyone who can reach this port directly can
+> submit arbitrary prompts for inference at this node's expense,
+> bypassing the coordinator's safety-classifier gate entirely (that gate
+> only applies to requests routed through `POST /generate`).
+
 It exposes two HTTP endpoints:
 
 - `GET /health` — returns `200 {"status":"ready"}` once the model has
