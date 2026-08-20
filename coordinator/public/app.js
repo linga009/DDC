@@ -1,11 +1,35 @@
+const TOKEN_KEY = "swarmAuthToken";
+
+function getToken() {
+  return sessionStorage.getItem(TOKEN_KEY) ?? "";
+}
+
+function setToken(token) {
+  sessionStorage.setItem(TOKEN_KEY, token);
+}
+
+function authedFetch(url, options = {}) {
+  const token = getToken();
+  return fetch(url, {
+    ...options,
+    headers: { ...(options.headers ?? {}), authorization: `Bearer ${token}` },
+  });
+}
+
 async function refreshStatus() {
   const activeCountEl = document.getElementById("active-count");
   const tbody = document.querySelector("#catalog-table tbody");
   try {
     const [capacityRes, catalogRes] = await Promise.all([
-      fetch("/capacity"),
-      fetch("/catalog"),
+      authedFetch("/capacity"),
+      authedFetch("/catalog"),
     ]);
+    if (capacityRes.status === 401 || catalogRes.status === 401) {
+      activeCountEl.textContent = "token required";
+      document.getElementById("token-status").textContent =
+        "Invalid or missing token — paste a valid SWARM_AUTH_TOKEN above.";
+      return;
+    }
     const capacity = await capacityRes.json();
     const catalog = await catalogRes.json();
 
@@ -40,11 +64,15 @@ async function classifyPrompt() {
 
   resultEl.textContent = "Checking...";
   try {
-    const res = await fetch("/classify", {
+    const res = await authedFetch("/classify", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt }),
     });
+    if (res.status === 401) {
+      resultEl.textContent = "Invalid or missing token — paste a valid SWARM_AUTH_TOKEN above.";
+      return;
+    }
     const body = await res.json();
     resultEl.textContent = body.safe
       ? "safe: true"
@@ -56,6 +84,15 @@ async function classifyPrompt() {
 }
 
 document.getElementById("classify-button").addEventListener("click", classifyPrompt);
+
+document.getElementById("save-token-button").addEventListener("click", () => {
+  const input = document.getElementById("token-input");
+  setToken(input.value);
+  document.getElementById("token-status").textContent = "Token saved for this tab.";
+  refreshStatus();
+});
+
+document.getElementById("token-input").value = getToken();
 
 refreshStatus();
 setInterval(refreshStatus, 5000);

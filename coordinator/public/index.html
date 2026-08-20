@@ -12,6 +12,18 @@
     <p class="tagline">Federated, open-weight LLM inference network — status dashboard</p>
   </header>
 
+  <section id="auth">
+    <h2>Coordinator access token</h2>
+    <p class="notice">
+      Every live endpoint on this coordinator requires <code>SWARM_AUTH_TOKEN</code>.
+      Paste it below to use this dashboard. Stored only for this browser tab —
+      cleared when the tab closes.
+    </p>
+    <input id="token-input" type="password" placeholder="Paste SWARM_AUTH_TOKEN...">
+    <button id="save-token-button" type="button">Save token</button>
+    <p id="token-status" role="status"></p>
+  </section>
+
   <main>
     <section id="status">
       <h2>Swarm status</h2>
