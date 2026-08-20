@@ -9,13 +9,15 @@ import { KeywordSafetyClassifier } from "../src/safety_classifier.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
 import { SwarmClient } from "../src/client.ts";
 
+const TEST_AUTH_TOKEN = "test-secret-token-1234";
+
 async function startTestServer() {
   const registry = new NodeRegistry();
   const catalog = new ModelCatalog();
   const peers = new PeerRegistry();
   const classifier = new KeywordSafetyClassifier([]);
   const reputation = new ReputationTracker();
-  const server = createServer(registry, catalog, peers, classifier, reputation);
+  const server = createServer(registry, catalog, peers, classifier, reputation, TEST_AUTH_TOKEN);
   await new Promise<void>(resolve => server.listen(0, resolve));
   const address = server.address();
   if (address === null || typeof address === "string") {
@@ -42,10 +44,31 @@ async function startStubNodeAgent(handler: (body: unknown) => { status: number; 
   return { server, endpoint: `http://127.0.0.1:${address.port}` };
 }
 
+test("SwarmClient sends the configured auth token on every request", async () => {
+  let receivedAuth: string | null = null;
+  const stub = createHttpServer((req, res) => {
+    receivedAuth = req.headers.authorization ?? null;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify([]));
+  });
+  await new Promise<void>(resolve => stub.listen(0, resolve));
+  const address = stub.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected stub server to bind a port");
+  }
+  try {
+    const client = new SwarmClient(`http://127.0.0.1:${address.port}`, "a-specific-test-token");
+    await client.listNodes();
+    assert.equal(receivedAuth, "Bearer a-specific-test-token");
+  } finally {
+    stub.close();
+  }
+});
+
 test("SwarmClient registers a node and lists it", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const client = new SwarmClient(baseUrl);
+    const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
     const nodeId = await client.registerNode("http://127.0.0.1:50052", "desktop");
     assert.equal(typeof nodeId, "string");
 
@@ -60,7 +83,7 @@ test("SwarmClient registers a node and lists it", async () => {
 test("SwarmClient heartbeat returns true for a known node and false for an unknown one", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const client = new SwarmClient(baseUrl);
+    const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
     const nodeId = await client.registerNode("http://127.0.0.1:50052", "desktop");
     assert.equal(await client.heartbeat(nodeId), true);
     assert.equal(await client.heartbeat("never-registered"), false);
@@ -72,7 +95,7 @@ test("SwarmClient heartbeat returns true for a known node and false for an unkno
 test("SwarmClient records reputation events and reads them back", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const client = new SwarmClient(baseUrl);
+    const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
     const nodeId = await client.registerNode("http://127.0.0.1:50052", "desktop");
     assert.equal(await client.recordAgreement(nodeId), true);
     assert.equal(await client.recordDisagreement(nodeId), true);
@@ -89,7 +112,7 @@ test("SwarmClient records reputation events and reads them back", async () => {
 test("SwarmClient reads capacity and catalog", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const client = new SwarmClient(baseUrl);
+    const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
     assert.equal(await client.getCapacity(), 0);
 
     await client.registerNode("http://127.0.0.1:50052", "desktop");
@@ -106,7 +129,7 @@ test("SwarmClient reads capacity and catalog", async () => {
 test("SwarmClient lists nodes grouped by locality", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const client = new SwarmClient(baseUrl);
+    const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
     await client.registerNode("http://127.0.0.1:50052", "desktop", "kitchen-mesh");
     const groups = await client.listNodesByLocality();
     assert.equal((groups["kitchen-mesh"] as unknown[]).length, 1);
@@ -118,7 +141,7 @@ test("SwarmClient lists nodes grouped by locality", async () => {
 test("SwarmClient registers, heartbeats, lists, and deregisters a peer", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const client = new SwarmClient(baseUrl);
+    const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
     const peerId = await client.registerPeer("http://127.0.0.1:9999");
     assert.equal(typeof peerId, "string");
 
@@ -137,7 +160,7 @@ test("SwarmClient registers, heartbeats, lists, and deregisters a peer", async (
 test("SwarmClient classifies a prompt", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const client = new SwarmClient(baseUrl);
+    const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
     const result = await client.classify("hello");
     assert.deepEqual(result, { safe: true, categories: [] });
   } finally {
@@ -148,7 +171,7 @@ test("SwarmClient classifies a prompt", async () => {
 test("SwarmClient.registerNode rejects with the server's error detail on a 400", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const client = new SwarmClient(baseUrl);
+    const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
     await assert.rejects(
       () => client.registerNode("http://127.0.0.1:50052", "toaster" as any),
       (err: Error) => {
@@ -164,7 +187,7 @@ test("SwarmClient.registerNode rejects with the server's error detail on a 400",
 test("SwarmClient.registerNode accepts an optional servesModel", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
-    const client = new SwarmClient(baseUrl);
+    const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
     const nodeId = await client.registerNode("http://127.0.0.1:50052", "desktop", undefined, "tinyllama-1.1b");
     const nodes = await client.listNodes();
     assert.equal((nodes as { nodeId: string; servesModel?: string }[])[0].servesModel, "tinyllama-1.1b");
@@ -178,7 +201,7 @@ test("SwarmClient.generate returns the generated text from a matching stub node"
   const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "Paris." } }));
   const { server, baseUrl } = await startTestServer();
   try {
-    const client = new SwarmClient(baseUrl);
+    const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
     await client.registerNode(stub.endpoint, "desktop", undefined, "tinyllama-1.1b");
 
     const result = await client.generate("The capital of France is", "tinyllama-1.1b");

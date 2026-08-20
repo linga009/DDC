@@ -26,7 +26,10 @@ async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1000) });
+      const res = await fetch(`http://127.0.0.1:${port}/health`, {
+        headers: { authorization: "Bearer test-secret-token-1234" },
+        signal: AbortSignal.timeout(1000),
+      });
       if (res.ok) return;
     } catch {
       // not up yet -- keep polling
@@ -50,8 +53,8 @@ test(
     // platforms/shells that already have it on PATH, and a harmless no-op
     // on non-Windows platforms (guarded by process.platform).
     const spawnEnv = process.platform === "win32"
-      ? { ...process.env, PATH: `C:\\msys64\\ucrt64\\bin;${process.env.PATH ?? ""}` }
-      : process.env;
+      ? { ...process.env, PATH: `C:\\msys64\\ucrt64\\bin;${process.env.PATH ?? ""}`, SWARM_AUTH_TOKEN: "test-secret-token-1234" }
+      : { ...process.env, SWARM_AUTH_TOKEN: "test-secret-token-1234" };
     const agent: ChildProcess = spawn(AGENT_BINARY, ["--model", MODEL_PATH, "--port", String(AGENT_PORT)], { env: spawnEnv });
     try {
       await waitForHealth(AGENT_PORT, 30000);
@@ -61,7 +64,7 @@ test(
       const peers = new PeerRegistry();
       const classifier = new KeywordSafetyClassifier([]);
       const reputation = new ReputationTracker();
-      const server = createServer(registry, catalog, peers, classifier, reputation);
+      const server = createServer(registry, catalog, peers, classifier, reputation, "test-secret-token-1234");
       await new Promise<void>(resolve => server.listen(0, resolve));
       const address = server.address();
       if (address === null || typeof address === "string") {
@@ -70,7 +73,7 @@ test(
       const baseUrl = `http://127.0.0.1:${address.port}`;
 
       try {
-        const client = new SwarmClient(baseUrl);
+        const client = new SwarmClient(baseUrl, "test-secret-token-1234");
         await client.registerNode(`http://127.0.0.1:${AGENT_PORT}`, "desktop", undefined, "tinyllama-1.1b");
 
         const result = await client.generate("The capital of France is", "tinyllama-1.1b", 8);

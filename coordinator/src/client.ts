@@ -1,14 +1,20 @@
 export class SwarmClient {
   private readonly baseUrl: string;
+  private readonly authToken: string;
 
-  constructor(baseUrl: string) {
+  constructor(baseUrl: string, authToken: string) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
+    this.authToken = authToken;
+  }
+
+  private authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+    return { ...extra, authorization: `Bearer ${this.authToken}` };
   }
 
   private async postJson(path: string, body: unknown, signal?: AbortSignal): Promise<Response> {
     return fetch(`${this.baseUrl}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify(body),
       signal,
     });
@@ -40,22 +46,22 @@ export class SwarmClient {
   }
 
   async heartbeat(nodeId: string, signal?: AbortSignal): Promise<boolean> {
-    const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/heartbeat`, { method: "POST", signal });
+    const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/heartbeat`, { method: "POST", headers: this.authHeaders(), signal });
     return res.status === 204;
   }
 
   async recordAgreement(nodeId: string, signal?: AbortSignal): Promise<boolean> {
-    const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/reputation/agree`, { method: "POST", signal });
+    const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/reputation/agree`, { method: "POST", headers: this.authHeaders(), signal });
     return res.status === 204;
   }
 
   async recordDisagreement(nodeId: string, signal?: AbortSignal): Promise<boolean> {
-    const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST", signal });
+    const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST", headers: this.authHeaders(), signal });
     return res.status === 204;
   }
 
   async getReputation(nodeId: string, signal?: AbortSignal): Promise<{ agreements: number; disagreements: number; trusted: boolean } | null> {
-    const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/reputation`, { signal });
+    const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/reputation`, { headers: this.authHeaders(), signal });
     if (res.status === 404) {
       return null;
     }
@@ -63,7 +69,7 @@ export class SwarmClient {
   }
 
   async listNodes(signal?: AbortSignal): Promise<unknown[]> {
-    const res = await fetch(`${this.baseUrl}/nodes`, { signal });
+    const res = await fetch(`${this.baseUrl}/nodes`, { headers: this.authHeaders(), signal });
     if (!res.ok) {
       const detail = await res.text();
       throw new Error(`listNodes failed: ${res.status} ${detail}`);
@@ -72,7 +78,7 @@ export class SwarmClient {
   }
 
   async listNodesByLocality(signal?: AbortSignal): Promise<Record<string, unknown[]>> {
-    const res = await fetch(`${this.baseUrl}/nodes/locality`, { signal });
+    const res = await fetch(`${this.baseUrl}/nodes/locality`, { headers: this.authHeaders(), signal });
     if (!res.ok) {
       const detail = await res.text();
       throw new Error(`listNodesByLocality failed: ${res.status} ${detail}`);
@@ -81,7 +87,7 @@ export class SwarmClient {
   }
 
   async getCapacity(signal?: AbortSignal): Promise<number> {
-    const res = await fetch(`${this.baseUrl}/capacity`, { signal });
+    const res = await fetch(`${this.baseUrl}/capacity`, { headers: this.authHeaders(), signal });
     if (!res.ok) {
       const detail = await res.text();
       throw new Error(`getCapacity failed: ${res.status} ${detail}`);
@@ -101,12 +107,12 @@ export class SwarmClient {
   }
 
   async peerHeartbeat(peerId: string, signal?: AbortSignal): Promise<boolean> {
-    const res = await fetch(`${this.baseUrl}/peers/${peerId}/heartbeat`, { method: "POST", signal });
+    const res = await fetch(`${this.baseUrl}/peers/${peerId}/heartbeat`, { method: "POST", headers: this.authHeaders(), signal });
     return res.status === 204;
   }
 
   async listPeers(signal?: AbortSignal): Promise<unknown[]> {
-    const res = await fetch(`${this.baseUrl}/peers`, { signal });
+    const res = await fetch(`${this.baseUrl}/peers`, { headers: this.authHeaders(), signal });
     if (!res.ok) {
       const detail = await res.text();
       throw new Error(`listPeers failed: ${res.status} ${detail}`);
@@ -115,12 +121,12 @@ export class SwarmClient {
   }
 
   async deregisterPeer(peerId: string, signal?: AbortSignal): Promise<boolean> {
-    const res = await fetch(`${this.baseUrl}/peers/${peerId}`, { method: "DELETE", signal });
+    const res = await fetch(`${this.baseUrl}/peers/${peerId}`, { method: "DELETE", headers: this.authHeaders(), signal });
     return res.status === 204;
   }
 
   async getCatalog(signal?: AbortSignal): Promise<unknown[]> {
-    const res = await fetch(`${this.baseUrl}/catalog`, { signal });
+    const res = await fetch(`${this.baseUrl}/catalog`, { headers: this.authHeaders(), signal });
     if (!res.ok) {
       const detail = await res.text();
       throw new Error(`getCatalog failed: ${res.status} ${detail}`);
