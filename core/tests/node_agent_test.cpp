@@ -27,6 +27,16 @@ std::string testModelPath() {
     return std::string(SWARM_TEST_MODEL_DIR) + "/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf";
 }
 
+constexpr const char* kTestAuthToken = "test-secret-token-1234";
+
+void setTestAuthTokenEnv() {
+#ifdef _WIN32
+    _putenv_s("SWARM_AUTH_TOKEN", kTestAuthToken);
+#else
+    setenv("SWARM_AUTH_TOKEN", kTestAuthToken, 1);
+#endif
+}
+
 std::string sendRawRequest(int port, const std::string& rawRequest) {
 #ifdef _WIN32
     WSADATA wsaData;
@@ -71,7 +81,9 @@ std::string sendRawRequest(int port, const std::string& rawRequest) {
 void waitForAgentHealth(int port) {
     for (int attempt = 0; attempt < 100; ++attempt) {
         try {
-            std::string response = sendRawRequest(port, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+            std::string response = sendRawRequest(
+                port,
+                "GET /health HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n");
             if (response.find("HTTP/1.1 200") != std::string::npos) {
                 return;
             }
@@ -96,6 +108,7 @@ protected:
     }
 
     void SetUp() override {
+        setTestAuthTokenEnv();
         KillAnyRunningAgent();
 
         std::string cmd;
@@ -157,6 +170,7 @@ protected:
     }
 
     void SetUp() override {
+        setTestAuthTokenEnv();
         KillAnyRunningAgent();
         KillAnyRunningRpcServer();
 
@@ -196,7 +210,9 @@ protected:
 };
 
 TEST_F(NodeAgentFixture, HealthEndpointReportsReady) {
-    std::string response = sendRawRequest(kAgentPort, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    std::string response = sendRawRequest(
+        kAgentPort,
+        "GET /health HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n");
     EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos);
     EXPECT_NE(response.find("\"status\":\"ready\""), std::string::npos);
 }
@@ -204,7 +220,7 @@ TEST_F(NodeAgentFixture, HealthEndpointReportsReady) {
 TEST_F(NodeAgentFixture, CompleteEndpointReturnsRealGeneratedText) {
     std::string body = R"({"prompt":"The capital of France is","n_predict":8})";
     std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
-                           "\r\n\r\n" + body;
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
     std::string response = sendRawRequest(kAgentPort, request);
 
     EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos);
@@ -222,7 +238,7 @@ TEST_F(NodeAgentFixture, CompleteEndpointReturnsRealGeneratedText) {
 TEST_F(NodeAgentFixture, CompleteEndpointRejectsAMissingPromptWith400) {
     std::string body = R"({"n_predict":8})";
     std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
-                           "\r\n\r\n" + body;
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
     std::string response = sendRawRequest(kAgentPort, request);
 
     EXPECT_NE(response.find("HTTP/1.1 400"), std::string::npos);
@@ -237,10 +253,32 @@ TEST_F(NodeAgentFixture, CompleteEndpointRejectsAnOversizedNPredictWith400) {
     // of failing fast, which is itself a signal the cap is gone.
     std::string body = R"({"prompt":"The capital of France is","n_predict":9999})";
     std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
-                           "\r\n\r\n" + body;
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
     std::string response = sendRawRequest(kAgentPort, request);
 
     EXPECT_NE(response.find("HTTP/1.1 400"), std::string::npos);
+}
+
+TEST_F(NodeAgentFixture, HealthEndpointRejectsMissingAuthWith401) {
+    std::string response = sendRawRequest(kAgentPort, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    EXPECT_NE(response.find("HTTP/1.1 401"), std::string::npos);
+}
+
+TEST_F(NodeAgentFixture, CompleteEndpointRejectsMissingAuthWith401) {
+    std::string body = R"({"prompt":"The capital of France is","n_predict":8})";
+    std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 401"), std::string::npos);
+}
+
+TEST_F(NodeAgentFixture, CompleteEndpointRejectsWrongAuthWith401) {
+    std::string body = R"({"prompt":"The capital of France is","n_predict":8})";
+    std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer wrong-token\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 401"), std::string::npos);
 }
 
 TEST_F(MultiNodeAgentFixture, CompleteEndpointWorksAcrossRealRpcShardedInference) {
@@ -253,7 +291,7 @@ TEST_F(MultiNodeAgentFixture, CompleteEndpointWorksAcrossRealRpcShardedInference
     // swarm-rpc-server child -> real HTTP response.
     std::string body = R"({"prompt":"The capital of France is","n_predict":8})";
     std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
-                           "\r\n\r\n" + body;
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
     std::string response = sendRawRequest(kAgentPort, request);
 
     ASSERT_NE(response.find("HTTP/1.1 200"), std::string::npos) << response;

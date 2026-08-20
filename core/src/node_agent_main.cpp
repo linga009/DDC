@@ -3,6 +3,7 @@
 #include "swarm/json_utils.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -26,6 +27,28 @@ swarm::LayerPlacement parseLayerPlacement(const std::string& spec) {
         throw std::runtime_error("--layer-placement endpoint must not be empty (got \"" + spec + "\")");
     }
     return swarm::LayerPlacement{layer, endpoint};
+}
+
+// Constant-time comparison -- a `==` on a secret-derived string is a
+// timing side-channel (an attacker who can measure response latency could
+// infer the token byte-by-byte from where the comparison first diverges).
+bool constantTimeEquals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+    }
+    return diff == 0;
+}
+
+bool isAuthorized(const swarm::HttpRequest& req, const std::string& token) {
+    auto it = req.headers.find("authorization");
+    if (it == req.headers.end()) {
+        return false;
+    }
+    return constantTimeEquals(it->second, "Bearer " + token);
 }
 
 }  // namespace
@@ -61,6 +84,13 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        const char* tokenEnv = std::getenv("SWARM_AUTH_TOKEN");
+        if (tokenEnv == nullptr || std::string(tokenEnv).empty()) {
+            std::fprintf(stderr, "error: SWARM_AUTH_TOKEN environment variable must be set -- refusing to start unauthenticated\n");
+            return 1;
+        }
+        std::string authToken = tokenEnv;
+
         std::printf("swarm-node-agent: loading model %s ...\n", modelPath.c_str());
         std::fflush(stdout);
 
@@ -81,7 +111,10 @@ int main(int argc, char** argv) {
 
         swarm::HttpServer server(port);
 
-        server.route("GET", "/health", [](const swarm::HttpRequest&) {
+        server.route("GET", "/health", [&authToken](const swarm::HttpRequest& req) {
+            if (!isAuthorized(req, authToken)) {
+                return swarm::HttpResponse{401, R"({"error":"missing or invalid Authorization header"})"};
+            }
             return swarm::HttpResponse{200, R"({"status":"ready"})"};
         });
 
@@ -91,7 +124,10 @@ int main(int argc, char** argv) {
         // handler could ever receive via server.run()'s dispatch loop) for
         // any unwind path out of this scope. In the normal case server.run()
         // below blocks forever and this scope is never unwound at all.
-        server.route("POST", "/complete", [&engine](const swarm::HttpRequest& req) -> swarm::HttpResponse {
+        server.route("POST", "/complete", [&engine, &authToken](const swarm::HttpRequest& req) -> swarm::HttpResponse {
+            if (!isAuthorized(req, authToken)) {
+                return swarm::HttpResponse{401, R"({"error":"missing or invalid Authorization header"})"};
+            }
             std::string prompt;
             if (!swarm::extractJsonString(req.body, "prompt", prompt)) {
                 return swarm::HttpResponse{400, R"({"error":"prompt must be a JSON string field"})"};
