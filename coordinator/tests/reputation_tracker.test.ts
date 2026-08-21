@@ -98,3 +98,70 @@ test("constructing with valid values does not throw", () => {
   assert.doesNotThrow(() => new ReputationTracker());
   assert.doesNotThrow(() => new ReputationTracker(3, 0.75));
 });
+
+test("score for a never-seen node is exactly 0.5", () => {
+  const tracker = new ReputationTracker();
+  assert.equal(tracker.score("never-seen"), 0.5);
+});
+
+test("score approaches 1 as agreement-only evidence grows, and never reaches it", () => {
+  const tracker = new ReputationTracker();
+  tracker.recordAgreement("node-a");
+  tracker.recordAgreement("node-a");
+  const scoreAtTwo = tracker.score("node-a");
+  for (let i = 0; i < 98; i++) {
+    tracker.recordAgreement("node-a");
+  }
+  const scoreAtHundred = tracker.score("node-a");
+
+  assert.ok(scoreAtTwo > 0.5);
+  assert.ok(scoreAtHundred > scoreAtTwo);
+  assert.ok(scoreAtHundred < 1);
+});
+
+test("score approaches 0 as disagreement-only evidence grows, and never reaches it", () => {
+  const tracker = new ReputationTracker();
+  tracker.recordDisagreement("node-a");
+  tracker.recordDisagreement("node-a");
+  const scoreAtTwo = tracker.score("node-a");
+  for (let i = 0; i < 98; i++) {
+    tracker.recordDisagreement("node-a");
+  }
+  const scoreAtHundred = tracker.score("node-a");
+
+  assert.ok(scoreAtTwo < 0.5);
+  assert.ok(scoreAtHundred < scoreAtTwo);
+  assert.ok(scoreAtHundred > 0);
+});
+
+test("equal agreements and disagreements score exactly 0.5, same as a never-seen node", () => {
+  const tracker = new ReputationTracker();
+  tracker.recordAgreement("node-a");
+  tracker.recordAgreement("node-a");
+  tracker.recordAgreement("node-a");
+  tracker.recordDisagreement("node-a");
+  tracker.recordDisagreement("node-a");
+  tracker.recordDisagreement("node-a");
+
+  assert.equal(tracker.score("node-a"), 0.5);
+});
+
+test("more evidence at the same perfect ratio scores strictly higher", () => {
+  const tracker = new ReputationTracker();
+  tracker.recordAgreement("few-samples");
+  tracker.recordAgreement("few-samples");
+  for (let i = 0; i < 100; i++) {
+    tracker.recordAgreement("many-samples");
+  }
+
+  assert.ok(tracker.score("many-samples") > tracker.score("few-samples"));
+});
+
+test("scores are computed independently per node", () => {
+  const tracker = new ReputationTracker();
+  tracker.recordAgreement("node-a");
+  tracker.recordDisagreement("node-b");
+
+  assert.ok(tracker.score("node-a") > 0.5);
+  assert.ok(tracker.score("node-b") < 0.5);
+});

@@ -58,4 +58,9 @@ export class ReputationTracker {
     const entry = this.stats.get(nodeId);
     return entry ? { ...entry } : { agreements: 0, disagreements: 0 };
   }
+
+  score(nodeId: string): number {
+    const { agreements, disagreements } = this.getStats(nodeId);
+    return (agreements + 1) / (agreements + disagreements + 2);
+  }
 }
