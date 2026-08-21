@@ -504,19 +504,37 @@ is enough to capture `SWARM_AUTH_TOKEN`, since the coordinator
 authenticates its outbound `/complete` call with it). `nodeId` is now a
 deterministic `sha256` hash of the (lowercased) endpoint rather than a
 random value, so `Map.set()` naturally overwrites the same entry on every
-re-registration of the same endpoint, no matter how much time has passed
-or whether the previous entry already aged out of the registry — a node
-cannot shed reputation history by re-registering, and cannot escape it by
-going quiet past the 30-second heartbeat timeout and coming back either.
-Verified live: eject a node with 5 disagreements, re-register the same
-endpoint, `GET /nodes` still excludes it and `GET /nodes/:nodeId/reputation`
-still reports the same `nodeId` with its disagreement count intact.
-**Not fixed by this:** an attacker who holds `SWARM_AUTH_TOKEN` can still
-mint unlimited *distinct* identities by registering different endpoints
-(e.g. several ports on one machine) — Phase 3 makes a given endpoint's
-identity stable and non-resettable, it does not limit how many endpoints
-one attacker can register in the first place. The overwrite-on-register
-mechanism that makes identity durable also cuts the other way: any
+re-registration of the *same endpoint string*, no matter how much time has
+passed or whether the previous entry already aged out of the registry — a
+node cannot shed reputation history by re-registering with the identical
+endpoint string it already used, and cannot escape it by going quiet past
+the 30-second heartbeat timeout and coming back either. Verified live:
+eject a node with 5 disagreements, re-register the same endpoint,
+`GET /nodes` still excludes it and `GET /nodes/:nodeId/reputation` still
+reports the same `nodeId` with its disagreement count intact.
+**Not fixed by this:** identity is stable per *endpoint string*, not per
+underlying node — `stableNodeId()` only lowercases the string, it does not
+canonicalize it, so a single listening socket answers to unlimited alias
+strings for free, no new port or infrastructure required. Verified live: a
+node ejected while registered as `http://127.0.0.1:PORT` re-registers as
+`http://localhost:PORT` (same running server, same socket) and comes back
+with a completely different `nodeId` and a clean `0/0, trusted: true`
+reputation record — `/generate` immediately routes to it again. The same
+works with `http://[::1]:PORT`, a trailing-dot FQDN vs. the bare form, or
+any other DNS name pointed at the same machine. An attacker who holds
+`SWARM_AUTH_TOKEN` can separately mint unlimited genuinely-distinct
+identities by registering different endpoints (e.g. several ports on one
+machine) too — Phase 3 makes a given endpoint *string* stable and
+non-resettable, it does not limit how many strings, aliased or distinct,
+one attacker can register in the first place. Relatedly, an ejected node
+does not even need to re-register to come back: the reputation-mutating
+routes deliberately check the *unfiltered* node list rather than the
+reputation-filtered one (so an already-ejected node stays reachable for
+legitimate agree/disagree corrections), which also means any token-holder
+can rehabilitate an ejected node in place with 6
+`POST /nodes/:nodeId/reputation/agree` calls, no re-registration involved;
+verified live. The overwrite-on-register mechanism that makes identity
+durable for a *given* endpoint string also cuts the other way: any
 token-holder who knows a node's exact `endpoint` (trivially readable via
 `GET /nodes`) can silently overwrite that node's `deviceTier`/
 `localityGroup`/`servesModel` claim by re-registering the same endpoint —
@@ -530,9 +548,12 @@ vector above. This is a new consequence of Phase 3's own fix, not present
 before it: pre-Phase-3, re-registering someone else's endpoint minted a
 harmless duplicate entry under a different `nodeId` rather than overwriting
 the original. It does not let the attacker redirect traffic to themselves
-(the stored `endpoint` is unchanged, so `/generate` still forwards to the
-real node's real server) — it is a targeted denial/griefing primitive, not
-a token-capture one. No fix is scoped for this; it would need the same
+— the coordinator's `new URL().href` parsing already normalizes the *host*
+to lowercase before `stableNodeId()` ever sees it, so this overwrite can
+only clobber the record's other fields, never repoint where `/generate`
+actually sends the request — so it is a targeted denial/griefing primitive,
+not a token-capture one. No fix is scoped for any of this; closing the
+endpoint-aliasing and overwrite gaps both need the same
 proof-of-endpoint-possession mechanism (e.g. node-supplied public-key
 identity) already rejected as out of scope for this phase. Separately, the
 disagreement ratio is still all-time with no decay or windowing, so an established node
