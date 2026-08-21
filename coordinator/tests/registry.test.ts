@@ -222,3 +222,84 @@ test("register accepts both localityGroup and servesModel together", () => {
   assert.equal(node.localityGroup, "kitchen-mesh");
   assert.equal(node.servesModel, "tinyllama-1.1b");
 });
+
+test("register called twice with the same endpoint returns the same nodeId and does not grow size()", () => {
+  const registry = new NodeRegistry();
+  const first = registry.register("http://127.0.0.1:50052", "desktop");
+  const second = registry.register("http://127.0.0.1:50052", "desktop");
+
+  assert.equal(first, second);
+  assert.equal(registry.size(), 1);
+});
+
+test("nodeId is a 64-character lowercase hex string (sha256 of the endpoint), not a UUID", () => {
+  const registry = new NodeRegistry();
+  const nodeId = registry.register("http://127.0.0.1:50052", "desktop");
+
+  assert.match(nodeId, /^[0-9a-f]{64}$/);
+});
+
+test("re-registering the same endpoint with a different deviceTier/localityGroup/servesModel updates the fields in place under the same nodeId", () => {
+  const registry = new NodeRegistry();
+  const first = registry.register("http://127.0.0.1:50052", "desktop", "kitchen-mesh", "tinyllama-1.1b");
+  const second = registry.register("http://127.0.0.1:50052", "android", "office-mesh", "small-7b");
+
+  assert.equal(first, second);
+  assert.equal(registry.size(), 1);
+  const [node] = registry.listActive();
+  assert.equal(node.deviceTier, "android");
+  assert.equal(node.localityGroup, "office-mesh");
+  assert.equal(node.servesModel, "small-7b");
+});
+
+test("registering the same endpoint under three different localityGroup values in sequence never produces more than one active node at a time", () => {
+  const registry = new NodeRegistry();
+  registry.register("http://127.0.0.1:50052", "desktop", "kitchen-mesh");
+  registry.register("http://127.0.0.1:50052", "desktop", "office-mesh");
+  registry.register("http://127.0.0.1:50052", "desktop", "garage-mesh");
+
+  assert.equal(registry.size(), 1);
+  const groups = registry.groupByLocality();
+  assert.equal(groups.has("kitchen-mesh"), false);
+  assert.equal(groups.has("office-mesh"), false);
+  assert.equal(groups.get("garage-mesh")?.length, 1);
+});
+
+test("nodeId derivation is case-insensitive in the endpoint", () => {
+  const registry = new NodeRegistry();
+  const lower = registry.register("http://127.0.0.1:50052", "desktop");
+  const upper = registry.register("HTTP://127.0.0.1:50052", "desktop");
+
+  assert.equal(lower, upper);
+  assert.equal(registry.size(), 1);
+});
+
+test("two different endpoints still produce two different nodeIds", () => {
+  const registry = new NodeRegistry();
+  const a = registry.register("http://127.0.0.1:50052", "desktop");
+  const b = registry.register("http://127.0.0.1:50053", "desktop");
+
+  assert.notEqual(a, b);
+});
+
+test("a node's reputation survives an expire-then-re-register cycle at the same endpoint", () => {
+  let now = 0;
+  const registry = new NodeRegistry(() => now);
+  const reputation = new ReputationTracker(3, 0.5);
+
+  const firstId = registry.register("http://127.0.0.1:50052", "desktop");
+  for (let i = 0; i < 3; i++) {
+    reputation.recordDisagreement(firstId);
+  }
+  assert.equal(reputation.isTrusted(firstId), false);
+
+  now = 30001; // past the 30s timeout, with no heartbeat in between
+  assert.equal(registry.listActive(reputation).length, 0); // pruned from the registry
+  assert.equal(registry.size(), 0);
+
+  const secondId = registry.register("http://127.0.0.1:50052", "desktop"); // re-register, same endpoint
+
+  assert.equal(secondId, firstId);
+  assert.equal(reputation.isTrusted(secondId), false); // still untrusted -- history was never reset
+  assert.deepEqual(reputation.getStats(secondId), { agreements: 0, disagreements: 3 });
+});

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { ReputationTracker } from "./reputation_tracker.ts";
 
 export type DeviceTier = "desktop" | "android" | "ios";
@@ -17,6 +17,18 @@ interface StoredNode extends NodeInfo {
   lastSeen: number;
 }
 
+function stableNodeId(endpoint: string): string {
+  // Deterministic, not random: the same endpoint must always produce the
+  // same nodeId, no matter how many times or how far apart in time it
+  // registers. This is what makes a re-registration below overwrite (not
+  // duplicate) the existing Map entry, closing the "re-register to clear
+  // reputation" and "go quiet 30s then reset" evasions -- identity here
+  // never depends on any prior entry still being present in `nodes`,
+  // unlike a live scan for a matching endpoint (PeerRegistry's approach)
+  // would.
+  return createHash("sha256").update(endpoint.toLowerCase()).digest("hex");
+}
+
 export class NodeRegistry {
   private readonly clock: () => number;
   private readonly timeoutMs: number;
@@ -28,7 +40,7 @@ export class NodeRegistry {
   }
 
   register(endpoint: string, deviceTier: DeviceTier, localityGroup?: string, servesModel?: string): string {
-    const nodeId = randomUUID();
+    const nodeId = stableNodeId(endpoint);
     this.nodes.set(nodeId, { nodeId, endpoint, deviceTier, localityGroup, servesModel, lastSeen: this.clock() });
     return nodeId;
   }
