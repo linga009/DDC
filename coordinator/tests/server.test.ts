@@ -1253,6 +1253,40 @@ test("GET /openapi.json serves the OpenAPI document", async () => {
   }
 });
 
+test("openapi.json documents the bearer-token requirement it is deliberately left public to advertise", async () => {
+  // /openapi.json is one of only four unauthenticated routes, and the stated
+  // reason (see isPublicRoute in server.ts) is "a developer needs to be able
+  // to read it to find out a token is even required." A document with no
+  // securityScheme, no security requirement, and no 401 anywhere contradicts
+  // its own reason for being public -- a developer generating a client from
+  // it would produce one that 401s on every call with nothing explaining why.
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/openapi.json`);
+    const doc = await res.json();
+
+    assert.deepEqual(doc.components.securitySchemes.bearerAuth.type, "http");
+    assert.deepEqual(doc.components.securitySchemes.bearerAuth.scheme, "bearer");
+    assert.deepEqual(doc.security, [{ bearerAuth: [] }]);
+    assert.match(doc.info.description, /Authorization: Bearer/);
+    assert.match(doc.info.description, /SWARM_AUTH_TOKEN/);
+
+    // Every documented operation must document its 401 -- all of them sit
+    // behind the same pre-routing auth check, so any operation without one
+    // is a documentation gap, not a route that can't 401.
+    for (const [path, methods] of Object.entries(doc.paths as Record<string, Record<string, any>>)) {
+      for (const [method, operation] of Object.entries(methods)) {
+        assert.ok(
+          operation.responses?.["401"],
+          `${method.toUpperCase()} ${path} is documented without a 401, but every route requires the token`,
+        );
+      }
+    }
+  } finally {
+    server.close();
+  }
+});
+
 test("every path+method documented in openapi.json resolves to a real route (not a 404)", async () => {
   const { server, baseUrl } = await startTestServer();
   try {

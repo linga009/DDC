@@ -16,7 +16,7 @@
 - Follow this repo's existing routing pattern in `server.ts` (manual `parts` splitting, no router library) and existing error-response conventions (`sendJson` helper, matching status codes).
 - This plan runs in its own git worktree at `.worktrees/security-phase-1-auth` (branch `security-phase-1-auth`), created via the `using-git-worktrees` skill before Task 1 starts, off `master`. Because a new worktree checks out a fresh copy from git's last-committed state, an unrelated uncommitted change that may exist in the main `DDC` working copy's `coordinator/tests/server.test.ts` (pre-dating this plan, unrelated to this work) will **not** be present in this worktree — nothing to preserve or reconcile, it's simply not there.
 - Run coordinator tests: `cd coordinator && npm test`. Run coordinator e2e test: `cd coordinator && npm run test:e2e` (requires a built `swarm-node-agent` and the TinyLlama test model — skips itself with a clear message if either is missing).
-- Build core: `cmake -G Ninja -S . -B build && cmake --build build` (ccache at `CCACHE_DIR=/c/Users/User/.ccache` — reuse it in the new worktree rather than cold-building). Run core tests: `cd build && ctest`, or run a specific test binary directly, e.g. `./build/core/tests/http_server_test.exe`.
+- Build core: `cmake -G Ninja -S . -B build && cmake --build build` (ccache at `CCACHE_DIR=/c/Users/User/.ccache` — reuse it in the new worktree rather than cold-building). Run core tests: `cd build && ctest`. Note that despite the per-suite-sounding source filenames (`http_server_test.cpp`, `node_agent_test.cpp`, ...), every C++ test in this repo compiles into ONE binary, `./build/core/tests/inference_engine_test.exe` — to run a subset, filter it, e.g. `./build/core/tests/inference_engine_test.exe --gtest_filter='HttpServerFixture.*'`.
 
 ---
 
@@ -896,7 +896,7 @@ TEST_F(HttpServerFixture, ParsesRequestHeadersIntoTheHandler) {
 - [ ] **Step 2: Build and run to verify it fails**
 
 Run: `cmake --build build`
-Run: `./build/core/tests/http_server_test.exe --gtest_filter=HttpServerFixture.ParsesRequestHeadersIntoTheHandler`
+Run: `./build/core/tests/inference_engine_test.exe --gtest_filter=HttpServerFixture.ParsesRequestHeadersIntoTheHandler`
 Expected: build FAILS (`HttpRequest` has no member `headers` yet).
 
 - [ ] **Step 3: Implement in `http_server.h`**
@@ -1011,7 +1011,7 @@ Add a `401` case to `writeResponse`'s status-text mapping (Task 6 will start ret
 - [ ] **Step 5: Build and run to verify it passes**
 
 Run: `cmake --build build`
-Run: `./build/core/tests/http_server_test.exe`
+Run: `./build/core/tests/inference_engine_test.exe --gtest_filter='HttpServerFixture.*'`
 Expected: PASS, all 8 tests (7 existing + 1 new).
 
 - [ ] **Step 6: Commit**
@@ -1164,7 +1164,7 @@ TEST_F(NodeAgentFixture, CompleteEndpointRejectsWrongAuthWith401) {
 - [ ] **Step 2: Build and run to verify the new tests fail**
 
 Run: `cmake --build build`
-Run: `./build/core/tests/node_agent_test.exe`
+Run: `./build/core/tests/inference_engine_test.exe --gtest_filter='NodeAgentFixture.*:MultiNodeAgentFixture.*'`
 Expected: `HealthEndpointRejectsMissingAuthWith401`, `CompleteEndpointRejectsMissingAuthWith401`, and `CompleteEndpointRejectsWrongAuthWith401` FAIL (the agent doesn't check auth yet, so these get `200`/`400` instead of `401`). All other tests should still PASS at this point (Step 1's header additions don't hurt anything yet since the agent doesn't require the header).
 
 - [ ] **Step 3: Implement in `node_agent_main.cpp`**
@@ -1251,7 +1251,7 @@ The `/complete` route (add `&authToken` to the existing capture list, and the ch
 - [ ] **Step 4: Build and run to verify everything passes**
 
 Run: `cmake --build build`
-Run: `./build/core/tests/node_agent_test.exe`
+Run: `./build/core/tests/inference_engine_test.exe --gtest_filter='NodeAgentFixture.*:MultiNodeAgentFixture.*'`
 Expected: PASS, all tests (4 pre-existing `NodeAgentFixture` tests + 3 new 401 tests + 1 `MultiNodeAgentFixture` test = 8 total).
 
 - [ ] **Step 5: Commit**

@@ -49,6 +49,17 @@ textarea {
   padding: 0.5rem;
 }
 
+input {
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  font: inherit;
+  box-sizing: border-box;
+}
+
+#token-input {
+  width: 100%;
+}
+
 button {
   margin-top: 0.5rem;
   padding: 0.5rem 1rem;

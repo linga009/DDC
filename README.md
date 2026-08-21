@@ -308,6 +308,20 @@ whole swarm, not per-node) on both `/health` and `/complete`:
 SWARM_AUTH_TOKEN=<your-secret> ./build/core/swarm-node-agent.exe --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --port 8081
 ```
 
+Both the coordinator and `swarm-node-agent` **refuse to start if
+`SWARM_AUTH_TOKEN` contains a newline or leading/trailing whitespace**,
+rather than accepting it. This is deliberate and worth knowing about,
+because `SWARM_AUTH_TOKEN=$(cat secret.txt)` on a file with a trailing
+newline, a `.env` line with a stray trailing space, and
+`docker --env-file` all produce exactly that. Such a token can never
+authenticate anyone — every HTTP parser strips the whitespace around a
+received header value, so the received token can never be byte-equal to a
+configured one that still carries it — and the failure mode without this
+check is brutal: a completely healthy-looking startup log followed by a
+`401` on every single request, including ones sending the byte-exact
+token. The token is *not* silently trimmed: if your secret isn't what you
+think it is, you should be told, not have it quietly rewritten.
+
 This closes "anyone can register a fake node, submit inference requests,
 or read swarm state" for anyone who doesn't have the token — it does
 **not** add encryption-in-transit (traffic is still plain HTTP) and it
@@ -318,6 +332,22 @@ about token-holder behavior, not outsider access). For encryption, or for
 running nodes across anything wider than a single trusted LAN, put an SSH
 tunnel or WireGuard in front — see `swarm-rpc-server`'s note above, which
 applies equally here.
+
+**The one shared secret is forwarded to whatever endpoint a registered
+node claims to be.** `POST /generate` sends `Authorization: Bearer
+<the-shared-token>` to the node's `endpoint` URL, and `GET /catalog`
+sends it to every registered peer coordinator — so the token's exposure
+surface is *every URL any token-holder ever registers*, in cleartext (no
+TLS, by design — see the Non-Goals in the security design doc). Verified
+live: an attacker-controlled listener registered as a node with a matching
+`servesModel` received both the real shared token and a real user prompt
+on its `/complete`. This is not an outsider bypass — you already need the
+token to register anything — but it means one dishonest or compromised
+token-holder can harvest the secret without ever attacking the
+coordinator, and any node operator who is later removed from the swarm
+already has it. A single swarm-wide secret is inherent to this phase's
+design; per-node tokens or mTLS are named as deferred scope in the design
+doc, not solved here.
 
 Endpoints:
 
@@ -444,6 +474,18 @@ registered, this instance makes an outbound HTTP request to it on every
 targets — this is a smaller set than "anyone on the network" but is not
 "only operators who should be adding peers," since there's still only the
 one shared token, not per-operator credentials.
+**Cross-operator federation is effectively broken by the shared-token
+model:** because the outbound `/capacity` poll authenticates with *this*
+instance's `SWARM_AUTH_TOKEN`, a peer coordinator running a *different*
+operator's token rejects that poll with a `401` and therefore contributes
+`0` to federated capacity — verified live. Nothing surfaces this except a
+`console.warn` on the polling side: `GET /catalog` still returns `200`,
+just with a silently smaller active-node count, which can leave a model
+looking unavailable when the federation really does have the capacity for
+it. Federating usefully today means every peer shares one token (a single
+trust domain), which is a real limitation for a project whose whole point
+is federation across independent operators. Per-operator credentials are
+deferred, not solved.
 The reputation-recording endpoints now require the same token — currently
 any token-holder can still record arbitrary agreement/disagreement events
 for any node, since the token is shared swarm-wide rather than scoped per
@@ -466,7 +508,14 @@ attacker who has separately registered their own endpoint with a
 match for that model, so every subsequent `/generate` call for it —
 including real user prompts — gets routed to the attacker's node, which can
 return arbitrary attacker-controlled text as if it were the real model's
-output. Separately, the disagreement ratio is all-time with no decay or windowing,
+output. That same routing step also hands the attacker the swarm's shared
+secret: the coordinator authenticates its outbound `/complete` call with
+`Authorization: Bearer <the-shared-token>`, so registering an endpoint you
+control is enough to capture the token in cleartext (verified live — see
+the Authentication section above). Registering requires already holding
+the token, so this is a token-holder vector rather than an outsider one,
+but it means the secret spreads to every endpoint anyone ever registers
+and cannot be un-learned by a node operator who later leaves. Separately, the disagreement ratio is all-time with no decay or windowing,
 so an established node with a long good history (e.g. 200 agreements)
 needs 200 *consecutive* disagreements to be ejected — the inverse of
 catching a node that goes bad (compromised, degraded hardware) after
@@ -533,7 +582,12 @@ For programmatic access to the coordinator, two things exist:
   the route code, so it can drift from actual behavior if a route's
   request/response shape changes without the doc being updated — a test in
   `coordinator/tests/server.test.ts` only catches a documented path
-  disappearing, not a shape drifting.
+  disappearing, not a shape drifting. The document declares a `bearerAuth`
+  security scheme and applies it to every operation, so a **generated
+  client must be configured with the shared `SWARM_AUTH_TOKEN`** or every
+  call it makes will `401` (each operation documents that `401`). The doc
+  itself stays reachable without a token, deliberately — that is how a
+  developer discovers a token is required in the first place.
 - **`coordinator/src/client.ts`** — a minimal `SwarmClient` class, one typed
   method per JSON API endpoint listed above (the static dashboard routes
   and `/openapi.json` itself are excluded), that talks to those routes
@@ -541,9 +595,21 @@ For programmatic access to the coordinator, two things exist:
   with zero dependencies (only native `fetch`) and runs directly under
   Node.js's native TypeScript execution, no build step — developers can
   import it as-is or copy it as a starting point for their own client.
+  **Its constructor now takes the auth token as a required second
+  argument** — `new SwarmClient(baseUrl, authToken)` — and attaches
+  `Authorization: Bearer <token>` to every request it makes; this is a
+  breaking change from the previous single-argument form, and there is no
+  unauthenticated mode. See the Authentication subsection above for where
+  that token comes from.
   Every method accepts an optional trailing `signal?: AbortSignal` so a
   caller can bound a request (e.g. `client.getCapacity(AbortSignal.timeout(2000))`);
   the client itself imposes no default or automatic timeout.
+  On a `401`, every method throws rather than returning a value: the
+  boolean-returning ones (`heartbeat`, `recordAgreement`,
+  `recordDisagreement`, `peerHeartbeat`, `deregisterPeer`) still return
+  `false` for a genuine "no such id", but an auth failure is not an answer
+  to that question and is raised instead of being flattened into the same
+  `false`.
 
 **`POST /generate` (and `SwarmClient.generate()`) is the one inference-request
 path that exists today** — both the OpenAPI document and `SwarmClient`
