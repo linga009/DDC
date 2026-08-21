@@ -26,6 +26,11 @@ async function refreshStatus() {
     ]);
     if (capacityRes.status === 401 || catalogRes.status === 401) {
       activeCountEl.textContent = "token required";
+      // Clear the table too, not just the count: rows left over from the
+      // last successful poll would otherwise sit there looking live while
+      // the page is actually unauthenticated, showing stale availability
+      // that may no longer be true.
+      tbody.innerHTML = "";
       document.getElementById("token-status").textContent =
         "Invalid or missing token — paste a valid SWARM_AUTH_TOKEN above.";
       return;

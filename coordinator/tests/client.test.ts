@@ -109,6 +109,56 @@ test("SwarmClient records reputation events and reads them back", async () => {
   }
 });
 
+test("SwarmClient.getReputation throws on a 401 instead of returning the error body typed as a reputation record", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    // Register through a correctly-configured client so the node genuinely
+    // exists -- this proves the 401 comes from the wrong token, not from the
+    // 404 path the method already handled.
+    const goodClient = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
+    const nodeId = await goodClient.registerNode("http://127.0.0.1:50052", "desktop");
+
+    const wrongTokenClient = new SwarmClient(baseUrl, "not-the-right-token");
+    // Previously this resolved to { error: "missing or invalid Authorization
+    // header" } while its declared type promised { agreements, disagreements,
+    // trusted } -- a caller reading `.trusted` silently got undefined from a
+    // request that never reached the reputation ledger.
+    await assert.rejects(
+      () => wrongTokenClient.getReputation(nodeId),
+      /getReputation failed: 401/,
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test("SwarmClient's boolean-returning methods throw on a 401 rather than reporting a false that means 'not found'", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const goodClient = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
+    const nodeId = await goodClient.registerNode("http://127.0.0.1:50052", "desktop");
+    const peerId = await goodClient.registerPeer("http://127.0.0.1:9099");
+    // The node and peer both really exist, so a correctly-authenticated
+    // caller gets `true` -- which is exactly what makes the wrong-token
+    // `false` these used to return a lie rather than a stale reading.
+    assert.equal(await goodClient.heartbeat(nodeId), true);
+
+    const wrongTokenClient = new SwarmClient(baseUrl, "not-the-right-token");
+    await assert.rejects(() => wrongTokenClient.heartbeat(nodeId), /heartbeat failed: 401/);
+    await assert.rejects(() => wrongTokenClient.recordAgreement(nodeId), /recordAgreement failed: 401/);
+    await assert.rejects(() => wrongTokenClient.recordDisagreement(nodeId), /recordDisagreement failed: 401/);
+    await assert.rejects(() => wrongTokenClient.peerHeartbeat(peerId), /peerHeartbeat failed: 401/);
+    await assert.rejects(() => wrongTokenClient.deregisterPeer(peerId), /deregisterPeer failed: 401/);
+
+    // A genuine "not found" must still come back as `false`, not a throw --
+    // only 401 changed behavior.
+    assert.equal(await goodClient.heartbeat("never-registered"), false);
+    assert.equal(await goodClient.peerHeartbeat("never-registered"), false);
+  } finally {
+    server.close();
+  }
+});
+
 test("SwarmClient reads capacity and catalog", async () => {
   const { server, baseUrl } = await startTestServer();
   try {

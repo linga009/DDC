@@ -55,8 +55,29 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+// Rejects a 401 with the RFC 7235 section 3.1 MUST: a 401 response has to
+// carry a WWW-Authenticate header naming the scheme the client should use.
+// Kept in one helper so every 401 this server emits is identical.
+function sendUnauthorized(res: ServerResponse): void {
+  const payload = JSON.stringify({ error: "missing or invalid Authorization header" });
+  res.writeHead(401, {
+    "content-type": "application/json",
+    "www-authenticate": "Bearer",
+  });
+  res.end(payload);
+}
+
 function isAuthorized(req: IncomingMessage, authToken: string): boolean {
+  // Node keeps the FIRST Authorization header when a request sends several
+  // (core/src/http_server.cpp matches this deliberately -- see its
+  // first-occurrence-wins comment), so both hops judge such a request alike.
   const header = req.headers.authorization;
+  // The scheme match is case-SENSITIVE ("Bearer ", not "bearer "), which is
+  // deliberately stricter than RFC 7235, where the auth-scheme token is
+  // case-insensitive. Fail-closed, and identical to isAuthorized() in
+  // core/src/node_agent_main.cpp so the coordinator and the node agent can
+  // never disagree about whether a given request is authorized. Not an
+  // oversight.
   if (typeof header !== "string" || !header.startsWith("Bearer ")) {
     return false;
   }
@@ -140,7 +161,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           (parts[0] === "app.js" || parts[0] === "style.css" || parts[0] === "openapi.json"));
 
       if (!isPublicRoute && !isAuthorized(req, authToken)) {
-        sendJson(res, 401, { error: "missing or invalid Authorization header" });
+        sendUnauthorized(res);
         return;
       }
 

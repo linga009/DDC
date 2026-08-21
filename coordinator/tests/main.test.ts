@@ -97,3 +97,34 @@ test("main.ts refuses to start when SWARM_AUTH_TOKEN is set but empty", async ()
   });
   assert.notEqual(exitCode, 0);
 });
+
+// A token carrying surrounding whitespace is worse than an unset one: the
+// coordinator used to start, log a perfectly healthy "listening ...
+// authentication required" line, and then 401 every request forever --
+// including one sending the byte-exact configured token -- because Node's
+// HTTP parser strips trailing whitespace off a received Authorization header,
+// so the received value can never equal an authToken that still has it baked
+// in. Verified live before the fix: SWARM_AUTH_TOKEN=$'tok\n' started fine and
+// rejected everything, with nothing in the log to explain why.
+for (const [label, token] of [
+  ["a trailing newline (SWARM_AUTH_TOKEN=$(cat secret.txt))", "tok-with-newline\n"],
+  ["a trailing space (a .env line with a stray space)", "tok-with-space "],
+  ["a leading space", " tok-with-leading-space"],
+  ["an embedded carriage return", "tok\rwith-cr"],
+] as const) {
+  test(`main.ts refuses to start when SWARM_AUTH_TOKEN has ${label}`, async () => {
+    const env = { ...process.env, PORT: "0", SWARM_AUTH_TOKEN: token };
+
+    const child = spawn(process.execPath, [mainPath], { env });
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    const exitCode = await new Promise<number | null>(resolve => {
+      child.on("exit", code => resolve(code));
+    });
+    assert.notEqual(exitCode, 0);
+    // The message has to actually name the problem -- an operator staring at
+    // universal 401s needs to be pointed at their own token, not left to
+    // guess.
+    assert.match(stderr, /SWARM_AUTH_TOKEN must not contain leading\/trailing whitespace or newlines/);
+  });
+}

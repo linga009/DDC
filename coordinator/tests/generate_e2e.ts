@@ -15,6 +15,7 @@ const AGENT_BINARY = process.platform === "win32"
   : "../build/core/swarm-node-agent";
 const MODEL_PATH = "../models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf";
 const AGENT_PORT = 51099;
+const TEST_AUTH_TOKEN = "test-secret-token-1234";
 
 const skipReason = !existsSync(AGENT_BINARY)
   ? `${AGENT_BINARY} not built -- run "cmake --build build" from the repo root first`
@@ -27,7 +28,7 @@ async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/health`, {
-        headers: { authorization: "Bearer test-secret-token-1234" },
+        headers: { authorization: `Bearer ${TEST_AUTH_TOKEN}` },
         signal: AbortSignal.timeout(1000),
       });
       if (res.ok) return;
@@ -53,8 +54,8 @@ test(
     // platforms/shells that already have it on PATH, and a harmless no-op
     // on non-Windows platforms (guarded by process.platform).
     const spawnEnv = process.platform === "win32"
-      ? { ...process.env, PATH: `C:\\msys64\\ucrt64\\bin;${process.env.PATH ?? ""}`, SWARM_AUTH_TOKEN: "test-secret-token-1234" }
-      : { ...process.env, SWARM_AUTH_TOKEN: "test-secret-token-1234" };
+      ? { ...process.env, PATH: `C:\\msys64\\ucrt64\\bin;${process.env.PATH ?? ""}`, SWARM_AUTH_TOKEN: TEST_AUTH_TOKEN }
+      : { ...process.env, SWARM_AUTH_TOKEN: TEST_AUTH_TOKEN };
     const agent: ChildProcess = spawn(AGENT_BINARY, ["--model", MODEL_PATH, "--port", String(AGENT_PORT)], { env: spawnEnv });
     try {
       await waitForHealth(AGENT_PORT, 30000);
@@ -64,7 +65,7 @@ test(
       const peers = new PeerRegistry();
       const classifier = new KeywordSafetyClassifier([]);
       const reputation = new ReputationTracker();
-      const server = createServer(registry, catalog, peers, classifier, reputation, "test-secret-token-1234");
+      const server = createServer(registry, catalog, peers, classifier, reputation, TEST_AUTH_TOKEN);
       await new Promise<void>(resolve => server.listen(0, resolve));
       const address = server.address();
       if (address === null || typeof address === "string") {
@@ -73,7 +74,7 @@ test(
       const baseUrl = `http://127.0.0.1:${address.port}`;
 
       try {
-        const client = new SwarmClient(baseUrl, "test-secret-token-1234");
+        const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
         await client.registerNode(`http://127.0.0.1:${AGENT_PORT}`, "desktop", undefined, "tinyllama-1.1b");
 
         const result = await client.generate("The capital of France is", "tinyllama-1.1b", 8);

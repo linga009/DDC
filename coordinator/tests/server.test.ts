@@ -81,6 +81,20 @@ test("a mutating route rejects a request with the wrong token with 401", async (
   }
 });
 
+test("a 401 carries the WWW-Authenticate header RFC 7235 requires", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await fetch(`${baseUrl}/nodes`);
+    assert.equal(res.status, 401);
+    // RFC 7235 section 3.1: a 401 MUST carry WWW-Authenticate naming the
+    // scheme, which is how a generic HTTP client knows what credential to
+    // supply rather than just seeing an opaque rejection.
+    assert.equal(res.headers.get("www-authenticate"), "Bearer");
+  } finally {
+    server.close();
+  }
+});
+
 test("a read route rejects a request with no Authorization header with 401", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
@@ -549,6 +563,54 @@ test("GET /catalog aggregates a live peer's reported capacity with local capacit
   } finally {
     serverA.close();
     serverB.close();
+  }
+});
+
+test("GET /catalog sends the shared auth token on its outbound /capacity request to a peer", async () => {
+  // The peer-federation tests around this one all use stub peers that never
+  // look at the inbound Authorization header, so every one of them would
+  // pass whether or not fetchPeerCapacity() authenticates at all. Now that
+  // GET /capacity requires a token, a peer that isn't sent one contributes
+  // 0 -- silently zeroing federated capacity. Assert the header for real.
+  const catalogEntries = [
+    { id: "small", displayName: "Small", minActiveNodes: 1 },
+  ];
+
+  let receivedAuth: string | null | undefined;
+  let receivedPath: string | undefined;
+  const testPeer = createHttpServer((req, res) => {
+    if (req.url === "/capacity") {
+      receivedPath = req.url;
+      receivedAuth = req.headers.authorization ?? null;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ activeNodes: 3 }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>(resolve => testPeer.listen(0, "127.0.0.1", resolve));
+  const testPeerAddress = testPeer.address();
+  if (testPeerAddress === null || typeof testPeerAddress === "string") {
+    throw new Error("expected test peer to bind a real port");
+  }
+
+  const { server, baseUrl } = await startTestServer(catalogEntries);
+  try {
+    await authFetch(`${baseUrl}/peers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${testPeerAddress.port}` }),
+    });
+
+    const res = await authFetch(`${baseUrl}/catalog`);
+    assert.equal(res.status, 200);
+
+    assert.equal(receivedPath, "/capacity", "the coordinator never polled the peer at all");
+    assert.equal(receivedAuth, `Bearer ${TEST_AUTH_TOKEN}`);
+  } finally {
+    server.close();
+    testPeer.close();
   }
 });
 

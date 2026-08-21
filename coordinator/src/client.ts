@@ -11,6 +11,25 @@ export class SwarmClient {
     return { ...extra, authorization: `Bearer ${this.authToken}` };
   }
 
+  // Used by the boolean-returning methods below (heartbeat, recordAgreement,
+  // recordDisagreement, peerHeartbeat, deregisterPeer). Those answer a
+  // found/not-found question -- true for 204, false otherwise -- but a 401
+  // is not an answer to that question at all: the request never got far
+  // enough to have one. Collapsing it into `false` made an auth failure
+  // indistinguishable from "that id isn't registered", so a node agent
+  // holding a stale token would read its own 401 as "the coordinator forgot
+  // me" and re-register forever, and a caller could never tell the two
+  // apart. Only 401 is promoted to a throw here; every other status keeps
+  // the documented true-if-204/false-otherwise contract those five methods
+  // were built around, since widening that is a bigger API decision than
+  // this fix round should make unilaterally.
+  private async throwIfUnauthorized(res: Response, methodName: string): Promise<void> {
+    if (res.status === 401) {
+      const detail = await res.text();
+      throw new Error(`${methodName} failed: 401 ${detail}`);
+    }
+  }
+
   private async postJson(path: string, body: unknown, signal?: AbortSignal): Promise<Response> {
     return fetch(`${this.baseUrl}${path}`, {
       method: "POST",
@@ -47,16 +66,19 @@ export class SwarmClient {
 
   async heartbeat(nodeId: string, signal?: AbortSignal): Promise<boolean> {
     const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/heartbeat`, { method: "POST", headers: this.authHeaders(), signal });
+    await this.throwIfUnauthorized(res, "heartbeat");
     return res.status === 204;
   }
 
   async recordAgreement(nodeId: string, signal?: AbortSignal): Promise<boolean> {
     const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/reputation/agree`, { method: "POST", headers: this.authHeaders(), signal });
+    await this.throwIfUnauthorized(res, "recordAgreement");
     return res.status === 204;
   }
 
   async recordDisagreement(nodeId: string, signal?: AbortSignal): Promise<boolean> {
     const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/reputation/disagree`, { method: "POST", headers: this.authHeaders(), signal });
+    await this.throwIfUnauthorized(res, "recordDisagreement");
     return res.status === 204;
   }
 
@@ -64,6 +86,16 @@ export class SwarmClient {
     const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/reputation`, { headers: this.authHeaders(), signal });
     if (res.status === 404) {
       return null;
+    }
+    // Anything other than 404 or a real 200 must throw, matching
+    // listNodes/getCapacity/etc. Blindly returning res.json() here meant a
+    // 401 body -- { error: "missing or invalid Authorization header" } --
+    // was handed back typed as a reputation record, so a caller reading
+    // `.trusted` got `undefined` (falsy: "not trusted") from a request that
+    // never actually consulted the reputation ledger at all.
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(`getReputation failed: ${res.status} ${detail}`);
     }
     return res.json();
   }
@@ -108,6 +140,7 @@ export class SwarmClient {
 
   async peerHeartbeat(peerId: string, signal?: AbortSignal): Promise<boolean> {
     const res = await fetch(`${this.baseUrl}/peers/${peerId}/heartbeat`, { method: "POST", headers: this.authHeaders(), signal });
+    await this.throwIfUnauthorized(res, "peerHeartbeat");
     return res.status === 204;
   }
 
@@ -122,6 +155,7 @@ export class SwarmClient {
 
   async deregisterPeer(peerId: string, signal?: AbortSignal): Promise<boolean> {
     const res = await fetch(`${this.baseUrl}/peers/${peerId}`, { method: "DELETE", headers: this.authHeaders(), signal });
+    await this.throwIfUnauthorized(res, "deregisterPeer");
     return res.status === 204;
   }
 
