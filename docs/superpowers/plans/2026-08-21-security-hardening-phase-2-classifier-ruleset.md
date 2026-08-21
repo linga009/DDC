@@ -80,13 +80,15 @@ test("a term rule matches case-insensitively", () => {
 
 test("a term containing regex metacharacters is treated literally, not as regex syntax", () => {
   withRulesFile(
-    JSON.stringify({ rules: [{ category: "test_category", term: "cost is $5 (approx.)" }] }),
+    JSON.stringify({ rules: [{ category: "test_category", term: "lose 100+ pounds fast" }] }),
     filePath => {
       const rules = loadSafetyRules(filePath);
-      assert.equal(rules[0].pattern.test("they said the cost is $5 (approx.) for it"), true);
-      // If metacharacters weren't escaped, "." would match any character and
-      // "(...)" would be a capture group -- neither should happen here.
-      assert.equal(rules[0].pattern.test("cost is $5 (approxX) for it"), false);
+      assert.equal(rules[0].pattern.test("you can lose 100+ pounds fast with this plan"), true);
+      // If "+" weren't escaped, it would be a regex quantifier ("one or
+      // more of the preceding character", i.e. one or more "0"s) rather
+      // than a literal plus sign -- so this input, which has an extra "0"
+      // instead of a literal "+", would incorrectly match too. It must not.
+      assert.equal(rules[0].pattern.test("you can lose 1000 pounds fast with this plan"), false);
     },
   );
 });
