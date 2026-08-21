@@ -492,44 +492,57 @@ for any node, since the token is shared swarm-wide rather than scoped per
 node or per operator.
 Reputation state is in-memory only and does not persist across restarts.
 
-**Known gaming vectors:** reputation is keyed by `nodeId`, and
-`NodeRegistry.register()` mints a fresh `randomUUID()` on every call with no
-endpoint dedupe (unlike `PeerRegistry`, which dedupes registrations by
-endpoint) — so an ejected node clears its record with one more
-`POST /nodes/register` call, restoring its `/capacity` count immediately.
-Verified live: 5 disagreements ejects a node; one re-register call and
-it's back with a clean slate. This is a stronger, cheaper vector than a
-node simply avoiding ever being spot-checked to stay perpetually
-"unproven, therefore trusted" under the zero-checks-trusted default above.
-Since `POST /generate` now exists, ejecting a legitimate node this way is
-no longer just about restoring a `/capacity` count: verified live, an
-attacker who has separately registered their own endpoint with a
-`servesModel` matching the ejected node's model becomes the sole remaining
-match for that model, so every subsequent `/generate` call for it —
-including real user prompts — gets routed to the attacker's node, which can
-return arbitrary attacker-controlled text as if it were the real model's
-output. That same routing step also hands the attacker the swarm's shared
-secret: the coordinator authenticates its outbound `/complete` call with
-`Authorization: Bearer <the-shared-token>`, so registering an endpoint you
-control is enough to capture the token in cleartext (verified live — see
-the Authentication section above). Registering requires already holding
-the token, so this is a token-holder vector rather than an outsider one,
-but it means the secret spreads to every endpoint anyone ever registers
-and cannot be un-learned by a node operator who later leaves. Separately, the disagreement ratio is all-time with no decay or windowing,
-so an established node with a long good history (e.g. 200 agreements)
-needs 200 *consecutive* disagreements to be ejected — the inverse of
-catching a node that goes bad (compromised, degraded hardware) after
-building trust, and effectively un-ejectable at any realistic spot-check
-sampling rate. Fixing the first requires stable node identity
-(endpoint-keyed or node-supplied public key); fixing the second requires a
-sliding window or EWMA scoring function instead of a lifetime ratio. Both
-are out of scope for this ledger-only plan and are prerequisites for the
-future spot-check-mechanism plan. Note also that because every
-registration mints a fresh reputation entry with no eviction, a churning
-fleet leaks one entry per registration in the in-memory `Map` — the same
-stable-identity fix needed above would address this too; evicting on
-registry-prune alone is not attempted here, since it would open a new
-evasion path (go quiet for 30s to get a clean slate).
+**Known gaming vectors:** reputation is keyed by `nodeId`. **Fixed in
+Security Hardening Phase 3:** `NodeRegistry.register()` used to mint a
+fresh `randomUUID()` on every call with no endpoint dedupe, so an ejected
+node could clear its record with one more `POST /nodes/register` call —
+verified live: 5 disagreements ejected a node, one re-register call
+restored it with a clean slate, and (once `POST /generate` existed) that
+clean-slate node could go on to capture real user traffic for a model and
+the swarm's shared token in cleartext (registering an endpoint you control
+is enough to capture `SWARM_AUTH_TOKEN`, since the coordinator
+authenticates its outbound `/complete` call with it). `nodeId` is now a
+deterministic `sha256` hash of the (lowercased) endpoint rather than a
+random value, so `Map.set()` naturally overwrites the same entry on every
+re-registration of the same endpoint, no matter how much time has passed
+or whether the previous entry already aged out of the registry — a node
+cannot shed reputation history by re-registering, and cannot escape it by
+going quiet past the 30-second heartbeat timeout and coming back either.
+Verified live: eject a node with 5 disagreements, re-register the same
+endpoint, `GET /nodes` still excludes it and `GET /nodes/:nodeId/reputation`
+still reports the same `nodeId` with its disagreement count intact.
+**Not fixed by this:** an attacker who holds `SWARM_AUTH_TOKEN` can still
+mint unlimited *distinct* identities by registering different endpoints
+(e.g. several ports on one machine) — Phase 3 makes a given endpoint's
+identity stable and non-resettable, it does not limit how many endpoints
+one attacker can register in the first place. The overwrite-on-register
+mechanism that makes identity durable also cuts the other way: any
+token-holder who knows a node's exact `endpoint` (trivially readable via
+`GET /nodes`) can silently overwrite that node's `deviceTier`/
+`localityGroup`/`servesModel` claim by re-registering the same endpoint —
+verified live: registering `http://127.0.0.1:1` again with no `servesModel`
+field instantly stripped a live, fully-trusted node's `servesModel` claim
+from its registry entry, with zero reputation calls made and no trace
+visible via `GET /nodes/:nodeId/reputation` (still `0/0`, `trusted: true`)
+— unclaiming a competitor from `/generate` routing for its real model in
+one HTTP call, cheaper and stealthier than the five-disagreement ejection
+vector above. This is a new consequence of Phase 3's own fix, not present
+before it: pre-Phase-3, re-registering someone else's endpoint minted a
+harmless duplicate entry under a different `nodeId` rather than overwriting
+the original. It does not let the attacker redirect traffic to themselves
+(the stored `endpoint` is unchanged, so `/generate` still forwards to the
+real node's real server) — it is a targeted denial/griefing primitive, not
+a token-capture one. No fix is scoped for this; it would need the same
+proof-of-endpoint-possession mechanism (e.g. node-supplied public-key
+identity) already rejected as out of scope for this phase. Separately, the
+disagreement ratio is still all-time with no decay or windowing, so an established node
+with a long good history (e.g. 200 agreements) still needs 200
+*consecutive* disagreements to be ejected — the inverse of catching a node
+that goes bad (compromised, degraded hardware) after building trust, and
+effectively un-ejectable at any realistic spot-check sampling rate. Fixing
+this requires a sliding window or EWMA scoring function instead of a
+lifetime ratio, and remains unscoped and undesigned (see the Security
+Hardening Phase roadmap in `CLAUDE.md`).
 
 **Locality grouping is self-reported and unverified:** `localityGroup` is an
 arbitrary string a node supplies at registration time — the coordinator
@@ -538,35 +551,34 @@ node can claim membership in any group, including one it has no actual
 adjacency to, with no cost or detection beyond holding the shared
 `SWARM_AUTH_TOKEN` (the same shared-token caveat above applies here too —
 registration now requires the token, but any token-holder can still claim
-any group for free). This is worse than a single false claim: because
-`NodeRegistry.register()` mints a fresh `randomUUID()` on every call with no
-endpoint dedupe (the same gap noted in the reputation gaming-vectors above),
-one physical device can register itself repeatedly under different
-`localityGroup` values and appear in multiple groups simultaneously —
-inflating any group's apparent size for free, or flooding every group at
-once. Verified live: the same endpoint registered under `"kitchen-mesh"`,
-`"office-mesh"`, and `"garage-mesh"` produced 3 distinct nodeIds, all live
-simultaneously in `GET /nodes/locality`, all backed by the same physical
-endpoint; re-registering under a new group does not remove the old
-registration either, so the stale entry persists in its original group
-until its normal liveness/heartbeat timeout (currently 30s) expires. This
-matters beyond the general shared-token caveat because `GET /nodes/locality`
-exists as groundwork for a future pipeline assembler that will likely
-prefer larger or majority locality clusters when selecting nodes — making
-this a vector against the exact consumer this endpoint is groundwork for.
-The root cause is the same missing stable-node-identity fix already named
-as a prerequisite in the reputation gaming-vectors note above; see that
-paragraph rather than repeating it here. Separately, a node can also
-register with `localityGroup: "ungrouped"` verbatim, which is
-indistinguishable from a node that never set the field at all. `GET
-/nodes/locality` exists purely as a stable, queryable interface for
-grouping; no pipeline-assembly or locality-aware request-routing system in
-this repo yet consumes it — `POST /generate` (Phase A, see below) is a
-simple first-match scan over active nodes with no locality-awareness at
-all, and this repo still has no cross-instance (federated) or multi-node
-pipeline-aware request routing of any kind. No client-side mesh-discovery
-mechanism (WiFi Direct, Multipeer Connectivity, LAN broadcast) yet exists
-to produce real, verifiable locality identifiers, either.
+any group for free). **Security Hardening Phase 3 fixed the amplified
+version of this:** before that phase, `NodeRegistry.register()` minted a
+fresh `randomUUID()` on every call with no endpoint dedupe, so one physical
+device could register itself repeatedly under different `localityGroup`
+values and appear in multiple groups simultaneously — verified live at the
+time: the same endpoint registered under `"kitchen-mesh"`, `"office-mesh"`,
+and `"garage-mesh"` produced 3 distinct nodeIds, all live simultaneously in
+`GET /nodes/locality`. `nodeId` is now a deterministic hash of the endpoint
+(see the reputation gaming-vectors note above), so re-registering the same
+endpoint under a new group now overwrites the previous registration instead
+of adding to it — a node can still claim any single group it likes, but can
+no longer occupy several at once. This matters because `GET
+/nodes/locality` exists as groundwork for a future pipeline assembler that
+will likely prefer larger or majority locality clusters when selecting
+nodes; the fix removes the cheapest way to inflate a group's apparent size
+for free. The base truthfulness gap remains open: a single false claim
+about which one group a node belongs to is still free and undetected.
+Separately, a node can also register with `localityGroup: "ungrouped"`
+verbatim, which is indistinguishable from a node that never set the field
+at all. `GET /nodes/locality` exists purely as a stable, queryable
+interface for grouping; no pipeline-assembly or locality-aware
+request-routing system in this repo yet consumes it — `POST /generate`
+(Phase A, see below) is a simple first-match scan over active nodes with no
+locality-awareness at all, and this repo still has no cross-instance
+(federated) or multi-node pipeline-aware request routing of any kind. No
+client-side mesh-discovery mechanism (WiFi Direct, Multipeer Connectivity,
+LAN broadcast) yet exists to produce real, verifiable locality identifiers,
+either.
 Both are expected to be built against this interface later.
 
 ## Developer API

@@ -977,6 +977,71 @@ test("a node ejected by reputation disappears from GET /nodes and stops counting
   }
 });
 
+test("a node ejected by reputation stays ejected after re-registering the same endpoint -- reputation is not reset by churn", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const registerRes = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
+    });
+    const { nodeId: firstNodeId } = await registerRes.json();
+
+    for (let i = 0; i < 5; i++) {
+      await authFetch(`${baseUrl}/nodes/${firstNodeId}/reputation/disagree`, { method: "POST" });
+    }
+
+    const ejectedNodes = await (await authFetch(`${baseUrl}/nodes`)).json();
+    assert.equal(ejectedNodes.length, 0);
+
+    // Re-register the exact same endpoint -- this is the live-verified
+    // vector from README's "Known gaming vectors" section: before this
+    // plan, this returned a brand-new randomUUID() nodeId with a clean
+    // reputation record, restoring the node to GET /nodes immediately.
+    const reregisterRes = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop" }),
+    });
+    const { nodeId: secondNodeId } = await reregisterRes.json();
+
+    assert.equal(secondNodeId, firstNodeId);
+
+    const stillEjectedNodes = await (await authFetch(`${baseUrl}/nodes`)).json();
+    assert.equal(stillEjectedNodes.length, 0);
+
+    const statsRes = await authFetch(`${baseUrl}/nodes/${secondNodeId}/reputation`);
+    assert.deepEqual(await statsRes.json(), { agreements: 0, disagreements: 5, trusted: false });
+  } finally {
+    server.close();
+  }
+});
+
+test("registering the same endpoint under three different localityGroup values never shows more than one node in GET /nodes/locality", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    for (const group of ["kitchen-mesh", "office-mesh", "garage-mesh"]) {
+      await authFetch(`${baseUrl}/nodes/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", localityGroup: group }),
+      });
+    }
+
+    const localityRes = await authFetch(`${baseUrl}/nodes/locality`);
+    const groups = await localityRes.json();
+
+    assert.equal(groups["kitchen-mesh"], undefined);
+    assert.equal(groups["office-mesh"], undefined);
+    assert.equal(groups["garage-mesh"].length, 1);
+
+    const nodesRes = await authFetch(`${baseUrl}/nodes`);
+    assert.equal((await nodesRes.json()).length, 1);
+  } finally {
+    server.close();
+  }
+});
+
 test("POST /nodes/register accepts an optional localityGroup and it is echoed back via GET /nodes", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
