@@ -23,8 +23,9 @@ export const openApiDocument = {
       "locality grouping, and request routing. POST /generate is the " +
       "first inference-request endpoint in this repo -- it classifies a " +
       "prompt, routes it to a single active node whose self-reported " +
-      "servesModel matches (first-match, no locality-awareness, no " +
-      "retry/fallback), and returns the generated text. Dynamic node " +
+      "servesModel matches (reputation-ranked with a random tie-break " +
+      "among equal scores, no locality-awareness, no retry/fallback), " +
+      "and returns the generated text. Dynamic node " +
       "selection, pre-warming, and streaming are not implemented yet.\n\n" +
       "Authentication: every endpoint described here requires a shared " +
       "secret, sent as `Authorization: Bearer <token>`. The operator sets it " +

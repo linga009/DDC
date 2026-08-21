@@ -406,7 +406,13 @@ Endpoints:
   malformed response. `n_predict` defaults to 64 and is capped at 512,
   mirroring `swarm-node-agent`'s own cap. Single attempt only — no retry,
   no fallback to a different node on failure, no streaming (the response
-  arrives complete or not at all). See the paragraph below for what this
+  arrives complete or not at all). Combined with Security Hardening Phase
+  4's random tie-break among equally-scored candidates (see below): if one
+  of several tied nodes is dead, identical requests now succeed or 502
+  *at random* from call to call, rather than the deterministic 100% 502 a
+  dead first-registered node produced before that phase — still correct
+  given the no-retry limitation, but worth knowing when diagnosing an
+  intermittently-failing `/generate`. See the paragraph below for what this
   endpoint does and doesn't do yet.
 - `POST /nodes/:nodeId/reputation/agree` / `POST /nodes/:nodeId/reputation/disagree`
   — record that a node's output agreed or disagreed with a redundant
@@ -437,9 +443,8 @@ still only Phase A of the request-routing initiative: node selection is
 reputation-ranked as of Security Hardening Phase 4 (see below) rather than
 a raw first-match scan, but is still not locality-aware or a general load
 balancer, there is no background pre-warming of pipelines ahead of demand,
-and there
-is no token streaming (a `/generate` call blocks until the full response
-is ready or the request fails). See
+and there is no token streaming (a `/generate` call blocks until the full
+response is ready or the request fails). See
 [`docs/superpowers/specs/2026-08-16-request-routing-design.md`](docs/superpowers/specs/2026-08-16-request-routing-design.md)
 for Phases B (dynamic, coordinator-driven pipeline assembly), C
 (pre-warming and demand-based autoscaling), and D (token streaming) — none
@@ -489,6 +494,32 @@ below; an operator can mint a fresh, neutral-scoring identity for the same
 physical node by re-registering under an alias. This is not a general load
 balancer: there is no in-flight-request tracking or capacity weighting,
 only a random tie-break among exactly-equal scores.
+
+**This ranking mechanism is itself gameable, and cheaply.** The
+reputation-recording endpoints already let any token-holder record
+arbitrary agree/disagree events for any node (see above); Phase 4 is what
+turns that pre-existing write primitive into a direct traffic-steering
+one. Verified live: an attacker registers a node and self-issues
+`POST /nodes/:nodeId/reputation/agree` calls against their own `nodeId` —
+beating a competitor with `A` real agreements costs exactly `A + 1`
+self-issued calls (Laplace scoring is monotonic in raw agreement count at
+a fixed ratio), takes well under a second locally, and — unlike ejecting
+the competitor via 5 disagreements — leaves **no trace on the victim at
+all**: it stays listed in `GET /nodes`, stays `trusted: true`, keeps its
+own disagreement count unchanged. Two related consequences of the same
+all-time, no-decay scoring the "Known gaming vectors" note above already
+flags as an ejection weakness: a node with a genuinely bad but
+merely-still-trusted history (e.g. `200` agreements / `100` disagreements
+— a 33% disagreement rate, under the 50% ejection threshold, but a Laplace
+score of `201/303 ≈ 0.66`) can **permanently monopolize** routing over a
+pristine untested node, since raw evidence volume outweighs a slightly
+worse ratio; and the already-disclosed 6-call ejection-rehab path doesn't
+just rejoin the pool post-Phase-4, it immediately **outranks every
+untested competitor** (a freshly-rehabbed `6/5` node scores `7/13 ≈ 0.54`,
+above the `0.5` neutral baseline). None of this requires an outsider — it
+is the same shared-token threat model as everywhere else in this section —
+but Phase 4 is what makes reputation data worth attacking rather than
+merely worth ignoring.
 
 **Caveat:** `POST /peers/register` now requires `SWARM_AUTH_TOKEN` (see
 Authentication above), and by default the server binds only
@@ -628,8 +659,8 @@ interface for grouping; no pipeline-assembly or locality-aware
 request-routing system in this repo yet consumes it — `POST /generate`
 (Phase A, see below) ranks candidates by reputation score (Security
 Hardening Phase 4, see above) but has no locality-awareness at all, and
-this repo still has no cross-instance
-(federated) or multi-node pipeline-aware request routing of any kind. No
+this repo still has no cross-instance (federated) or multi-node
+pipeline-aware request routing of any kind. No
 client-side mesh-discovery mechanism (WiFi Direct, Multipeer Connectivity,
 LAN broadcast) yet exists to produce real, verifiable locality identifiers,
 either.

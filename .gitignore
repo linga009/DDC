@@ -1,3 +1,8 @@
 .worktrees/
 /build/
 /models/
+# This project is deliberately zero-npm-dependency (see CLAUDE.md) -- no
+# lockfile should ever need to exist, but `npm install`/`npm test` can
+# generate a trivial empty one locally. Ignore it so it never gets
+# accidentally committed.
+/coordinator/package-lock.json
