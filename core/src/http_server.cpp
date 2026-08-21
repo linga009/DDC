@@ -135,9 +135,33 @@ ParsedHead parseHead(const std::string& head, std::string& bodySoFar) {
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
         std::string value = headerLine.substr(colon + 1);
+        // Strip the optional whitespace (OWS) on BOTH sides of the field
+        // value, per RFC 7230 section 3.2.4. Trimming only the leading side
+        // would make `Authorization: Bearer <token> ` (one trailing space,
+        // trivially introduced by a hand-edited config or a copy-paste)
+        // compare unequal to the same token here while Node's parser -- and
+        // therefore the coordinator -- trims it and accepts it. The two
+        // sides of this project must agree on what a header value is.
         size_t firstNonSpace = value.find_first_not_of(" \t");
-        value = (firstNonSpace == std::string::npos) ? std::string() : value.substr(firstNonSpace);
-        result.headers[name] = value;
+        if (firstNonSpace == std::string::npos) {
+            value.clear();
+        } else {
+            size_t lastNonSpace = value.find_last_not_of(" \t");
+            value = value.substr(firstNonSpace, lastNonSpace - firstNonSpace + 1);
+        }
+
+        // First occurrence wins, for every header: `headers[name] = value`
+        // would let a LAST-wins duplicate header override an earlier one,
+        // while Node's parser (and therefore the coordinator) keeps the
+        // FIRST `Authorization` it sees. A request smuggling two different
+        // Authorization headers must be judged identically by both
+        // implementations, so ignore any repeat rather than overwrite. This
+        // covers Content-Length too: the first value parsed below is the one
+        // that governs the body read, so a second one can't retroactively
+        // change how much body this server expects.
+        if (!result.headers.emplace(name, value).second) {
+            continue;
+        }
 
         if (name == "content-length") {
             if (value.empty()) {

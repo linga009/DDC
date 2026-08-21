@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 
@@ -35,6 +38,71 @@ void setTestAuthTokenEnv() {
 #else
     setenv("SWARM_AUTH_TOKEN", kTestAuthToken, 1);
 #endif
+}
+
+// Sets SWARM_AUTH_TOKEN in THIS process's environment to an arbitrary
+// (possibly malformed) value. std::system() spawns through the C runtime and
+// the child inherits this process's environment, so whatever is set here is
+// exactly what the spawned agent binary reads from getenv().
+void setAuthTokenEnvRaw(const char* value) {
+#ifdef _WIN32
+    _putenv_s("SWARM_AUTH_TOKEN", value);
+#else
+    setenv("SWARM_AUTH_TOKEN", value, 1);
+#endif
+}
+
+void unsetAuthTokenEnv() {
+#ifdef _WIN32
+    // On the UCRT, _putenv_s with an empty value removes the variable
+    // entirely -- which is what "unset" must mean here, since the agent
+    // treats set-but-empty and unset with the same branch anyway.
+    _putenv_s("SWARM_AUTH_TOKEN", "");
+#else
+    unsetenv("SWARM_AUTH_TOKEN");
+#endif
+}
+
+// Restores the valid shared test token on scope exit, so a failing
+// assertion can never leave a broken SWARM_AUTH_TOKEN behind for whichever
+// test GoogleTest runs next in this shared binary.
+struct AuthTokenEnvGuard {
+    ~AuthTokenEnvGuard() { setTestAuthTokenEnv(); }
+};
+
+// Spawns the real swarm-node-agent binary in the FOREGROUND (unlike the
+// fixtures below, which spawn it detached and poll /health) and returns its
+// exit code, with everything it wrote to stdout/stderr captured in `output`.
+//
+// Only valid for cases where the agent is expected to refuse to start: the
+// model path passed is deliberately nonexistent, so if a regression ever
+// lets startup past the SWARM_AUTH_TOKEN checks, this call fails fast at
+// model load (with a different message, which the assertions catch) instead
+// of loading a real model and blocking forever on server.run().
+int runAgentExpectingRefusalToStart(int port, std::string& output) {
+    const std::string outPath = "node_agent_startup_test_output.txt";
+    std::remove(outPath.c_str());
+
+    std::string cmd = "\"" SWARM_NODE_AGENT_PATH "\" --model \"no-such-model-file.gguf\" --port " +
+                      std::to_string(port) + " > \"" + outPath + "\" 2>&1";
+#ifdef _WIN32
+    // std::system() runs this through `cmd /c`, which strips the first and
+    // last quote character off a command that begins with one -- turning the
+    // quoted exe path into a mangled single token ("...agent.exe" --model
+    // ... .txt) that cmd then reports as an unrecognized command. Wrapping
+    // the WHOLE command in one more pair of quotes gives cmd that outer pair
+    // to eat and leaves the real quoting intact. (Caught for real: without
+    // this, the spawn "failed" with a non-zero exit for the wrong reason,
+    // which is why these tests assert on the message and not just the code.)
+    cmd = "\"" + cmd + "\"";
+#endif
+    int rc = std::system(cmd.c_str());
+
+    std::ifstream in(outPath);
+    output.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    in.close();
+    std::remove(outPath.c_str());
+    return rc;
 }
 
 std::string sendRawRequest(int port, const std::string& rawRequest) {
@@ -279,6 +347,54 @@ TEST_F(NodeAgentFixture, CompleteEndpointRejectsWrongAuthWith401) {
     std::string response = sendRawRequest(kAgentPort, request);
 
     EXPECT_NE(response.find("HTTP/1.1 401"), std::string::npos);
+}
+
+// These three spawn the agent binary directly rather than going through
+// NodeAgentFixture: the whole point is a process that never becomes
+// healthy, so the fixture's spawn-detached-and-poll-/health machinery is
+// exactly the wrong shape. A distinct port (50094) from every fixture in
+// this file keeps them from ever colliding, though nothing should bind it.
+TEST(NodeAgentStartupTest, RefusesToStartWhenAuthTokenIsUnset) {
+    AuthTokenEnvGuard restoreTokenForLaterTests;
+    unsetAuthTokenEnv();
+
+    std::string output;
+    int rc = runAgentExpectingRefusalToStart(50094, output);
+
+    EXPECT_NE(rc, 0) << output;
+    // Assert on the message, not just the exit code: a nonexistent model
+    // path also exits non-zero, so the exit code alone would still "pass"
+    // if the token check were deleted outright.
+    EXPECT_NE(output.find("SWARM_AUTH_TOKEN"), std::string::npos) << output;
+}
+
+TEST(NodeAgentStartupTest, RefusesToStartWhenAuthTokenHasATrailingNewline) {
+    // The single most likely real-world misconfiguration:
+    // SWARM_AUTH_TOKEN=$(cat secret.txt) where the file ends in a newline,
+    // or a .env line with a stray trailing space. Every HTTP header parser
+    // (Node's, and this repo's own since Minor #12) strips whitespace around
+    // a received field value, so a token that still carries it can never be
+    // matched -- the agent would come up "healthy" and then 401 literally
+    // every request, including one sending the byte-exact configured token.
+    AuthTokenEnvGuard restoreTokenForLaterTests;
+    setAuthTokenEnvRaw("tok-with-trailing-newline\n");
+
+    std::string output;
+    int rc = runAgentExpectingRefusalToStart(50094, output);
+
+    EXPECT_NE(rc, 0) << output;
+    EXPECT_NE(output.find("SWARM_AUTH_TOKEN"), std::string::npos) << output;
+}
+
+TEST(NodeAgentStartupTest, RefusesToStartWhenAuthTokenHasALeadingSpace) {
+    AuthTokenEnvGuard restoreTokenForLaterTests;
+    setAuthTokenEnvRaw(" tok-with-leading-space");
+
+    std::string output;
+    int rc = runAgentExpectingRefusalToStart(50094, output);
+
+    EXPECT_NE(rc, 0) << output;
+    EXPECT_NE(output.find("SWARM_AUTH_TOKEN"), std::string::npos) << output;
 }
 
 TEST_F(MultiNodeAgentFixture, CompleteEndpointWorksAcrossRealRpcShardedInference) {

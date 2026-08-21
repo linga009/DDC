@@ -48,7 +48,33 @@ bool isAuthorized(const swarm::HttpRequest& req, const std::string& token) {
     if (it == req.headers.end()) {
         return false;
     }
+    // The scheme comparison here is case-SENSITIVE ("Bearer " only, not
+    // "bearer "), which is deliberately stricter than RFC 7235, where the
+    // auth-scheme token is case-insensitive. Fail-closed and identical to
+    // the coordinator's isAuthorized() in coordinator/src/server.ts -- both
+    // sides reject a lowercase scheme, so the two implementations can't
+    // disagree about whether a given request is authorized. Not an
+    // oversight.
     return constantTimeEquals(it->second, "Bearer " + token);
+}
+
+// True if `token` contains a CR/LF anywhere, or leading/trailing spaces or
+// tabs. Such a token can never authenticate anyone: HTTP header parsers
+// strip optional whitespace around a field value (Node's does, and this
+// repo's own http_server.cpp does since Minor #12), so the value that
+// arrives on the wire can never be byte-equal to a configured token that
+// still carries that whitespace. Rather than authenticate nobody while
+// logging a healthy startup, refuse to start. See validateAuthToken()'s
+// caller for the operator-facing message.
+bool hasSurroundingWhitespaceOrNewlines(const std::string& token) {
+    if (token.empty()) {
+        return false;  // handled by the separate empty-token check
+    }
+    if (token.find_first_of("\r\n") != std::string::npos) {
+        return true;
+    }
+    return token.front() == ' ' || token.front() == '\t' ||
+           token.back() == ' ' || token.back() == '\t';
 }
 
 }  // namespace
@@ -90,6 +116,17 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::string authToken = tokenEnv;
+        // Deliberately NOT trimmed: silently rewriting the operator's secret
+        // would mean the running agent authenticates against a token that
+        // isn't the one they configured. Tell them instead.
+        if (hasSurroundingWhitespaceOrNewlines(authToken)) {
+            std::fprintf(stderr,
+                         "error: SWARM_AUTH_TOKEN must not contain leading/trailing whitespace or "
+                         "newlines -- check for a trailing newline from a file read "
+                         "(SWARM_AUTH_TOKEN=$(cat secret.txt)) or from .env parsing. "
+                         "Refusing to start with a token no client could ever match.\n");
+            return 1;
+        }
 
         std::printf("swarm-node-agent: loading model %s ...\n", modelPath.c_str());
         std::fflush(stdout);

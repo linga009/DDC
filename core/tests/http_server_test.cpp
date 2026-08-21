@@ -195,4 +195,50 @@ TEST_F(HttpServerFixture, ParsesRequestHeadersIntoTheHandler) {
     EXPECT_EQ(capturedAuth, "Bearer abc123");
 }
 
+TEST_F(HttpServerFixture, TrimsTrailingWhitespaceFromAHeaderValue) {
+    swarm::HttpServer server(kTestPort + 8);
+    std::string capturedAuth;
+    server.route("GET", "/health", [&capturedAuth](const swarm::HttpRequest& req) {
+        auto it = req.headers.find("authorization");
+        if (it != req.headers.end()) {
+            capturedAuth = it->second;
+        }
+        return swarm::HttpResponse{200, "{}"};
+    });
+    startServer(server);
+
+    // Trailing OWS (a space and a tab here). RFC 7230 3.2.4 says a parser
+    // strips it on both sides; Node's parser does, so the coordinator
+    // accepts this request. If this side only trimmed the leading side, the
+    // same request would carry a *different* token value here and fail auth
+    // -- the two implementations would disagree.
+    sendRawRequest(kTestPort + 8, "GET /health HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer abc123 \t\r\n\r\n");
+
+    EXPECT_EQ(capturedAuth, "Bearer abc123");
+}
+
+TEST_F(HttpServerFixture, KeepsTheFirstOfTwoDuplicateHeaders) {
+    swarm::HttpServer server(kTestPort + 9);
+    std::string capturedAuth;
+    server.route("GET", "/health", [&capturedAuth](const swarm::HttpRequest& req) {
+        auto it = req.headers.find("authorization");
+        if (it != req.headers.end()) {
+            capturedAuth = it->second;
+        }
+        return swarm::HttpResponse{200, "{}"};
+    });
+    startServer(server);
+
+    // Node's parser keeps the FIRST Authorization header, so the coordinator
+    // judges this request on "Bearer first". This server must reach the same
+    // verdict -- a last-wins map assignment here would mean a single request
+    // could be rejected by one hop and accepted by the other.
+    sendRawRequest(kTestPort + 9,
+                   "GET /health HTTP/1.1\r\nHost: x\r\n"
+                   "Authorization: Bearer first\r\n"
+                   "Authorization: Bearer second\r\n\r\n");
+
+    EXPECT_EQ(capturedAuth, "Bearer first");
+}
+
 }  // namespace
