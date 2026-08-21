@@ -397,7 +397,20 @@ Endpoints:
   pattern-matching, not semantic content understanding**: it catches
   prompts containing a configured term or pattern, and nothing else — it
   does not catch the same request rephrased, misspelled, translated into
-  another language, or expressed in a genuinely novel way. Edit
+  another language, or expressed in a genuinely novel way. The same
+  bluntness cuts the other way too: it has no notion of surrounding
+  intent, so a benign prompt that happens to contain a configured phrase
+  (e.g. a pharmacology student asking about a lethal dose for overdose
+  *management*, or a security engineer asking how to defend against a
+  technique) gets flagged exactly like a malicious one — false positives
+  are not tuned away, only false negatives are the documented gap. The
+  `csam` category in particular is written to match even a prompt merely
+  *naming* the category (e.g. asking what the category covers), which
+  means this README's own category list and a rule author copying it
+  verbatim into the dashboard demo will themselves get blocked — a
+  deliberate consequence of keeping that category's rules blunt and
+  non-graphic (see the curation notes in the Phase 2 implementation plan),
+  not a bug. Edit
   `coordinator/safety_rules.json` (no code change needed) to add rules — a
   plain `"term"` is the safe default (word-boundary-wrapped, escaped
   automatically); the raw-regex `"pattern"` escape hatch has no complexity
@@ -405,7 +418,7 @@ Endpoints:
   can be catastrophically slow (ReDoS) — keep patterns simple. A
   real classifier with different matching logic can still be supplied by
   implementing the `SafetyClassifier` interface
-  (`coordinator/src/safety_classifier.ts`).** `/classify` is
+  (`coordinator/src/safety_classifier.ts`). `/classify` is
   also callable directly and independently of `/generate` below — it is
   not exclusively an internal implementation detail of routing.
 - `POST /generate` — submit `{ "prompt": string, "modelId": string,

@@ -23,6 +23,21 @@ function widenApostrophes(escaped: string): string {
   return escaped.replace(/['’]/g, "['’]");
 }
 
+// Collapse each run of literal spaces in an ALREADY-ESCAPED term into "\s+"
+// (JS regex \s already matches space, tab, newline, CR, and non-breaking
+// space, among others). A term is authored with single spaces between words
+// ("how to build a bomb"), but escapeRegExp leaves those spaces untouched
+// (space is not a regex metacharacter) -- so without this, the compiled
+// pattern only ever matched that EXACT single-space phrase, and the
+// identical phrase with one extra space, a tab, or a line wrap (the default
+// in the dashboard's own multi-line prompt textarea, or in any prompt pasted
+// from a wrapped document) sailed through unflagged. Same bypass class as
+// the apostrophe fix above, broader: it reaches every term rule, not just
+// the ones containing an apostrophe.
+function widenWhitespace(escaped: string): string {
+  return escaped.replace(/ +/g, "\\s+");
+}
+
 export function loadSafetyRules(filePath: string | URL): KeywordRule[] {
   let raw: string;
   try {
@@ -112,7 +127,7 @@ export function loadSafetyRules(filePath: string | URL): KeywordRule[] {
       // \b-wrapping) for a rule that genuinely needs one.
       rules.push({
         category: candidate.category,
-        pattern: new RegExp(`\\b${widenApostrophes(escapeRegExp(term))}\\b`, "i"),
+        pattern: new RegExp(`\\b${widenWhitespace(widenApostrophes(escapeRegExp(term)))}\\b`, "i"),
       });
     } else {
       // "pattern" is raw regex source, authored by hand -- unlike "term"

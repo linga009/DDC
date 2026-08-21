@@ -171,6 +171,40 @@ test("a term authored with a curly apostrophe also matches the straight form", (
   );
 });
 
+test("a multi-word term matches the same phrase with extra, tab, or newline whitespace between words", () => {
+  // A term is authored with single spaces ("how to build a bomb"), but
+  // escapeRegExp leaves literal spaces untouched -- without widening, the
+  // compiled pattern only matched that EXACT single-space phrase, and an
+  // extra space, a tab, or a line-wrapped paste (the default in the
+  // dashboard's own multi-line prompt textarea) sailed through unflagged.
+  withRulesFile(
+    JSON.stringify({ rules: [{ category: "test_category", term: "how to build a bomb" }] }),
+    filePath => {
+      const rules = loadSafetyRules(filePath);
+      assert.equal(rules[0].pattern.test("how to build a bomb"), true);
+      assert.equal(rules[0].pattern.test("how to  build a bomb"), true); // extra space
+      assert.equal(rules[0].pattern.test("how to\tbuild a bomb"), true); // tab
+      assert.equal(rules[0].pattern.test("how to\nbuild a bomb"), true); // newline
+      assert.equal(rules[0].pattern.test("how to\r\nbuild a bomb"), true); // CRLF
+      assert.equal(rules[0].pattern.test("how to build a bomb"), true); // non-breaking space
+      // Still a real match requirement: removing a word entirely, not just
+      // varying the whitespace between words, must not match.
+      assert.equal(rules[0].pattern.test("how to a bomb"), false);
+    },
+  );
+});
+
+test("whitespace widening and apostrophe widening compose correctly on the same term", () => {
+  withRulesFile(
+    JSON.stringify({ rules: [{ category: "test_category", term: "clone someone's bank  card" }] }),
+    filePath => {
+      const rules = loadSafetyRules(filePath);
+      assert.equal(rules[0].pattern.test("clone someone's bank card"), true);
+      assert.equal(rules[0].pattern.test("clone someone’s bank\ncard"), true);
+    },
+  );
+});
+
 test("throws SafetyRulesError with the rule index when a rule is missing category", () => {
   withRulesFile(
     JSON.stringify({ rules: [{ term: "no category here" }] }),
@@ -313,6 +347,18 @@ test("the real shipped ruleset flags an apostrophe term typed with an autocorrec
   const matches = (prompt: string) => rules.filter(r => r.pattern.test(prompt)).map(r => r.category);
   assert.deepEqual(matches(straight), ["fraud_and_scams"]);
   assert.deepEqual(matches(curly), ["fraud_and_scams"]);
+});
+
+test("the real shipped ruleset flags a term typed with an extra space between words", () => {
+  // Same fix as the synthetic whitespace tests above, proven end-to-end
+  // against production rule data rather than a fixture.
+  const rules = loadSafetyRules(REAL_RULES_URL);
+  const exact = "how to build a bomb";
+  const extraSpace = "how to  build a bomb";
+
+  const matches = (prompt: string) => rules.filter(r => r.pattern.test(prompt)).map(r => r.category);
+  assert.deepEqual(matches(exact), ["violence_and_weapons"]);
+  assert.deepEqual(matches(extraSpace), ["violence_and_weapons"]);
 });
 
 test("accepts a URL object directly (not just a string path)", () => {

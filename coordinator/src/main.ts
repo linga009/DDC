@@ -2,7 +2,7 @@ import { createServer } from "./server.ts";
 import { NodeRegistry } from "./registry.ts";
 import { ModelCatalog } from "./catalog.ts";
 import { PeerRegistry } from "./peer_registry.ts";
-import { KeywordSafetyClassifier } from "./safety_classifier.ts";
+import { KeywordSafetyClassifier, type KeywordRule } from "./safety_classifier.ts";
 import { ReputationTracker } from "./reputation_tracker.ts";
 import { loadSafetyRules, SafetyRulesError } from "./safety_rules_loader.ts";
 
@@ -40,7 +40,7 @@ const peers = new PeerRegistry();
 // do -- one actionable console.error line and exit(1), not a raw stack trace
 // from an uncaught exception. README describes this as "the same posture as
 // SWARM_AUTH_TOKEN"; this is what makes that literally true.
-let rules;
+let rules: KeywordRule[];
 try {
   rules = loadSafetyRules(new URL("../safety_rules.json", import.meta.url));
 } catch (err) {
