@@ -629,12 +629,21 @@ git commit -m "Add HTTP-level regression coverage and document the sybil-resista
   `ReputationTracker`, not an identity fix, and is unscoped and undesigned
   as of this plan.
 - **Defense against an attacker minting many distinct fake identities.**
-  This plan makes a *given* endpoint's identity stable and non-resettable.
-  It does not limit how many different endpoints one token-holder can
-  register as unrelated-looking nodes.
+  This plan makes a *given endpoint string's* identity stable and
+  non-resettable, not a given physical node's — `stableNodeId()` only
+  lowercases the endpoint, it does not canonicalize it, so one listening
+  socket answers to unlimited alias strings (`127.0.0.1` vs `localhost` vs
+  `[::1]` vs a trailing-dot FQDN vs any other DNS name pointed at it) for
+  free, with no new port or infrastructure required — each alias gets a
+  fresh, clean identity. This is a materially bigger gap than "register
+  several ports on one machine"; whole-branch review caught and verified
+  it live (see README's "Known gaming vectors"), and it should be named
+  accurately anywhere this plan's residual scope is summarized.
 - **`localityGroup` truthfulness.** A node can still falsely claim
   membership in any single locality group with no verification. This plan
-  only removes the ability to claim several groups *simultaneously*.
+  only removes the ability to claim several groups simultaneously *under
+  the same endpoint string* — the same aliasing gap above means a single
+  physical device can still occupy several groups at once, one per alias.
 - **Node-supplied public-key identity.** Considered in the design doc and
   rejected for this phase as a materially bigger scope (key generation,
   registration flow, rotation/loss story) — endpoint-derived identity is

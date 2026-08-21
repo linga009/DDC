@@ -73,10 +73,23 @@ picks the endpoint-keyed option and works out its consequences.
   open problem; Phase 4's reputation-ranked selection and any future
   per-operator-credential work are the more plausible places to address
   it, not this phase.
+
+  **Post-implementation correction (whole-branch review, live-verified):**
+  "several ports on one machine" understates this gap — `stableNodeId()`
+  only lowercases the endpoint, it does not canonicalize it, so a *single*
+  listening socket answers to unlimited alias strings (`127.0.0.1` vs
+  `localhost` vs `[::1]` vs a trailing-dot FQDN vs any other DNS name
+  pointed at it) for free, no new port or infrastructure required. An
+  ejected node can shed its reputation history entirely by re-registering
+  under an alias of the identical socket it was already using. See
+  README's "Known gaming vectors" for the live repro.
 - **Locality-group truthfulness.** `localityGroup` stays exactly as
   unverified and self-reported as before — this phase only stops one
   endpoint from claiming several groups *at the same time*. A node can
-  still lie about which single group it's in.
+  still lie about which single group it's in. **Post-implementation
+  correction:** the same endpoint-aliasing gap above means a single
+  physical device can still occupy several groups simultaneously, one per
+  alias — the guarantee is per endpoint string, not per device.
 - **Node-supplied public-key identity.** Considered and rejected for this
   phase — see Rejected Approaches below.
 - **Persistence across coordinator restarts.** Every piece of state in

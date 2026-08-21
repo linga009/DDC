@@ -580,15 +580,22 @@ values and appear in multiple groups simultaneously — verified live at the
 time: the same endpoint registered under `"kitchen-mesh"`, `"office-mesh"`,
 and `"garage-mesh"` produced 3 distinct nodeIds, all live simultaneously in
 `GET /nodes/locality`. `nodeId` is now a deterministic hash of the endpoint
-(see the reputation gaming-vectors note above), so re-registering the same
-endpoint under a new group now overwrites the previous registration instead
-of adding to it — a node can still claim any single group it likes, but can
-no longer occupy several at once. This matters because `GET
-/nodes/locality` exists as groundwork for a future pipeline assembler that
-will likely prefer larger or majority locality clusters when selecting
-nodes; the fix removes the cheapest way to inflate a group's apparent size
-for free. The base truthfulness gap remains open: a single false claim
-about which one group a node belongs to is still free and undetected.
+(see the reputation gaming-vectors note above), so re-registering the exact
+same endpoint string under a new group now overwrites the previous
+registration instead of adding to it — a node can still claim any single
+group it likes under a given endpoint string, but can no longer occupy
+several groups under that same string at once. As with the reputation fix
+above, this is a per-endpoint-string guarantee, not a per-device one: the
+same physical node can still occupy several groups simultaneously by
+registering under aliases of itself (`127.0.0.1` vs `localhost` vs `[::1]`
+vs any other DNS name pointed at it), one group per alias — that gap is
+not closed by this phase. This matters because `GET /nodes/locality`
+exists as groundwork for a future pipeline assembler that will likely
+prefer larger or majority locality clusters when selecting nodes; the fix
+raises the cost of inflating a group's apparent size (from "one call per
+extra entry" to "one call per extra alias"), it does not close it. The
+base truthfulness gap remains open: a single false claim about which one
+group a node belongs to is still free and undetected.
 Separately, a node can also register with `localityGroup: "ungrouped"`
 verbatim, which is indistinguishable from a node that never set the field
 at all. `GET /nodes/locality` exists purely as a stable, queryable
