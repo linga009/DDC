@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { readFileSync, writeFileSync } from "node:fs";
 
 const mainPath = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 
@@ -128,3 +129,32 @@ for (const [label, token] of [
     assert.match(stderr, /SWARM_AUTH_TOKEN must not contain leading\/trailing whitespace or newlines/);
   });
 }
+
+test("main.ts refuses to start when the safety rules file is malformed", async () => {
+  const env = {
+    ...process.env,
+    PORT: "0",
+    SWARM_AUTH_TOKEN: "test-secret-token-1234",
+  };
+  // This test intentionally does NOT override the real rules file path --
+  // main.ts resolves coordinator/safety_rules.json relative to its own
+  // module location, not an env var (see Task 1's Global Constraints note).
+  // Instead this test temporarily corrupts the real file, restoring it
+  // in a finally block no matter what.
+  const rulesPath = fileURLToPath(new URL("../safety_rules.json", import.meta.url));
+  const original = readFileSync(rulesPath, "utf-8");
+  writeFileSync(rulesPath, "{ this is not valid json", "utf-8");
+
+  try {
+    const child = spawn(process.execPath, [mainPath], { env });
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    const exitCode = await new Promise<number | null>(resolve => {
+      child.on("exit", code => resolve(code));
+    });
+    assert.notEqual(exitCode, 0);
+    assert.match(stderr, /not valid JSON/);
+  } finally {
+    writeFileSync(rulesPath, original, "utf-8");
+  }
+});
