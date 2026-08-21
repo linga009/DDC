@@ -31,6 +31,20 @@ test("loads a valid rules file into KeywordRule[] with term rules matching by wo
   );
 });
 
+test("a term ending in punctuation can fail to match even when the phrase is present -- documented limitation, not a bug in escaping", () => {
+  withRulesFile(
+    JSON.stringify({ rules: [{ category: "test_category", term: "warning sign!" }] }),
+    filePath => {
+      const rules = loadSafetyRules(filePath);
+      // "!" is non-word and is immediately followed by a space (also
+      // non-word), so \b cannot match at that boundary even though the
+      // text clearly contains the intended phrase. This is the documented
+      // \b-wrapping limitation, not a regression to "fix" here.
+      assert.equal(rules[0].pattern.test("there was a warning sign! posted"), false);
+    },
+  );
+});
+
 test("a term rule matches case-insensitively", () => {
   withRulesFile(
     JSON.stringify({ rules: [{ category: "test_category", term: "danger phrase" }] }),
@@ -121,6 +135,46 @@ test("throws SafetyRulesError with the rule index when a rule is missing categor
         assert.ok(err instanceof SafetyRulesError);
         assert.match((err as Error).message, /index 0/);
         assert.match((err as Error).message, /category/);
+        return true;
+      });
+    },
+  );
+});
+
+test("throws SafetyRulesError when a rule has an explicit empty-string category", () => {
+  withRulesFile(
+    JSON.stringify({ rules: [{ category: "", term: "x" }] }),
+    filePath => {
+      assert.throws(() => loadSafetyRules(filePath), (err: unknown) => {
+        assert.ok(err instanceof SafetyRulesError);
+        assert.match((err as Error).message, /category/);
+        return true;
+      });
+    },
+  );
+});
+
+test("throws SafetyRulesError when a rule entry is not an object", () => {
+  withRulesFile(
+    JSON.stringify({ rules: ["not an object"] }),
+    filePath => {
+      assert.throws(() => loadSafetyRules(filePath), (err: unknown) => {
+        assert.ok(err instanceof SafetyRulesError);
+        assert.match((err as Error).message, /must be an object/);
+        return true;
+      });
+    },
+  );
+});
+
+test("throws SafetyRulesError when a term rule has an empty \"term\"", () => {
+  withRulesFile(
+    JSON.stringify({ rules: [{ category: "c", term: "" }] }),
+    filePath => {
+      assert.throws(() => loadSafetyRules(filePath), (err: unknown) => {
+        assert.ok(err instanceof SafetyRulesError);
+        assert.match((err as Error).message, /empty/);
+        assert.match((err as Error).message, /term/);
         return true;
       });
     },

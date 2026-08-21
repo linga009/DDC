@@ -40,7 +40,7 @@ export function loadSafetyRules(filePath: string | URL): KeywordRule[] {
   const rules: KeywordRule[] = [];
 
   rawRules.forEach((entry, index) => {
-    if (typeof entry !== "object" || entry === null) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
       throw new SafetyRulesError(`safety rule at index ${index} must be an object`);
     }
     const candidate = entry as Record<string, unknown>;
@@ -72,6 +72,16 @@ export function loadSafetyRules(filePath: string | URL): KeywordRule[] {
           `safety rule at index ${index} (category "${candidate.category}") has an empty "term"`,
         );
       }
+      // \b requires a word/non-word transition on both sides of the match,
+      // not just "start/end of the term". A term that starts or ends with
+      // punctuation (e.g. "!" or ")") can silently fail to match if that
+      // punctuation is itself adjacent to another non-word character (like
+      // a space) in the text being classified -- non-word followed by
+      // non-word is not a boundary. This is a real limitation of the
+      // word-boundary approach, not a bug in the escaping above: rule
+      // authors should avoid leading/trailing punctuation in "term"
+      // entries; use the "pattern" escape hatch (raw regex source, no
+      // \b-wrapping) for a rule that genuinely needs one.
       rules.push({
         category: candidate.category,
         pattern: new RegExp(`\\b${escapeRegExp(term)}\\b`, "i"),
