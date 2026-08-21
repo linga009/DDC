@@ -4,8 +4,15 @@
 
 This is Phase 3 of the Security & Trust Hardening initiative (see
 `CLAUDE.md`'s Plan Roadmap). Phase 1 (shared-secret authentication,
-`SWARM_AUTH_TOKEN`) and Phase 2 (real safety-classifier ruleset) are done
-and merged. Phase 3 fixes `ReputationTracker`/`NodeRegistry`'s lack of
+`SWARM_AUTH_TOKEN`) is done and merged. **Correction (caught by Phase 3's
+whole-branch review):** Phase 2 (real safety-classifier ruleset) is *not*
+done and merged as this paragraph originally claimed — as of this
+correction, `master` carries only Phase 2's design and plan docs;
+`main.ts` still constructs `new KeywordSafetyClassifier([])` (the zero-rule
+default), and its own implementation work lives on an unmerged branch.
+Phase 3's own implementation does not depend on Phase 2 being merged
+either way — this was a background-context error, not a scoping one.
+Phase 3 fixes `ReputationTracker`/`NodeRegistry`'s lack of
 defense against churning registrations. Phase 4 (reputation-ranked node
 selection for `POST /generate`) remains unstarted and undesigned, and
 depends on this phase existing first — ranking by reputation is only
