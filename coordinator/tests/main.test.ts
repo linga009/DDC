@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readFileSync, writeFileSync } from "node:fs";
+import { loadSafetyRules } from "../src/safety_rules_loader.ts";
 
 const mainPath = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 
@@ -43,7 +44,7 @@ test("main.ts binds to 127.0.0.1 by default and discloses that authentication is
   const child = spawn(process.execPath, [mainPath], { env });
   try {
     const logLine = await waitForStartupLog(child);
-    assert.match(logLine, /^coordinator listening on 127\.0\.0\.1:0 \(authentication required -- see SWARM_AUTH_TOKEN\)$/);
+    assert.match(logLine, /^coordinator listening on 127\.0\.0\.1:0 \(authentication required -- see SWARM_AUTH_TOKEN; safety classifier armed with \d+ rules across \d+ categories\)$/);
   } finally {
     child.kill();
   }
@@ -55,7 +56,7 @@ test("main.ts binds to the host given via the HOST env var", async () => {
   const child = spawn(process.execPath, [mainPath], { env });
   try {
     const logLine = await waitForStartupLog(child);
-    assert.match(logLine, /^coordinator listening on 0\.0\.0\.0:0 \(authentication required -- see SWARM_AUTH_TOKEN\)$/);
+    assert.match(logLine, /^coordinator listening on 0\.0\.0\.0:0 \(authentication required -- see SWARM_AUTH_TOKEN; safety classifier armed with \d+ rules across \d+ categories\)$/);
   } finally {
     child.kill();
   }
@@ -72,7 +73,31 @@ test("main.ts falls back to 127.0.0.1 when HOST is set but empty, not all interf
   const child = spawn(process.execPath, [mainPath], { env });
   try {
     const logLine = await waitForStartupLog(child);
-    assert.match(logLine, /^coordinator listening on 127\.0\.0\.1:0 \(authentication required -- see SWARM_AUTH_TOKEN\)$/);
+    assert.match(logLine, /^coordinator listening on 127\.0\.0\.1:0 \(authentication required -- see SWARM_AUTH_TOKEN; safety classifier armed with \d+ rules across \d+ categories\)$/);
+  } finally {
+    child.kill();
+  }
+});
+
+test("main.ts's startup log reports the real ruleset's actual rule and category counts", async () => {
+  // Without a positive signal, an operator's only evidence the safety gate
+  // is armed is the absence of a crash -- which used to be byte-identical
+  // to starting with a fully disarmed (empty) ruleset.
+  const env = { ...process.env, PORT: "0", SWARM_AUTH_TOKEN: "test-secret-token-1234" };
+
+  const child = spawn(process.execPath, [mainPath], { env });
+  try {
+    const logLine = await waitForStartupLog(child);
+    const match = logLine.match(/safety classifier armed with (\d+) rules across (\d+) categories/);
+    assert.ok(match, `startup log did not report the loaded rule count: ${logLine}`);
+
+    // Compare against the real file rather than hardcoding 70/10, so this
+    // stays true as rules are added -- but still fails loudly if the log
+    // ever reports a count that isn't what actually got loaded.
+    const rules = loadSafetyRules(new URL("../safety_rules.json", import.meta.url));
+    assert.equal(Number(match[1]), rules.length);
+    assert.equal(Number(match[2]), new Set(rules.map(r => r.category)).size);
+    assert.ok(rules.length > 0);
   } finally {
     child.kill();
   }
@@ -130,31 +155,90 @@ for (const [label, token] of [
   });
 }
 
-test("main.ts refuses to start when the safety rules file is malformed", async () => {
+// These tests intentionally do NOT override the real rules file path --
+// main.ts resolves coordinator/safety_rules.json relative to its own module
+// location, not an env var (see Task 1's Global Constraints note). So they
+// temporarily corrupt the REAL file and restore it. A plain try/finally
+// covers normal completion and thrown assertions, but not a hard kill of the
+// test runner itself (Ctrl-C, a crash, `node --test` being torn down)
+// mid-window -- which would leave a developer's tree carrying a corrupted or
+// disarmed safety ruleset, and could flake any concurrently-running test file
+// that spawns main.ts. This helper adds process-level restore hooks as a
+// safety net on top of the finally.
+async function withCorruptedRulesFile(
+  replacement: string,
+  run: () => Promise<void>,
+): Promise<void> {
+  const rulesPath = fileURLToPath(new URL("../safety_rules.json", import.meta.url));
+  const original = readFileSync(rulesPath, "utf-8");
+  let corrupted = false;
+
+  const restore = () => {
+    if (!corrupted) return;
+    corrupted = false;
+    // Best-effort: an exit hook must not throw, or it masks the real failure.
+    try {
+      writeFileSync(rulesPath, original, "utf-8");
+    } catch {
+      // ignored deliberately
+    }
+  };
+  const onSignal = () => {
+    restore();
+    process.exit(1);
+  };
+  // "exit" covers process.exit()/normal teardown; the signal handlers cover
+  // an operator's Ctrl-C, which otherwise terminates without running "exit".
+  process.on("exit", restore);
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+
+  writeFileSync(rulesPath, replacement, "utf-8");
+  corrupted = true;
+  try {
+    await run();
+  } finally {
+    restore();
+    process.off("exit", restore);
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+  }
+}
+
+async function startupFailure(): Promise<{ exitCode: number | null; stderr: string }> {
   const env = {
     ...process.env,
     PORT: "0",
     SWARM_AUTH_TOKEN: "test-secret-token-1234",
   };
-  // This test intentionally does NOT override the real rules file path --
-  // main.ts resolves coordinator/safety_rules.json relative to its own
-  // module location, not an env var (see Task 1's Global Constraints note).
-  // Instead this test temporarily corrupts the real file, restoring it
-  // in a finally block no matter what.
-  const rulesPath = fileURLToPath(new URL("../safety_rules.json", import.meta.url));
-  const original = readFileSync(rulesPath, "utf-8");
-  writeFileSync(rulesPath, "{ this is not valid json", "utf-8");
+  const child = spawn(process.execPath, [mainPath], { env });
+  let stderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+  const exitCode = await new Promise<number | null>(resolve => {
+    child.on("exit", code => resolve(code));
+  });
+  return { exitCode, stderr };
+}
 
-  try {
-    const child = spawn(process.execPath, [mainPath], { env });
-    let stderr = "";
-    child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-    const exitCode = await new Promise<number | null>(resolve => {
-      child.on("exit", code => resolve(code));
-    });
+test("main.ts refuses to start when the safety rules file is malformed", async () => {
+  await withCorruptedRulesFile("{ this is not valid json", async () => {
+    const { exitCode, stderr } = await startupFailure();
     assert.notEqual(exitCode, 0);
     assert.match(stderr, /not valid JSON/);
-  } finally {
-    writeFileSync(rulesPath, original, "utf-8");
-  }
+    // Clean single-line diagnostic, matching SWARM_AUTH_TOKEN's posture --
+    // not a raw multi-line stack trace from an uncaught exception.
+    assert.doesNotMatch(stderr, /SafetyRulesError|at .*safety_rules_loader/);
+  });
+});
+
+test("main.ts refuses to start when the safety rules file has an empty rules array", async () => {
+  // The disarmed-gate case: this used to start cleanly, log a line
+  // indistinguishable from a healthy 70-rule start, and then answer
+  // safe:true for every prompt including "how to build a bomb".
+  await withCorruptedRulesFile(JSON.stringify({ rules: [] }), async () => {
+    const { exitCode, stderr } = await startupFailure();
+    assert.notEqual(exitCode, 0);
+    assert.match(stderr, /empty "rules" array/);
+    assert.doesNotMatch(stderr, /SafetyRulesError|at .*safety_rules_loader/);
+  });
 });
