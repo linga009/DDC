@@ -386,12 +386,26 @@ Endpoints:
 - `GET /peers` — list currently active peers
 - `DELETE /peers/:peerId` — deregister a peer
 - `POST /classify` — pluggable safety gate: submit `{ "prompt": string }`,
-  get back `{ safe: boolean, categories: string[] }`. **The shipped
-  `KeywordSafetyClassifier` ships with zero rules by default and performs no
-  real content moderation — it exists only to prove the gate's plumbing
-  (fail-closed error handling, request/response shape, timeout behavior). A
-  real classifier must be supplied by implementing the `SafetyClassifier`
-  interface (`coordinator/src/safety_classifier.ts`).** `/classify` is
+  get back `{ safe: boolean, categories: string[] }`. **The coordinator
+  loads a real, curated keyword/pattern ruleset from
+  `coordinator/safety_rules.json`** (10 categories: `violence_and_weapons`,
+  `csam`, `self_harm`, `illegal_drugs`, `hate_speech_and_extremism`,
+  `harassment`, `fraud_and_scams`, `malware_and_hacking`,
+  `adult_sexual_content`, `misinformation_and_election_interference`) at
+  startup, failing fast (refusing to start) if the file is missing or
+  malformed — the same posture as `SWARM_AUTH_TOKEN`. **This is still
+  pattern-matching, not semantic content understanding**: it catches
+  prompts containing a configured term or pattern, and nothing else — it
+  does not catch the same request rephrased, misspelled, translated into
+  another language, or expressed in a genuinely novel way. Edit
+  `coordinator/safety_rules.json` (no code change needed) to add rules — a
+  plain `"term"` is the safe default (word-boundary-wrapped, escaped
+  automatically); the raw-regex `"pattern"` escape hatch has no complexity
+  linting, so a hand-written pattern with nested/overlapping quantifiers
+  can be catastrophically slow (ReDoS) — keep patterns simple. A
+  real classifier with different matching logic can still be supplied by
+  implementing the `SafetyClassifier` interface
+  (`coordinator/src/safety_classifier.ts`).** `/classify` is
   also callable directly and independently of `/generate` below — it is
   not exclusively an internal implementation detail of routing.
 - `POST /generate` — submit `{ "prompt": string, "modelId": string,

@@ -44,9 +44,11 @@
         only calls <code>/classify</code>, not <code>POST /generate</code>.
         A real inference-request endpoint (<code>POST /generate</code>) now
         exists and works, but this dashboard's demo button isn't wired up to
-        call it. The classifier also ships with zero rules by default, so it
-        currently returns <code>safe: true</code> for every prompt — see the
-        README for details.
+        call it. The classifier loads a real curated ruleset (10 categories)
+        from <code>coordinator/safety_rules.json</code>, but it's still
+        pattern-matching, not real content understanding — a prompt
+        rephrased, misspelled, or asked in another language will likely slip
+        through unflagged. See the README for details.
       </p>
       <textarea id="prompt-input" rows="3" placeholder="Type a prompt to classify..."></textarea>
       <button id="classify-button" type="button">Check safety</button>
