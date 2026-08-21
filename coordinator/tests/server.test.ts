@@ -843,6 +843,56 @@ test("POST /classify returns safe:false and categories for a prompt matching a c
   }
 });
 
+test("POST /classify reports a category once even when several rules in that category match", async () => {
+  // The classifier emits one entry per matching RULE. With a real 70-rule
+  // ruleset, a single prompt trivially trips two rules in the same category,
+  // which used to surface as {"categories":["violence_and_weapons",
+  // "violence_and_weapons"]} in the response body and in the dashboard UI.
+  const classifier = new KeywordSafetyClassifier([
+    { pattern: /FIRST_RULE/, category: "same_category" },
+    { pattern: /SECOND_RULE/, category: "same_category" },
+    { pattern: /OTHER_RULE/, category: "other_category" },
+  ]);
+  const { server, baseUrl } = await startTestServer(undefined, undefined, classifier);
+  try {
+    const res = await authFetch(`${baseUrl}/classify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "trips FIRST_RULE and SECOND_RULE and OTHER_RULE" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.safe, false);
+    // De-duplicated, and first-seen order preserved -- not sorted, not
+    // collapsed to a single category.
+    assert.deepEqual(body.categories, ["same_category", "other_category"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /classify still reports every DISTINCT category a prompt matches", async () => {
+  // Guards against "de-duplicate" being implemented as "report only the
+  // first match".
+  const classifier = new KeywordSafetyClassifier([
+    { pattern: /ALPHA/, category: "cat_a" },
+    { pattern: /BETA/, category: "cat_b" },
+    { pattern: /GAMMA/, category: "cat_c" },
+  ]);
+  const { server, baseUrl } = await startTestServer(undefined, undefined, classifier);
+  try {
+    const res = await authFetch(`${baseUrl}/classify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "ALPHA BETA GAMMA" }),
+    });
+    const body = await res.json();
+    assert.deepEqual(body.categories, ["cat_a", "cat_b", "cat_c"]);
+  } finally {
+    server.close();
+  }
+});
+
 test("POST /classify rejects a request with a missing or non-string prompt", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
@@ -1586,6 +1636,37 @@ test("POST /generate returns 502 when the selected node is unreachable", async (
     assert.equal(res.status, 502);
   } finally {
     server.close();
+  }
+});
+
+test("POST /generate's blocked-prompt body reports a category once even when several rules in it match", async () => {
+  // /generate builds its own 400 body from a classification result, so the
+  // de-duplication has to hold at both response-construction sites, not just
+  // /classify's.
+  const classifier = new KeywordSafetyClassifier([
+    { pattern: /FIRST_RULE/, category: "same_category" },
+    { pattern: /SECOND_RULE/, category: "same_category" },
+  ]);
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "must not be reached" } }));
+  const { server, baseUrl } = await startTestServer(undefined, undefined, classifier);
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "FIRST_RULE and SECOND_RULE", modelId: "tinyllama-1.1b" }),
+    });
+
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { safe: false, categories: ["same_category"] });
+  } finally {
+    server.close();
+    stub.server.close();
   }
 });
 

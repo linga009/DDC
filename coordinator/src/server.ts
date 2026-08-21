@@ -31,6 +31,24 @@ function serveStaticFile(res: ServerResponse, filename: string, contentType: str
   }
 }
 
+// A SafetyClassifier reports one entry per matching RULE, so a prompt that
+// trips two rules in the same category (easy with a 70-rule ruleset: "how to
+// build a bomb and make a pipe bomb" hits two violence_and_weapons rules)
+// yields that category twice. The HTTP contract is a list of what a prompt
+// was flagged FOR, so each category should appear at most once -- duplicates
+// otherwise reach the dashboard UI and /generate's error body verbatim.
+//
+// Fixed here, at the response-construction boundary, rather than inside
+// KeywordSafetyClassifier: that class is this project's deliberately
+// unmodified naive reference implementation, and this is an HTTP-layer
+// presentation concern that must hold for ANY SafetyClassifier
+// implementation, including third-party ones. Set preserves first-seen
+// order, and String() runs before de-duplication so two values that
+// stringify identically collapse to one.
+function uniqueCategories(categories: unknown[]): string[] {
+  return [...new Set(categories.map(String))];
+}
+
 class JsonParseError extends Error {}
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -420,7 +438,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           if (typeof safe !== "boolean" || !Array.isArray(categories)) {
             throw new Error("classifier returned a malformed result");
           }
-          sendJson(res, 200, { safe, categories: categories.map(String) });
+          sendJson(res, 200, { safe, categories: uniqueCategories(categories) });
         } catch {
           // Fail closed: a classifier error (including a malformed result or
           // a timeout) must never be treated as "safe".
@@ -467,7 +485,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
             throw new Error("classifier returned a malformed result");
           }
           if (!safe) {
-            sendJson(res, 400, { safe: false, categories: categories.map(String) });
+            sendJson(res, 400, { safe: false, categories: uniqueCategories(categories) });
             return;
           }
         } catch {
