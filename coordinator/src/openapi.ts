@@ -245,7 +245,15 @@ export const openApiDocument = {
     },
     "/classify": {
       post: {
-        summary: "Safety-classify a prompt (does not run inference; shipped classifier has zero rules by default)",
+        summary:
+          "Safety-classify a prompt (does not run inference). The coordinator loads a real curated " +
+          "keyword/pattern ruleset from coordinator/safety_rules.json at startup, covering 10 categories: " +
+          "violence_and_weapons, csam, self_harm, illegal_drugs, hate_speech_and_extremism, harassment, " +
+          "fraud_and_scams, malware_and_hacking, adult_sexual_content, " +
+          "misinformation_and_election_interference. This is pattern-matching, NOT semantic content " +
+          "understanding -- it catches prompts containing a configured term or pattern and nothing else, " +
+          "so the same request rephrased, misspelled, or translated will not be caught. Each category is " +
+          "reported at most once, however many rules in it matched.",
         requestBody: {
           content: { "application/json": { schema: { type: "object", required: ["prompt"], properties: { prompt: { type: "string" } } } } },
         },

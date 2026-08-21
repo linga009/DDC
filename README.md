@@ -755,7 +755,12 @@ same-origin only, and now requires an operator to paste a valid
 tab's `sessionStorage`, sent as `Authorization: Bearer <token>` on every
 `/capacity`, `/catalog`, and `/classify` call) — matching the coordinator's
 Authentication requirement described above; this means anyone who has the
-token, not literally anyone, can use the dashboard. As with the `/classify` endpoint
-itself (see above), the shipped classifier has zero rules by default, so
-the demo currently reports every prompt as `safe: true`; the dashboard's
-own notice discloses this.
+token, not literally anyone, can use the dashboard. The demo is backed by
+the same real curated ruleset as the `/classify` endpoint itself (see
+above): 10 categories loaded from `coordinator/safety_rules.json`, so a
+prompt containing a configured term comes back `safe: false` with the
+categories it matched. It is still pattern-matching, not semantic content
+understanding — the same request rephrased, misspelled, or written in
+another language will come back `safe: true` — and the dashboard's own
+notice discloses that limitation in the UI rather than overselling the
+verdict.

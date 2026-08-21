@@ -15,8 +15,14 @@ export interface KeywordRule {
 // A deliberately naive, non-production reference classifier. It exists to
 // prove the SafetyClassifier gate's plumbing (block/allow decisions,
 // category reporting, fail-closed error handling in the HTTP layer) works
-// correctly -- it is NOT a real content-moderation implementation, and
-// ships with zero rules by default. Wiring in a real classifier (e.g. a
+// correctly -- it is NOT a real content-moderation implementation.
+//
+// It is no longer rule-less in practice: main.ts loads a real curated
+// ruleset from coordinator/safety_rules.json at startup and passes it in
+// here. What stays naive is the MECHANISM, not the rule count -- this
+// matches literal terms and hand-written regexes, so it cannot recognize a
+// rephrased, misspelled, or translated version of a prompt it does block.
+// Wiring in a classifier that actually understands content (e.g. a
 // model-backed one calling the C++ InferenceEngine) means implementing
 // SafetyClassifier, not extending this class.
 export class KeywordSafetyClassifier implements SafetyClassifier {
