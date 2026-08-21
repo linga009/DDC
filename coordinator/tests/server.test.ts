@@ -1392,6 +1392,11 @@ test("index.html contains the expected element IDs app.js depends on, and the no
     assert.match(body, /id="classify-button"/);
     assert.match(body, /id="classify-result"/);
     assert.match(body, /does not run inference/i);
+    assert.match(body, /id="chat-model-select"/);
+    assert.match(body, /id="chat-history"/);
+    assert.match(body, /id="chat-input"/);
+    assert.match(body, /id="chat-send-button"/);
+    assert.match(body, /id="chat-new-button"/);
   } finally {
     server.close();
   }

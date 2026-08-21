@@ -36,19 +36,44 @@
       </table>
     </section>
 
+    <section id="chat">
+      <h2>Chat</h2>
+      <p class="notice">
+        Calls the coordinator's real <code>POST /generate</code> endpoint —
+        this is genuine inference, not the classify demo below. It has no
+        session memory of its own: each reply is one independent completion,
+        so this page resends the last few messages as part of each new
+        prompt to approximate a "conversation." Only the most recent
+        <strong>6 messages</strong> are resent — a long conversation will
+        start to "forget" its earliest turns. Every message is safety-checked
+        the same way <code>/classify</code> checks a prompt below. No
+        streaming: a reply arrives all at once, which can take up to two
+        minutes.
+      </p>
+      <label for="chat-model-select">Model</label>
+      <select id="chat-model-select"></select>
+      <div id="chat-history" role="log" aria-live="polite"></div>
+      <textarea id="chat-input" rows="2" placeholder="Type a message..."></textarea>
+      <div class="chat-controls">
+        <button id="chat-send-button" type="button">Send</button>
+        <button id="chat-new-button" type="button">New chat</button>
+      </div>
+    </section>
+
     <section id="classify-demo">
       <h2>Safety classifier demo</h2>
       <p class="notice">
         This checks a prompt against the coordinator's <code>/classify</code>
         safety gate. <strong>This demo does not run inference</strong> — it
         only calls <code>/classify</code>, not <code>POST /generate</code>.
-        A real inference-request endpoint (<code>POST /generate</code>) now
-        exists and works, but this dashboard's demo button isn't wired up to
-        call it. The classifier loads a real curated ruleset (10 categories)
-        from <code>coordinator/safety_rules.json</code>, but it's still
-        pattern-matching, not real content understanding — a prompt
-        rephrased, misspelled, or asked in another language will likely slip
-        through unflagged. See the README for details.
+        The chat panel above calls the real inference endpoint
+        (<code>POST /generate</code>); this demo intentionally stays
+        classify-only so you can safety-check a prompt without spending an
+        inference request. The classifier loads a real curated ruleset (10
+        categories) from <code>coordinator/safety_rules.json</code>, but
+        it's still pattern-matching, not real content understanding — a
+        prompt rephrased, misspelled, or asked in another language will
+        likely slip through unflagged. See the README for details.
       </p>
       <textarea id="prompt-input" rows="3" placeholder="Type a prompt to classify..."></textarea>
       <button id="classify-button" type="button">Check safety</button>

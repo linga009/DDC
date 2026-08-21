@@ -40,6 +40,9 @@ async function refreshStatus() {
 
     activeCountEl.textContent = String(capacity.activeNodes);
 
+    chatCatalog = catalog;
+    populateModelSelect();
+
     tbody.innerHTML = "";
     for (const entry of catalog) {
       const row = document.createElement("tr");
@@ -60,6 +63,137 @@ async function refreshStatus() {
     activeCountEl.textContent = "unavailable";
     console.error("failed to refresh swarm status", err);
   }
+}
+
+let chatCatalog = [];          // last catalog fetched by refreshStatus()
+let chatHistory = [];          // { role: "user" | "assistant", text: string, status?: "blocked" | "error" }
+let chatModelLocked = false;
+const CHAT_HISTORY_WINDOW = 6; // prior messages resent per turn (3 user/assistant pairs)
+const CHAT_N_PREDICT = 256;    // server default (64) is too short for a chat reply; stays under the 512 cap
+
+function populateModelSelect() {
+  if (chatModelLocked) return; // don't disturb an in-progress conversation's selection
+  const select = document.getElementById("chat-model-select");
+  const previous = select.value;
+  select.innerHTML = "";
+  for (const entry of chatCatalog) {
+    const option = document.createElement("option");
+    option.value = entry.id;
+    option.textContent = entry.available ? entry.displayName : `${entry.displayName} (unavailable)`;
+    select.appendChild(option);
+  }
+  if (chatCatalog.some(e => e.id === previous)) {
+    select.value = previous;
+  }
+}
+
+function buildChatPrompt(newMessage) {
+  const priorTurns = chatHistory
+    .filter(m => m.status === undefined) // exclude blocked/error entries from the resent transcript
+    .slice(-CHAT_HISTORY_WINDOW);
+  const transcript = priorTurns
+    .map(m => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`)
+    .join("\n");
+  return (transcript ? transcript + "\n" : "") + `User: ${newMessage}\nAssistant:`;
+}
+
+function renderChatHistory() {
+  const historyEl = document.getElementById("chat-history");
+  historyEl.innerHTML = "";
+  for (const message of chatHistory) {
+    const row = document.createElement("div");
+    row.className = message.status
+      ? `chat-message chat-${message.role} chat-${message.status}`
+      : `chat-message chat-${message.role}`;
+    row.textContent = message.text;
+    historyEl.appendChild(row);
+  }
+  historyEl.scrollTop = historyEl.scrollHeight;
+}
+
+function setChatBusy(busy) {
+  document.getElementById("chat-input").disabled = busy;
+  document.getElementById("chat-send-button").disabled = busy;
+  document.getElementById("chat-new-button").disabled = busy;
+  if (busy) {
+    chatModelLocked = true;
+  }
+  document.getElementById("chat-model-select").disabled = busy || chatModelLocked;
+
+  const historyEl = document.getElementById("chat-history");
+  const existingPlaceholder = document.getElementById("chat-thinking");
+  if (busy) {
+    if (!existingPlaceholder) {
+      const placeholder = document.createElement("div");
+      placeholder.id = "chat-thinking";
+      placeholder.className = "chat-message chat-assistant chat-thinking";
+      placeholder.textContent = "Thinking...";
+      historyEl.appendChild(placeholder);
+      historyEl.scrollTop = historyEl.scrollHeight;
+    }
+  } else if (existingPlaceholder) {
+    existingPlaceholder.remove();
+  }
+}
+
+async function sendChatMessage() {
+  const input = document.getElementById("chat-input");
+  const text = input.value.trim();
+  if (!text) return;
+
+  const prompt = buildChatPrompt(text);
+  chatHistory.push({ role: "user", text });
+  renderChatHistory();
+  input.value = "";
+  setChatBusy(true);
+
+  const modelId = document.getElementById("chat-model-select").value;
+  try {
+    const res = await authedFetch("/generate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt, modelId, n_predict: CHAT_N_PREDICT }),
+    });
+    const body = await res.json();
+    if (res.status === 200) {
+      chatHistory.push({ role: "assistant", text: body.text.trim() });
+    } else if (res.status === 400 && body.safe === false) {
+      chatHistory.push({
+        role: "assistant",
+        text: `Blocked by safety filter (${body.categories.length > 0 ? body.categories.join(", ") : "unspecified"}).`,
+        status: "blocked",
+      });
+    } else if (res.status === 401) {
+      chatHistory.push({
+        role: "assistant",
+        text: "Invalid or missing token — paste a valid SWARM_AUTH_TOKEN above.",
+        status: "error",
+      });
+    } else {
+      chatHistory.push({ role: "assistant", text: body.error ?? `Request failed (${res.status}).`, status: "error" });
+    }
+  } catch (err) {
+    chatHistory.push({ role: "assistant", text: "Network error reaching the coordinator.", status: "error" });
+    console.error("chat generate request failed", err);
+  }
+  setChatBusy(false);
+  renderChatHistory();
+}
+
+function resetChat() {
+  chatHistory = [];
+  chatModelLocked = false;
+  renderChatHistory();
+  populateModelSelect();
+  // chatModelLocked being false above is necessary but not sufficient: the
+  // <select> element's own `disabled` DOM property was set to `true` by the
+  // last setChatBusy(true)/setChatBusy(false) pair during the just-finished
+  // conversation and nothing else clears it. Route through setChatBusy(false)
+  // so the same single place that disables the dropdown is also the place
+  // that re-enables it -- confirmed live: without this call, "New chat"
+  // cleared the JS lock flag but left the dropdown visibly and functionally
+  // disabled in the browser.
+  setChatBusy(false);
 }
 
 async function classifyPrompt() {
@@ -89,6 +223,8 @@ async function classifyPrompt() {
 }
 
 document.getElementById("classify-button").addEventListener("click", classifyPrompt);
+document.getElementById("chat-send-button").addEventListener("click", sendChatMessage);
+document.getElementById("chat-new-button").addEventListener("click", resetChat);
 
 document.getElementById("save-token-button").addEventListener("click", () => {
   const input = document.getElementById("token-input");
