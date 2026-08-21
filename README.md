@@ -755,25 +755,45 @@ list above). It shows:
   `GET /capacity`) and the model catalog with each entry's minimum
   active-node threshold and current availability (from `GET /catalog`),
   polled every 5 seconds.
-- **A `/classify` demo** — a text box and button that submit a prompt to
-  `POST /classify` and display the resulting `safe`/`categories` verdict.
+- **A chat panel that runs real inference.** Pick a model, type a message,
+  and it calls the real `POST /generate` endpoint (see the Coordinator
+  service section above) and shows the generated reply — this is genuine
+  inference, produced by a real `swarm-node-agent`, not a demo. The backend
+  has no chat-template or session-memory support of its own (`POST
+  /generate` is a single stateless completion call every time), so the
+  page fakes multi-turn "memory" itself: each new message resends the last
+  6 messages of the conversation as a plain `User: …\nAssistant: …`
+  transcript ahead of the new one. This means a long conversation
+  gradually "forgets" its earliest turns once they age out of that window
+  — silently, with no warning in the UI — and reply quality depends
+  entirely on how well the selected model continues a plain-text
+  transcript, since no model-specific chat formatting exists anywhere in
+  this codebase. The model picker locks for the duration of a conversation
+  (switching models mid-conversation with concatenated history sent to a
+  different model doesn't make sense) and unlocks on "New chat," which
+  also clears history. Every message is safety-checked exactly like
+  `/classify` before it's ever sent to a node — a blocked message renders
+  as a distinct notice and never reaches `/generate`'s node-selection step
+  at all. No streaming (Phase D isn't built — a reply arrives whole, which
+  can take up to two minutes) and no persistence across a page reload
+  (conversation state lives only in the page's memory).
+- **A `/classify` demo**, separate from the chat panel — a text box and
+  button that submit a prompt to `POST /classify` directly and display the
+  resulting `safe`/`categories` verdict without spending an inference
+  request. Useful for checking whether a specific prompt would be blocked
+  without actually running it.
 
-**The dashboard's own demo button does not run real inference.** It only
-calls `POST /classify`, not `POST /generate` — a real inference-request
-endpoint exists and works (see the Coordinator service section above), but
-this dashboard was never wired up to call it, and the client visibly
-discloses this gap in its own UI rather than faking it. The client is
-same-origin only, and now requires an operator to paste a valid
+The client is same-origin only, and requires an operator to paste a valid
 `SWARM_AUTH_TOKEN` into the dashboard's token field (kept in the browser
 tab's `sessionStorage`, sent as `Authorization: Bearer <token>` on every
-`/capacity`, `/catalog`, and `/classify` call) — matching the coordinator's
-Authentication requirement described above; this means anyone who has the
-token, not literally anyone, can use the dashboard. The demo is backed by
-the same real curated ruleset as the `/classify` endpoint itself (see
-above): 10 categories loaded from `coordinator/safety_rules.json`, so a
-prompt containing a configured term comes back `safe: false` with the
-categories it matched. It is still pattern-matching, not semantic content
-understanding — the same request rephrased, misspelled, or written in
-another language will come back `safe: true` — and the dashboard's own
-notice discloses that limitation in the UI rather than overselling the
-verdict.
+`/capacity`, `/catalog`, `/classify`, and `/generate` call) — matching the
+coordinator's Authentication requirement described above; this means
+anyone who has the token, not literally anyone, can use the dashboard. Both
+the chat panel and the classify demo are backed by the same real curated
+ruleset (see above): 10 categories loaded from
+`coordinator/safety_rules.json`, so a prompt containing a configured term
+comes back blocked with the categories it matched. It is still
+pattern-matching, not semantic content understanding — the same request
+rephrased, misspelled, or written in another language will slip through
+unflagged — and the dashboard's own notice discloses that limitation in
+the UI rather than overselling the verdict.
