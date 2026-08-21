@@ -2,8 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer as createHttpServer } from "node:http";
 import net from "node:net";
-import { createServer } from "../src/server.ts";
-import { NodeRegistry } from "../src/registry.ts";
+import { createServer, selectNode } from "../src/server.ts";
+import { NodeRegistry, type NodeInfo } from "../src/registry.ts";
 import { ModelCatalog, type CatalogEntry } from "../src/catalog.ts";
 import { PeerRegistry } from "../src/peer_registry.ts";
 import { KeywordSafetyClassifier, type SafetyClassifier } from "../src/safety_classifier.ts";
@@ -23,10 +23,11 @@ async function startTestServer(
   classifier: SafetyClassifier = new KeywordSafetyClassifier([]),
   reputation: ReputationTracker = new ReputationTracker(),
   authToken: string = TEST_AUTH_TOKEN,
+  random: () => number = Math.random,
 ) {
   const registry = new NodeRegistry();
   const catalog = new ModelCatalog(catalogEntries);
-  const server = createServer(registry, catalog, peers, classifier, reputation, authToken);
+  const server = createServer(registry, catalog, peers, classifier, reputation, authToken, random);
 
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -48,6 +49,82 @@ function authFetch(url: string, options: RequestInit = {}, token: string = TEST_
     headers: { ...(options.headers ?? {}), authorization: `Bearer ${token}` },
   });
 }
+
+test("selectNode returns undefined when no candidate matches the requested model", () => {
+  const reputation = new ReputationTracker();
+  const nodes: NodeInfo[] = [
+    { nodeId: "a", endpoint: "http://x", deviceTier: "desktop", servesModel: "other-model" },
+  ];
+  const result = selectNode(nodes, reputation, "tinyllama-1.1b", () => {
+    throw new Error("random should not be called");
+  });
+  assert.equal(result, undefined);
+});
+
+test("selectNode returns the single matching candidate without calling random", () => {
+  const reputation = new ReputationTracker();
+  const nodes: NodeInfo[] = [
+    { nodeId: "a", endpoint: "http://x", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
+  ];
+  const result = selectNode(nodes, reputation, "tinyllama-1.1b", () => {
+    throw new Error("random should not be called");
+  });
+  assert.equal(result?.nodeId, "a");
+});
+
+test("selectNode picks the higher-scoring candidate without calling random", () => {
+  const reputation = new ReputationTracker();
+  reputation.recordAgreement("good");
+  reputation.recordAgreement("good");
+  reputation.recordAgreement("good");
+  reputation.recordDisagreement("bad");
+  reputation.recordDisagreement("bad");
+  reputation.recordDisagreement("bad");
+  const nodes: NodeInfo[] = [
+    { nodeId: "bad", endpoint: "http://x", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
+    { nodeId: "good", endpoint: "http://y", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
+  ];
+  const result = selectNode(nodes, reputation, "tinyllama-1.1b", () => {
+    throw new Error("random should not be called");
+  });
+  assert.equal(result?.nodeId, "good");
+});
+
+test("selectNode breaks a tie using the injected random function, low end of the range", () => {
+  const reputation = new ReputationTracker();
+  const nodes: NodeInfo[] = [
+    { nodeId: "a", endpoint: "http://x", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
+    { nodeId: "b", endpoint: "http://y", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
+    { nodeId: "c", endpoint: "http://z", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
+  ];
+  const result = selectNode(nodes, reputation, "tinyllama-1.1b", () => 0);
+  assert.equal(result?.nodeId, "a");
+});
+
+test("selectNode breaks a tie using the injected random function, high end of the range", () => {
+  const reputation = new ReputationTracker();
+  const nodes: NodeInfo[] = [
+    { nodeId: "a", endpoint: "http://x", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
+    { nodeId: "b", endpoint: "http://y", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
+    { nodeId: "c", endpoint: "http://z", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
+  ];
+  const result = selectNode(nodes, reputation, "tinyllama-1.1b", () => 0.999);
+  assert.equal(result?.nodeId, "c");
+});
+
+test("selectNode ignores candidates that don't match the requested model even when they score higher", () => {
+  const reputation = new ReputationTracker();
+  reputation.recordAgreement("wrong-model-node");
+  reputation.recordAgreement("wrong-model-node");
+  const nodes: NodeInfo[] = [
+    { nodeId: "wrong-model-node", endpoint: "http://x", deviceTier: "desktop", servesModel: "small-7b" },
+    { nodeId: "right-model-node", endpoint: "http://y", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
+  ];
+  const result = selectNode(nodes, reputation, "tinyllama-1.1b", () => {
+    throw new Error("random should not be called");
+  });
+  assert.equal(result?.nodeId, "right-model-node");
+});
 
 test("a mutating route rejects a request with no Authorization header with 401", async () => {
   const { server, baseUrl } = await startTestServer();
@@ -1536,5 +1613,72 @@ test("POST /generate excludes a reputation-ejected node from routing", async () 
   } finally {
     server.close();
     stub.server.close();
+  }
+});
+
+test("POST /generate routes to the higher-scoring node when two trusted nodes serve the same model", async () => {
+  const goodStub = await startStubNodeAgent(() => ({ status: 200, body: { text: "from the well-reputed node" } }));
+  const untestedStub = await startStubNodeAgent(() => ({ status: 200, body: { text: "from the untested node" } }));
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: untestedStub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+    const goodRegisterRes = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: goodStub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+    const { nodeId: goodNodeId } = await goodRegisterRes.json();
+
+    for (let i = 0; i < 10; i++) {
+      await authFetch(`${baseUrl}/nodes/${goodNodeId}/reputation/agree`, { method: "POST" });
+    }
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { text: "from the well-reputed node" });
+  } finally {
+    server.close();
+    goodStub.server.close();
+    untestedStub.server.close();
+  }
+});
+
+test("POST /generate breaks a tie between equally-scored nodes using the injected random function", async () => {
+  const firstStub = await startStubNodeAgent(() => ({ status: 200, body: { text: "from the first-registered node" } }));
+  const secondStub = await startStubNodeAgent(() => ({ status: 200, body: { text: "from the second-registered node" } }));
+  const { server, baseUrl } = await startTestServer(undefined, undefined, undefined, undefined, undefined, () => 0.999);
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: firstStub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: secondStub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { text: "from the second-registered node" });
+  } finally {
+    server.close();
+    firstStub.server.close();
+    secondStub.server.close();
   }
 });

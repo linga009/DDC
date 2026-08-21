@@ -433,9 +433,11 @@ must also keep sending `POST /nodes/:nodeId/heartbeat` periodically (the
 same 30-second liveness timeout every other endpoint relies on) — once it
 ages out of the registry from a missed heartbeat, `/generate` stops finding
 it and returns `503` again, exactly as if it had never registered. This is
-still only Phase A of the request-routing initiative: node selection is a
-simple first-match scan over active nodes (not load- or locality-aware),
-there is no background pre-warming of pipelines ahead of demand, and there
+still only Phase A of the request-routing initiative: node selection is
+reputation-ranked as of Security Hardening Phase 4 (see below) rather than
+a raw first-match scan, but is still not locality-aware or a general load
+balancer, there is no background pre-warming of pipelines ahead of demand,
+and there
 is no token streaming (a `/generate` call blocks until the full response
 is ready or the request fails). See
 [`docs/superpowers/specs/2026-08-16-request-routing-design.md`](docs/superpowers/specs/2026-08-16-request-routing-design.md)
@@ -464,6 +466,29 @@ reputation ledger and ejection policy, ready to be wired into a future
 dual-node dispatch path. Reputation endpoints themselves stay operable on an
 already-ejected node (so future spot-check results can still be recorded
 for it) — only capacity-facing views exclude it.
+
+**Security Hardening Phase 4 adds reputation-ranked node selection to
+`POST /generate`.** Previously it picked the first active, trusted node
+matching the requested `servesModel` (`Array.prototype.find` in `Map`
+insertion order); it now scores every such candidate with
+`ReputationTracker.score()` — a Laplace-smoothed agreement ratio,
+`(agreements + 1) / (agreements + disagreements + 2)` — and picks the
+highest-scoring one, breaking exact ties (most commonly: several untested
+nodes, which all score a neutral `0.5`) by choosing uniformly at random
+among them rather than always favoring whichever node happened to register
+first. This changes *ranking* only, not *eligibility* — a node still has
+to pass `isTrusted()`'s existing minSamples/disagreementThreshold gate to
+be a candidate at all. In practice this ranks mostly-untested nodes today:
+nothing in this codebase automatically calls the reputation-recording
+endpoints from `/generate`'s own outcomes, so real ranking signal only
+exists where an operator or external tool has manually recorded it — a
+future automatic-feedback phase is real potential follow-on work, not
+implemented here. The score is also only as durable as the `nodeId` it's
+attached to — see the endpoint-aliasing caveat in "Known gaming vectors"
+below; an operator can mint a fresh, neutral-scoring identity for the same
+physical node by re-registering under an alias. This is not a general load
+balancer: there is no in-flight-request tracking or capacity weighting,
+only a random tie-break among exactly-equal scores.
 
 **Caveat:** `POST /peers/register` now requires `SWARM_AUTH_TOKEN` (see
 Authentication above), and by default the server binds only
@@ -601,8 +626,9 @@ verbatim, which is indistinguishable from a node that never set the field
 at all. `GET /nodes/locality` exists purely as a stable, queryable
 interface for grouping; no pipeline-assembly or locality-aware
 request-routing system in this repo yet consumes it — `POST /generate`
-(Phase A, see below) is a simple first-match scan over active nodes with no
-locality-awareness at all, and this repo still has no cross-instance
+(Phase A, see below) ranks candidates by reputation score (Security
+Hardening Phase 4, see above) but has no locality-awareness at all, and
+this repo still has no cross-instance
 (federated) or multi-node pipeline-aware request routing of any kind. No
 client-side mesh-discovery mechanism (WiFi Direct, Multipeer Connectivity,
 LAN broadcast) yet exists to produce real, verifiable locality identifiers,

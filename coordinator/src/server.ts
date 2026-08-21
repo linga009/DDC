@@ -3,7 +3,7 @@ import { timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
-import { NodeRegistry, type DeviceTier } from "./registry.ts";
+import { NodeRegistry, type DeviceTier, type NodeInfo } from "./registry.ts";
 import { ModelCatalog } from "./catalog.ts";
 import { PeerRegistry } from "./peer_registry.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
@@ -143,7 +143,34 @@ async function federatedActiveNodeCount(registry: NodeRegistry, peers: PeerRegis
   return local + peerCounts.reduce((sum, n) => sum + n, 0);
 }
 
-export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier, reputation: ReputationTracker, authToken: string) {
+// Ranks candidates serving `modelId` by ReputationTracker.score() and
+// returns the highest-scoring one. Ties (most commonly: several untested
+// nodes, which all score the neutral 0.5) are broken by picking uniformly
+// at random among the tied set, so equally-trusted nodes share load
+// instead of one perpetually winning by registration order. `random` is
+// injected (mirroring NodeRegistry's injectable `clock`) so callers can
+// pin the tie-break for deterministic tests; it is never invoked when
+// there's a unique highest scorer.
+export function selectNode(nodes: NodeInfo[], reputation: ReputationTracker, modelId: string, random: () => number): NodeInfo | undefined {
+  const candidates = nodes.filter(n => n.servesModel === modelId);
+  if (candidates.length === 0) {
+    return undefined;
+  }
+  let bestScore = -Infinity;
+  let best: NodeInfo[] = [];
+  for (const node of candidates) {
+    const s = reputation.score(node.nodeId);
+    if (s > bestScore) {
+      bestScore = s;
+      best = [node];
+    } else if (s === bestScore) {
+      best.push(node);
+    }
+  }
+  return best.length === 1 ? best[0] : best[Math.floor(random() * best.length)];
+}
+
+export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier, reputation: ReputationTracker, authToken: string, random: () => number = Math.random) {
   return createHttpServer(async (req, res) => {
     try {
       const method = req.method ?? "GET";
@@ -451,7 +478,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           return;
         }
 
-        const node = registry.listActive(reputation).find(n => n.servesModel === candidate.modelId);
+        const node = selectNode(registry.listActive(reputation), reputation, candidate.modelId, random);
         if (!node) {
           sendJson(res, 503, { error: `no active node currently serves model "${candidate.modelId}"` });
           return;
