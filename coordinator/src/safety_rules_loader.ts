@@ -7,6 +7,22 @@ function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// Widen every apostrophe in an ALREADY-ESCAPED term into a character class
+// matching either quote style. iOS, macOS, Word and many chat UIs autocorrect
+// a typed straight apostrophe (U+0027) into a right single quotation mark
+// (U+2019), so a rule written as "clone someone's bank card" would otherwise
+// miss a user who typed that exact phrase anywhere autocorrect is on -- that
+// is a trivially-reachable bypass, not the disclosed rephrasing/misspelling
+// limitation. Applied here (generically, to every current and future term)
+// rather than by hand-writing variants into safety_rules.json.
+//
+// Order matters: this runs AFTER escapeRegExp. Neither apostrophe is a regex
+// metacharacter, so escapeRegExp leaves both untouched and the "[" / "]" this
+// introduces are not themselves re-escaped afterwards.
+function widenApostrophes(escaped: string): string {
+  return escaped.replace(/['’]/g, "['’]");
+}
+
 export function loadSafetyRules(filePath: string | URL): KeywordRule[] {
   let raw: string;
   try {
@@ -37,6 +53,18 @@ export function loadSafetyRules(filePath: string | URL): KeywordRule[] {
   }
 
   const rawRules = (parsed as { rules: unknown[] }).rules;
+
+  // An empty ruleset is the one failure mode that looks exactly like success:
+  // the coordinator would start with a byte-identical startup log and then
+  // report every prompt -- including the worst ones -- as safe:true, with
+  // nothing anywhere to signal that the gate had been disarmed. Fail fast
+  // instead, which is this loader's whole reason to exist.
+  if (rawRules.length === 0) {
+    throw new SafetyRulesError(
+      `safety rules file ${filePath} has an empty "rules" array -- a rule-less classifier reports every prompt as safe`,
+    );
+  }
+
   const rules: KeywordRule[] = [];
 
   rawRules.forEach((entry, index) => {
@@ -84,7 +112,7 @@ export function loadSafetyRules(filePath: string | URL): KeywordRule[] {
       // \b-wrapping) for a rule that genuinely needs one.
       rules.push({
         category: candidate.category,
-        pattern: new RegExp(`\\b${escapeRegExp(term)}\\b`, "i"),
+        pattern: new RegExp(`\\b${widenApostrophes(escapeRegExp(term))}\\b`, "i"),
       });
     } else {
       // "pattern" is raw regex source, authored by hand -- unlike "term"

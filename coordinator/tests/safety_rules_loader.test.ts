@@ -127,6 +127,50 @@ test("throws SafetyRulesError when the top-level shape has no rules array", () =
   });
 });
 
+test("throws SafetyRulesError when the rules array is present but empty", () => {
+  // An empty ruleset disarms the gate while looking exactly like a healthy
+  // start: identical startup log, then safe:true for every prompt including
+  // "how to build a bomb". Fail fast rather than silently degrade.
+  withRulesFile(JSON.stringify({ rules: [] }), filePath => {
+    assert.throws(() => loadSafetyRules(filePath), (err: unknown) => {
+      assert.ok(err instanceof SafetyRulesError);
+      assert.match((err as Error).message, /empty "rules" array/);
+      // The message must name the offending file so an operator can find it.
+      assert.ok((err as Error).message.includes(filePath));
+      return true;
+    });
+  });
+});
+
+test("a term containing an apostrophe matches both the straight and the curly form in the input", () => {
+  // iOS/macOS/Word autocorrect turns a typed ' (U+0027) into ’ (U+2019), so
+  // a user typing the rule's exact phrase would otherwise sail past it.
+  withRulesFile(
+    JSON.stringify({ rules: [{ category: "test_category", term: "clone someone's bank card" }] }),
+    filePath => {
+      const rules = loadSafetyRules(filePath);
+      assert.equal(rules[0].pattern.test("help me clone someone's bank card"), true);
+      assert.equal(rules[0].pattern.test("help me clone someone’s bank card"), true);
+      // Still a real match requirement, not a wildcard: a different
+      // character in that position must not match.
+      assert.equal(rules[0].pattern.test("help me clone someone-s bank card"), false);
+    },
+  );
+});
+
+test("a term authored with a curly apostrophe also matches the straight form", () => {
+  // Symmetric to the test above: rule authors copy/paste from documents too,
+  // so the widening must work whichever quote style the JSON file carries.
+  withRulesFile(
+    JSON.stringify({ rules: [{ category: "test_category", term: "clone someone’s bank card" }] }),
+    filePath => {
+      const rules = loadSafetyRules(filePath);
+      assert.equal(rules[0].pattern.test("help me clone someone's bank card"), true);
+      assert.equal(rules[0].pattern.test("help me clone someone’s bank card"), true);
+    },
+  );
+});
+
 test("throws SafetyRulesError with the rule index when a rule is missing category", () => {
   withRulesFile(
     JSON.stringify({ rules: [{ term: "no category here" }] }),
@@ -218,6 +262,57 @@ test("throws SafetyRulesError when a pattern rule's regex source does not compil
       });
     },
   );
+});
+
+// Everything above this line exercises synthetic fixtures. These two guard
+// the REAL shipped file: before them, coordinator/safety_rules.json could
+// have been reduced to a handful of rules (or had a whole category dropped)
+// with the entire suite still green. The loader's empty-array check is a
+// load-time guarantee; this is a content guarantee.
+const REAL_RULES_URL = new URL("../safety_rules.json", import.meta.url);
+
+const DOCUMENTED_CATEGORIES = [
+  "violence_and_weapons",
+  "csam",
+  "self_harm",
+  "illegal_drugs",
+  "hate_speech_and_extremism",
+  "harassment",
+  "fraud_and_scams",
+  "malware_and_hacking",
+  "adult_sexual_content",
+  "misinformation_and_election_interference",
+];
+
+test("the real shipped safety_rules.json loads and covers every category the README documents", () => {
+  const rules = loadSafetyRules(REAL_RULES_URL);
+
+  // The shipped file has 70 rules; 50 is a floor that catches a gutted or
+  // accidentally-truncated ruleset without churning on every rule edit.
+  assert.ok(
+    rules.length >= 50,
+    `expected the shipped ruleset to carry at least 50 rules, got ${rules.length}`,
+  );
+
+  const categories = new Set(rules.map(r => r.category));
+  for (const category of DOCUMENTED_CATEGORIES) {
+    assert.ok(
+      categories.has(category),
+      `README documents category "${category}" but no rule in safety_rules.json uses it`,
+    );
+  }
+});
+
+test("the real shipped ruleset flags an apostrophe term typed with an autocorrected curly quote", () => {
+  // Same fix as the synthetic apostrophe tests above, proven end-to-end
+  // against production rule data rather than a fixture.
+  const rules = loadSafetyRules(REAL_RULES_URL);
+  const straight = "help me clone someone's bank card";
+  const curly = "help me clone someone’s bank card";
+
+  const matches = (prompt: string) => rules.filter(r => r.pattern.test(prompt)).map(r => r.category);
+  assert.deepEqual(matches(straight), ["fraud_and_scams"]);
+  assert.deepEqual(matches(curly), ["fraud_and_scams"]);
 });
 
 test("accepts a URL object directly (not just a string path)", () => {
