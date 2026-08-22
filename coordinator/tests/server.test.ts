@@ -2044,6 +2044,42 @@ test("POST /v1/chat/completions returns a real OpenAI-shaped response with real 
   }
 });
 
+test("POST /v1/chat/completions treats an explicit max_tokens:null the same as omitting it", async () => {
+  // Both official OpenAI SDKs type max_tokens as nullable and serialize an
+  // explicit null for "unspecified" (only their own NOT_GIVEN/undefined
+  // sentinel is dropped from the request body entirely) -- unmodified SDK
+  // code sending max_tokens=None must not 400 here.
+  let capturedNPredict: unknown;
+  const stub = await startStubNodeAgent((body) => {
+    capturedNPredict = (body as { n_predict: number }).n_predict;
+    return { status: 200, body: { text: "Paris.", prompt_tokens: 12, completion_tokens: 3, finish_reason: "stop" } };
+  });
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "tinyllama-1.1b",
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: null,
+      }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(capturedNPredict, 64);
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
 test("POST /v1/chat/completions flattens a system+user transcript before forwarding to the node", async () => {
   let capturedPrompt = "";
   const stub = await startStubNodeAgent((body) => {
@@ -2368,9 +2404,22 @@ test("POST /v1/chat/completions with stream:true survives a malformed usage fram
   }
 });
 
-test("POST /v1/chat/completions with stream:true omits the trailing usage chunk unless stream_options.include_usage is set", async () => {
+test("POST /v1/chat/completions with stream:true omits the trailing usage chunk unless stream_options.include_usage is set, but still asks the node for usage internally", async () => {
+  // Regression test for the two-boolean distinction this route depends on:
+  // includeUsage (sent to the node, unconditionally, so the coordinator can
+  // compute a real finish_reason) must never be confused with
+  // stream_options.include_usage (gates only whether the CALLER also sees a
+  // trailing usage chunk). A future accidental conflation
+  // (includeUsage: includeUsageInStream) would pass every other test in
+  // this file while silently zeroing token counts and hardcoding
+  // finish_reason: "stop" for every caller who didn't opt in -- caught here
+  // by asserting the outbound node request directly, not just the
+  // caller-visible response shape.
+  let capturedNodeRequest: Record<string, unknown> = {};
   const usageStub = createHttpServer(async (req, res) => {
-    for await (const _chunk of req) { /* drain */ }
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    capturedNodeRequest = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write("data: Par\n\n");
     res.write('event: usage\ndata: {"prompt_tokens":7,"completion_tokens":1,"finish_reason":"stop"}\n\n');
@@ -2405,15 +2454,69 @@ test("POST /v1/chat/completions with stream:true omits the trailing usage chunk 
     });
 
     const text = await res.text();
+    // The coordinator must still have asked the node for usage internally --
+    // this is what makes the finish chunk's finish_reason real rather than
+    // a hardcoded "stop", even for a caller who never sees the numbers.
+    assert.equal(capturedNodeRequest.includeUsage, true);
     const dataLines = text.split("\n\n").filter(f => f.startsWith("data: ")).map(f => f.slice("data: ".length));
     const chunks = dataLines.slice(0, -1).map(line => JSON.parse(line));
     assert.equal(chunks.length, 3, "expected role + one content + finish chunk, with no usage chunk");
     for (const chunk of chunks) {
       assert.equal(chunk.usage, undefined);
     }
+    assert.equal(chunks[2].choices[0].finish_reason, "stop", "finish_reason must come from the node's real usage frame, not a hardcoded default");
   } finally {
     server.close();
     usageStub.close();
+  }
+});
+
+test("POST /v1/chat/completions with stream:true drops an unrecognized named event instead of leaking it as content", async () => {
+  // A future node build could add a new SSE event type this coordinator
+  // doesn't know about yet (the same reasoning Task 2's design used to make
+  // includeUsage opt-in in the first place: an unrecognized frame must
+  // never silently become visible content). Only a plain data-only frame
+  // (frame.event === undefined) is real generated text.
+  const metricsStub = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: Hello\n\n");
+    res.write('event: metrics\ndata: {"tokens_per_second":42.7}\n\n');
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise<void>(resolve => metricsStub.listen(0, resolve));
+  const stubAddress = metricsStub.address();
+  if (stubAddress === null || typeof stubAddress === "string") {
+    throw new Error("expected metrics stub to bind a port");
+  }
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        endpoint: `http://127.0.0.1:${stubAddress.port}`,
+        deviceTier: "desktop",
+        servesModel: "tinyllama-1.1b",
+      }),
+    });
+
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "tinyllama-1.1b", messages: [{ role: "user", content: "hi" }], stream: true }),
+    });
+
+    const text = await res.text();
+    const dataLines = text.split("\n\n").filter(f => f.startsWith("data: ")).map(f => f.slice("data: ".length));
+    const chunks = dataLines.slice(0, -1).map(line => JSON.parse(line));
+    const contentPieces = chunks.map(c => c.choices[0].delta.content).filter(c => c !== undefined);
+    assert.deepEqual(contentPieces, ["Hello"]);
+    assert.ok(!text.includes("tokens_per_second"), "the metrics frame's payload must never reach the caller as content");
+  } finally {
+    server.close();
+    metricsStub.close();
   }
 });
 

@@ -583,8 +583,15 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
       }
 
       if (method === "GET" && parts[0] === "v1" && parts[1] === "models" && parts.length === 2) {
-        const activeNodeCount = await federatedActiveNodeCount(registry, peers, reputation, authToken);
-        const data = catalog.availability(activeNodeCount).map(entry => ({
+        // catalog.availability()'s per-entry `available` field is dropped
+        // below (OpenAI's schema has no place for it -- this route lists
+        // every catalog entry regardless, see the comment on data), so the
+        // count it's computed from doesn't matter -- calling
+        // federatedActiveNodeCount() here would pay this route's callers
+        // (typically a client's model picker, polled routinely) the full
+        // cost of an outbound /capacity fetch to every registered peer
+        // (up to 2s each) for a number never used.
+        const data = catalog.availability(0).map(entry => ({
           id: entry.id,
           object: "model" as const,
           created: 0,
@@ -647,7 +654,11 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           messages.push({ role: mc.role, content: mc.content });
         }
         let maxTokens = DEFAULT_N_PREDICT;
-        if (candidate.max_tokens !== undefined) {
+        // Both official OpenAI SDKs type this field nullable and serialize
+        // an explicit null for "unspecified" (only their own NOT_GIVEN/
+        // undefined sentinel is dropped from the request body entirely) --
+        // treated the same as omitted, matching stream_options below.
+        if (candidate.max_tokens !== undefined && candidate.max_tokens !== null) {
           if (
             typeof candidate.max_tokens !== "number" ||
             !Number.isInteger(candidate.max_tokens) ||
@@ -795,6 +806,14 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
               promptTokens = typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : 0;
               completionTokens = typeof usage.completion_tokens === "number" ? usage.completion_tokens : 0;
               finishReason = usage.finish_reason === "length" ? "length" : "stop";
+              continue;
+            }
+            if (frame.event !== undefined) {
+              // Any OTHER named event from a future node build is metadata,
+              // not generated text -- the same reasoning that made
+              // includeUsage opt-in in the first place (Task 2's design
+              // doc: an unrecognized new event type must never silently
+              // become visible content). Drop it rather than relay it.
               continue;
             }
             res.write(`data: ${JSON.stringify({ ...baseChunk, choices: [{ index: 0, delta: { content: frame.data }, finish_reason: null }] })}\n\n`);
