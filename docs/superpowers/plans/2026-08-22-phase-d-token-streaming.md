@@ -332,7 +332,9 @@ git commit -m "Add InferenceEngine::completeStreaming(); complete() becomes a th
 
 **Interfaces:**
 - Consumes: nothing from Task 1 (this task is independent of it; both feed into Task 3).
-- Produces: `class ResponseWriter` with `writeJsonResponse(int status, const std::string& body)`, `writeChunk(const std::string& text)`, `writeError(const std::string& message)`; `using StreamingHttpHandler = std::function<void(const HttpRequest&, ResponseWriter&)>`; `HttpServer::routeStreaming(const std::string& method, const std::string& path, StreamingHttpHandler handler)`. Task 3 depends on exactly these names/signatures.
+- Produces: `class ResponseWriter` with `writeJsonResponse(int status, const std::string& body)`, `writeChunk(const std::string& text)`, `writeDone()`, `writeError(const std::string& message)`; `using StreamingHttpHandler = std::function<void(const HttpRequest&, ResponseWriter&)>`; `HttpServer::routeStreaming(const std::string& method, const std::string& path, StreamingHttpHandler handler)`. Task 3 depends on exactly these names/signatures.
+- **Terminal frame contract (added during Task 3's review round, after a live-verified defect):** every successful stream ends with a literal `data: [DONE]\n\n` sentinel — the same one real OpenAI-compatible streaming APIs use, chosen here as useful precedent for the separately-sketched future plan that adds an OpenAI-compatible endpoint on top of this work. `run()` emits it automatically, exactly once, after any `StreamingHttpHandler` that **returns normally**; handlers never call `writeDone()` themselves. It is deliberately NOT emitted on the exception path, so the three outcomes of a streaming response are distinguishable on the wire: clean completion (**including a generation that produced zero chunks**) ends with `data: [DONE]`; a genuine C++ exception ends with `event: error` and no `[DONE]`; and an outright process abort (the disclosed, uncatchable `GGML_ABORT`-on-dead-remote-device case) ends with neither marker — the honest signal, since nothing can make that graceful. **Any consumer written against this task — Task 4's coordinator relay and Task 5's `SwarmClient.generateStream()`/dashboard renderer — must treat `[DONE]` as a control frame and not render it as generated text.** Those tasks' own sections have not been updated for this and need to be, separately.
+- **`writeError()` picks its response form based on what has already been sent.** With nothing yet on the wire (a pre-generation validation failure), it sends a real `500 application/json` — byte-identical to what the same failure produces on the non-streaming path — rather than committing to a `200 text/event-stream` purely to carry an error frame for a request that never began streaming. Only once a stream is genuinely underway, when the status line and Content-Type can no longer be changed, does it fall back to the SSE `event: error` frame. Practical consequence for Task 3: an oversized-prompt request with `stream: true` returns `HTTP/1.1 500` + `application/json`, matching the identical request without `stream` (live-verified against a real `swarm-node-agent`).
 - `ResponseWriter` is **non-copyable** (copy constructor and copy assignment are `= delete`d). Task 3 and any later consumer must always take and pass it by reference — `[&writer]`, never `[writer]`, if a handler ever puts it in a lambda. This is enforced at compile time on purpose: the writer's `sseHeadersSent_`/`jsonResponseSent_` flags track what has already gone out on a socket it does not own, so a copy would silently diverge and re-emit SSE headers mid-stream instead of erroring.
 
 **Design note carried over from this plan's own scoping**: `HttpServer` routes purely on `(method, path)` — a request body field like `stream: true` can't be used to pick between two *different* registered routes at dispatch time, only inspected by whichever single handler routing already selected. So `routeStreaming()` handlers decide, per request, whether to call `writeJsonResponse()` (a normal, complete, non-streaming response — used when the caller didn't ask to stream) or one-or-more `writeChunk()`/`writeError()` calls (an SSE stream). Exactly one of these is ever used per request; `ResponseWriter` enforces that the first call wins.
@@ -377,7 +379,7 @@ std::vector<std::string> sendRawRequestCapturingChunks(int port, const std::stri
 }
 ```
 
-Add `#include <vector>` and `#include <type_traits>` to this file's includes if not already present (check the top of the file first — it already includes `<string>` and `<thread>` but may not include these directly). `<type_traits>` is for the non-copyability test at the end of this listing.
+Add `#include <vector>`, `#include <type_traits>`, and `#include <cstring>` to this file's includes if not already present (check the top of the file first — it already includes `<string>` and `<thread>` but may not include these directly). `<type_traits>` is for the non-copyability test at the end of this listing; `<cstring>` is for the `std::strlen` used by the `[DONE]`-is-the-final-frame assertions.
 
 Then add these tests at the end of the file, before the closing `}  // namespace`:
 
@@ -469,6 +471,81 @@ TEST_F(HttpServerFixture, StreamingRouteTreatsCrlfAsOneLineBreakNotTwo) {
     EXPECT_EQ(response.find('\r', frameStart), std::string::npos);
 }
 
+// The zero-chunk stream is a REAL, reachable case, not a synthetic one: an
+// instruct model handed an already-complete turn emits its end-of-generation
+// token as the very first token, so InferenceEngine::completeStreaming()
+// breaks before ever invoking its callback and the handler never calls
+// writeChunk(). Because SSE headers are sent lazily on first write, that
+// used to put literally ZERO bytes on the wire -- run() just closed the
+// socket, and a real client (verified with curl) reported "Empty reply from
+// server", indistinguishable from a crashed process. run() now calls
+// writeDone() after any streaming handler that returns normally, so even a
+// stream with no content is a well-formed 200 that terminates explicitly.
+TEST_F(HttpServerFixture, StreamingRouteThatWritesNothingStillSendsADoneTerminatedResponse) {
+    swarm::HttpServer server(kTestPort + 18);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter&) {
+        // Writes nothing at all -- a generation that produced zero tokens.
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 18, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_FALSE(response.empty());
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos);
+    EXPECT_NE(response.find("Content-Type: text/event-stream"), std::string::npos);
+    EXPECT_NE(response.find("data: [DONE]\n\n"), std::string::npos);
+}
+
+// The `data: [DONE]\n\n` sentinel is the same one real OpenAI-compatible
+// streaming APIs use, and it must come LAST -- a client reading frames in
+// order treats it as "the stream completed successfully, no more content is
+// coming", which is only true if no further frame follows it.
+TEST_F(HttpServerFixture, StreamingRouteAppendsADoneFrameAfterTheLastChunk) {
+    swarm::HttpServer server(kTestPort + 19);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("alpha");
+        writer.writeChunk("beta");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 19, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    size_t alpha = response.find("data: alpha\n\n");
+    size_t beta = response.find("data: beta\n\n");
+    size_t done = response.find("data: [DONE]\n\n");
+    ASSERT_NE(alpha, std::string::npos);
+    ASSERT_NE(beta, std::string::npos);
+    ASSERT_NE(done, std::string::npos);
+    EXPECT_LT(alpha, beta);
+    EXPECT_LT(beta, done);
+    // Nothing at all after the sentinel -- it is the final frame on the wire.
+    EXPECT_EQ(done + std::strlen("data: [DONE]\n\n"), response.size());
+}
+
+// A failure that happens BEFORE any byte has been written is still a normal
+// HTTP error: the status line hasn't been committed yet, so a real
+// `500 application/json` is available and matches byte-for-byte what the
+// same failure produces on this endpoint's non-streaming path. Committing to
+// a `200 text/event-stream` just to carry an error frame would tell every
+// client "this request succeeded" about a request that never started.
+TEST_F(HttpServerFixture, StreamingHandlerThatThrowsBeforeWritingAnythingGetsAJsonErrorNotAnSseStream) {
+    swarm::HttpServer server(kTestPort + 20);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter&) {
+        throw std::runtime_error("prompt too long");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 20, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("HTTP/1.1 500"), std::string::npos);
+    EXPECT_NE(response.find("Content-Type: application/json"), std::string::npos);
+    EXPECT_NE(response.find(R"({"error":"prompt too long"})"), std::string::npos);
+    EXPECT_EQ(response.find("text/event-stream"), std::string::npos);
+    EXPECT_EQ(response.find("event: error"), std::string::npos);
+    // A failed request must never claim success, by any route.
+    EXPECT_EQ(response.find("[DONE]"), std::string::npos);
+}
+
 // A ResponseWriter tracks, in its own members, whether SSE headers or a
 // complete JSON response have already gone out on its socket -- state that
 // is only correct if exactly one object owns it for the life of the
@@ -498,6 +575,12 @@ TEST_F(HttpServerFixture, StreamingRouteSendsAnErrorFrameWhenTheHandlerThrows) {
     EXPECT_NE(response.find("data: partial\n\n"), std::string::npos);
     EXPECT_NE(response.find("event: error"), std::string::npos);
     EXPECT_NE(response.find(R"("error":"boom")"), std::string::npos);
+    // The success sentinel and the error frame are mutually exclusive: run()
+    // calls writeDone() only on the path where the handler RETURNED, never
+    // on the path where it threw. A stream that ended in an error must not
+    // also announce "[DONE]" -- that would tell the client the generation
+    // completed successfully when it was cut short partway through.
+    EXPECT_EQ(response.find("[DONE]"), std::string::npos);
 }
 
 TEST_F(HttpServerFixture, StreamingRouteHandlerCanWriteANormalNonStreamingResponseInstead) {
@@ -513,6 +596,14 @@ TEST_F(HttpServerFixture, StreamingRouteHandlerCanWriteANormalNonStreamingRespon
     EXPECT_NE(response.find("Content-Type: application/json"), std::string::npos);
     EXPECT_NE(response.find(R"({"text":"not streamed"})"), std::string::npos);
     EXPECT_EQ(response.find("text/event-stream"), std::string::npos);
+    // writeDone() runs after EVERY streaming handler that returns normally,
+    // including this one -- but a handler that chose a plain JSON response
+    // has nothing streaming to terminate, so writeDone() must be a no-op
+    // there. Appending anything after a Content-Length-delimited body would
+    // corrupt the wire for every non-streaming caller of a
+    // routeStreaming()-registered endpoint (which is exactly what
+    // swarm-node-agent's /complete is without "stream": true).
+    EXPECT_EQ(response.find("[DONE]"), std::string::npos);
 }
 
 TEST_F(HttpServerFixture, RegularRoutesStillWorkAlongsideAStreamingRoute) {
@@ -600,11 +691,15 @@ struct HttpResponse {
 using HttpHandler = std::function<HttpResponse(const HttpRequest&)>;
 
 // Handed to a StreamingHttpHandler. Exactly one of writeJsonResponse() or
-// one-or-more calls to writeChunk()/writeError() may be made on a given
-// ResponseWriter -- whichever is called first commits this response to
-// being either a normal single JSON response or an SSE stream; any further
-// call (of either kind) after that is a silent no-op, since a response's
-// status line and headers can only be sent once. This lets one
+// one-or-more calls to writeChunk()/writeError()/writeDone() may be made on
+// a given ResponseWriter -- whichever is called first commits this response
+// to being either a normal single JSON response or an SSE stream; any
+// further call (of either kind) after that is a silent no-op, since a
+// response's status line and headers can only be sent once. writeError() is
+// the one exception to the "first call picks SSE" rule, and deliberately
+// so: called when nothing has been sent yet, it picks the plain JSON form
+// (a real 500), because a failure with no committed status line does not
+// need a stream to report it. This lets one
 // streaming-registered route serve both a plain, unchanged non-streaming
 // response (when a handler determines, after inspecting the request, that
 // this particular call shouldn't actually stream) and a real SSE stream,
@@ -637,17 +732,44 @@ public:
     // std::runtime_error if the underlying send fails (peer gone).
     void writeChunk(const std::string& text);
 
-    // Sends SSE response headers if not already sent, then one terminal
-    // `event: error\ndata: {"error":"<message>"}\n\n` frame -- the defined
-    // way to signal "generation failed" after a stream may have already
-    // delivered real content, which changing the HTTP status code cannot
-    // do once a 200 and its headers are already on the wire. Throws
-    // std::runtime_error if the underlying send fails.
+    // Sends SSE headers if not already sent (guaranteeing a well-formed,
+    // non-empty response even for a generation that produced zero chunks),
+    // then a terminal `data: [DONE]\n\n` frame -- the defined way to signal
+    // "this stream completed successfully; there is no more content coming."
+    // A no-op if a plain JSON response was already sent via writeJsonResponse
+    // (nothing streaming-related to terminate). Matches the same sentinel
+    // real OpenAI-compatible streaming APIs use. Throws std::runtime_error if
+    // the underlying send fails (peer gone).
     //
-    // Note this one needs NO line-break splitting of its own: the message
-    // goes through jsonEscapeString(), which already turns a '\r' into a
-    // literal backslash-r inside the JSON string, so it cannot put a raw
-    // '\r' on the wire the way writeChunk() could.
+    // HttpServer::run() calls this automatically, exactly once, after a
+    // StreamingHttpHandler returns normally -- handlers do not need to call
+    // it, and calling it again is a no-op (the second call would otherwise
+    // put a second sentinel on the wire, telling a client the stream ended
+    // twice).
+    void writeDone();
+
+    // Signals failure. If NOTHING has been sent yet, this is still an
+    // ordinary HTTP error: a real `500 application/json` response, matching
+    // byte-for-byte what the non-streaming path produces for the identical
+    // failure, rather than committing to a 200 text/event-stream purely to
+    // carry an error frame for a request that never began streaming.
+    // Once a stream IS underway, the status line and Content-Type are
+    // already committed and cannot be changed, so the only way left to
+    // signal failure is one terminal
+    // `event: error\ndata: {"error":"<message>"}\n\n` frame -- the defined
+    // way to say "generation failed" after real content may already have
+    // been delivered. Throws std::runtime_error if the underlying send
+    // fails.
+    //
+    // Note the SSE branch needs NO line-break splitting of its own: the
+    // message goes through jsonEscapeString(), which already turns a '\r'
+    // into a literal backslash-r inside the JSON string, so it cannot put a
+    // raw '\r' on the wire the way writeChunk() could.
+    //
+    // A response that ends in an error frame never also carries a
+    // `[DONE]` sentinel: run() calls writeDone() only on the path where the
+    // handler returned normally, so "succeeded" and "failed" stay mutually
+    // exclusive on the wire.
     void writeError(const std::string& message);
 
     // Non-copyable, deliberately. The sseHeadersSent_/jsonResponseSent_
@@ -674,6 +796,7 @@ private:
     intptr_t socketHandle_;
     bool sseHeadersSent_ = false;
     bool jsonResponseSent_ = false;
+    bool doneSent_ = false;
 };
 
 using StreamingHttpHandler = std::function<void(const HttpRequest&, ResponseWriter&)>;
@@ -831,11 +954,59 @@ void ResponseWriter::writeChunk(const std::string& text) {
     }
 }
 
-void ResponseWriter::writeError(const std::string& message) {
-    ensureSseHeadersSent();
+void ResponseWriter::writeDone() {
     if (jsonResponseSent_) {
-        return;  // a normal response already went out -- see ensureSseHeadersSent's comment
+        // The handler chose a plain, complete JSON response -- there is no
+        // stream to terminate, and appending anything after a
+        // Content-Length-delimited body would corrupt the wire for every
+        // non-streaming caller of a routeStreaming()-registered endpoint.
+        return;
     }
+    if (doneSent_) {
+        return;  // one stream, one terminal sentinel
+    }
+    // Deliberately BEFORE the send, not after: a handler that already streamed
+    // real content and then loses the peer must not leave this false and
+    // invite a second sentinel attempt from a later caller.
+    doneSent_ = true;
+    // Unconditionally ensures headers first -- this is the whole point of the
+    // method. A generation that emitted its end-of-generation token as its
+    // very first token (a normal case for an instruct model handed an
+    // already-complete turn) never calls writeChunk(), so without this the
+    // lazily-sent SSE headers would never go out at all and the client would
+    // get zero bytes: an empty reply indistinguishable from a crashed server.
+    ensureSseHeadersSent();
+    socket_t s = static_cast<socket_t>(socketHandle_);
+    static const char kDoneFrame[] = "data: [DONE]\n\n";
+    size_t len = sizeof(kDoneFrame) - 1;  // exclude the trailing '\0'
+    size_t sentTotal = 0;
+    while (sentTotal < len) {
+        long long n = sendBytes(s, kDoneFrame + sentTotal, len - sentTotal);
+        if (n <= 0) {
+            throw std::runtime_error("failed to write SSE completion marker: peer gone");
+        }
+        sentTotal += static_cast<size_t>(n);
+    }
+}
+
+void ResponseWriter::writeError(const std::string& message) {
+    if (jsonResponseSent_) {
+        return;  // already committed to a response -- see ensureSseHeadersSent's comment
+    }
+    if (!sseHeadersSent_) {
+        // Nothing has been sent to the client yet -- a real error status is
+        // still possible and matches the non-streaming path's behavior for
+        // the identical failure, instead of committing to a 200
+        // text/event-stream just to report a failure that happened before
+        // any generation began. (A too-long prompt rejected during
+        // tokenization is the live example: the same request without
+        // "stream": true already gets exactly this 500 + JSON body.)
+        writeJsonResponse(500, R"({"error":")" + jsonEscapeString(message) + R"("})");
+        return;
+    }
+    // Already streaming -- the only way left to signal failure is an SSE
+    // error frame; the status line and Content-Type are already committed
+    // and cannot be changed now.
     socket_t s = static_cast<socket_t>(socketHandle_);
     std::string frame = "event: error\ndata: {\"error\":\"" + jsonEscapeString(message) + "\"}\n\n";
     size_t sentTotal = 0;
@@ -932,6 +1103,19 @@ Replace with:
                     ResponseWriter writer(static_cast<intptr_t>(client));
                     try {
                         std::get<2>(routeEntry)(request, writer);
+                        // Only on the path where the handler RETURNED, never
+                        // where it threw: `[DONE]` means "completed
+                        // successfully", so a stream that ended via
+                        // writeError() below must not also claim it. This
+                        // placement is what makes the three outcomes of a
+                        // streaming response distinguishable on the wire --
+                        // clean completion (including zero chunks) ends with
+                        // `data: [DONE]`, a genuine C++ exception ends with
+                        // `event: error`, and an outright process abort (the
+                        // disclosed, uncatchable GGML_ABORT-on-dead-remote
+                        // case) ends with neither, which is the honest signal
+                        // for it.
+                        writer.writeDone();
                     } catch (const std::exception& e) {
                         try {
                             writer.writeError(e.what());
