@@ -111,6 +111,23 @@ function renderChatHistory() {
   historyEl.scrollTop = historyEl.scrollHeight;
 }
 
+// Appends `piece` directly to the last rendered message's DOM node without
+// rebuilding the whole history -- used while a streamed reply is actively
+// growing, so a real generation (which can emit dozens of pieces) doesn't
+// clear-and-rebuild the entire visible history on every single token.
+// renderChatHistory() itself is still used for the FIRST piece of a new
+// message (it needs a DOM node to exist before this can append to it) and
+// for anything that changes a message's CSS class (an error/blocked
+// status), not just its text.
+function appendToLastChatMessage(piece) {
+  const historyEl = document.getElementById("chat-history");
+  const last = historyEl.lastElementChild;
+  if (last) {
+    last.textContent += piece;
+    historyEl.scrollTop = historyEl.scrollHeight;
+  }
+}
+
 function setChatBusy(busy) {
   document.getElementById("chat-input").disabled = busy;
   document.getElementById("chat-send-button").disabled = busy;
@@ -148,32 +165,78 @@ async function sendChatMessage() {
   setChatBusy(true);
 
   const modelId = document.getElementById("chat-model-select").value;
+  const assistantMessage = { role: "assistant", text: "" };
+  let assistantMessageAdded = false;
+
   try {
     const res = await authedFetch("/generate", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ prompt, modelId, n_predict: CHAT_N_PREDICT }),
+      body: JSON.stringify({ prompt, modelId, n_predict: CHAT_N_PREDICT, stream: true }),
     });
-    const body = await res.json();
-    if (res.status === 200) {
-      chatHistory.push({ role: "assistant", text: body.text.trim() });
-    } else if (res.status === 400 && body.safe === false) {
-      chatHistory.push({
-        role: "assistant",
-        text: `Blocked by safety filter (${body.categories.length > 0 ? body.categories.join(", ") : "unspecified"}).`,
-        status: "blocked",
-      });
-    } else if (res.status === 401) {
-      chatHistory.push({
-        role: "assistant",
-        text: "Invalid or missing token — paste a valid SWARM_AUTH_TOKEN above.",
-        status: "error",
-      });
+
+    if (res.status !== 200) {
+      const body = await res.json();
+      if (res.status === 400 && body.safe === false) {
+        chatHistory.push({
+          role: "assistant",
+          text: `Blocked by safety filter (${body.categories.length > 0 ? body.categories.join(", ") : "unspecified"}).`,
+          status: "blocked",
+        });
+      } else if (res.status === 401) {
+        chatHistory.push({
+          role: "assistant",
+          text: "Invalid or missing token — paste a valid SWARM_AUTH_TOKEN above.",
+          status: "error",
+        });
+      } else {
+        chatHistory.push({ role: "assistant", text: body.error ?? `Request failed (${res.status}).`, status: "error" });
+      }
     } else {
-      chatHistory.push({ role: "assistant", text: body.error ?? `Request failed (${res.status}).`, status: "error" });
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() ?? "";
+        for (const frame of frames) {
+          if (frame.startsWith("event: error")) {
+            const dataLine = frame.split("\n").find(line => line.startsWith("data: "));
+            const message = dataLine ? JSON.parse(dataLine.slice("data: ".length)).error : "generation failed mid-stream";
+            if (!assistantMessageAdded) {
+              chatHistory.push(assistantMessage);
+              assistantMessageAdded = true;
+            }
+            assistantMessage.status = "error";
+            assistantMessage.text += assistantMessage.text ? ` [error: ${message}]` : `Error: ${message}`;
+            renderChatHistory(); // status changed -- needs the CSS class updated too, not just text
+            continue;
+          }
+          const dataLines = frame.split("\n").filter(line => line.startsWith("data: "));
+          if (dataLines.length === 0) continue;
+          const piece = dataLines.map(line => line.slice("data: ".length)).join("\n");
+          if (piece === "[DONE]") continue; // terminal sentinel -- not literal generated text
+          assistantMessage.text += piece;
+          if (!assistantMessageAdded) {
+            chatHistory.push(assistantMessage);
+            assistantMessageAdded = true;
+            renderChatHistory(); // first piece -- the DOM node doesn't exist yet
+          } else {
+            appendToLastChatMessage(piece); // later pieces -- avoid a full rebuild per token
+          }
+        }
+      }
+      if (!assistantMessageAdded) {
+        chatHistory.push({ role: "assistant", text: "(no output)" });
+      }
     }
   } catch (err) {
-    chatHistory.push({ role: "assistant", text: "Network error reaching the coordinator.", status: "error" });
+    if (!assistantMessageAdded) {
+      chatHistory.push({ role: "assistant", text: "Network error reaching the coordinator.", status: "error" });
+    }
     console.error("chat generate request failed", err);
   }
   setChatBusy(false);

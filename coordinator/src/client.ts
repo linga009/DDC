@@ -64,6 +64,49 @@ export class SwarmClient {
     return res.json();
   }
 
+  // Yields one generated text piece per SSE "data: ..." frame the
+  // coordinator relays, in order, as they arrive -- does not buffer the
+  // whole reply before the caller sees anything. Throws if the stream
+  // emits an "event: error" frame (with that frame's message), or if the
+  // initial request itself fails before any streaming could begin.
+  // A trailing "data: [DONE]\n\n" frame marks a successful stream's end --
+  // it is a terminal sentinel, not generated text, and is never yielded.
+  async *generateStream(prompt: string, modelId: string, n_predict?: number, signal?: AbortSignal): AsyncGenerator<string> {
+    const res = await this.postJson("/generate", { prompt, modelId, n_predict, stream: true }, signal);
+    if (!res.ok || !res.body) {
+      const detail = await res.text();
+      throw new Error(`generateStream failed: ${res.status} ${detail}`);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? ""; // the last element may be an incomplete frame -- keep it for the next read
+      for (const frame of frames) {
+        if (frame.startsWith("event: error")) {
+          const dataLine = frame.split("\n").find(line => line.startsWith("data: "));
+          const message = dataLine ? JSON.parse(dataLine.slice("data: ".length)).error : "generation failed mid-stream";
+          throw new Error(`generateStream failed mid-stream: ${message}`);
+        }
+        const dataLines = frame.split("\n").filter(line => line.startsWith("data: "));
+        if (dataLines.length === 0) {
+          continue;
+        }
+        const text = dataLines.map(line => line.slice("data: ".length)).join("\n");
+        if (text === "[DONE]") {
+          return; // terminal sentinel -- stream is complete, not literal generated text
+        }
+        yield text;
+      }
+    }
+  }
+
   async heartbeat(nodeId: string, signal?: AbortSignal): Promise<boolean> {
     const res = await fetch(`${this.baseUrl}/nodes/${nodeId}/heartbeat`, { method: "POST", headers: this.authHeaders(), signal });
     await this.throwIfUnauthorized(res, "heartbeat");

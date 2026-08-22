@@ -261,3 +261,109 @@ test("SwarmClient.generate returns the generated text from a matching stub node"
     stub.server.close();
   }
 });
+
+test("generateStream yields each SSE chunk's text in order", async () => {
+  const server = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: Paris\n\n");
+    res.write("data:  is\n\n");
+    res.write("data:  nice\n\n");
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected test server to bind a port");
+  }
+  const client = new SwarmClient(`http://127.0.0.1:${address.port}`, "test-token");
+  try {
+    const pieces: string[] = [];
+    for await (const piece of client.generateStream("hi", "tinyllama-1.1b")) {
+      pieces.push(piece);
+    }
+    assert.deepEqual(pieces, ["Paris", " is", " nice"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("generateStream does not yield the [DONE] terminal sentinel as a piece", async () => {
+  const server = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected test server to bind a port");
+  }
+  const client = new SwarmClient(`http://127.0.0.1:${address.port}`, "test-token");
+  try {
+    const pieces: string[] = [];
+    for await (const piece of client.generateStream("hi", "tinyllama-1.1b")) {
+      pieces.push(piece);
+    }
+    assert.deepEqual(pieces, []);
+  } finally {
+    server.close();
+  }
+});
+
+test("generateStream throws when the stream emits an error frame", async () => {
+  const server = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: partial\n\n");
+    res.write('event: error\ndata: {"error":"node died"}\n\n');
+    res.end();
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected test server to bind a port");
+  }
+  const client = new SwarmClient(`http://127.0.0.1:${address.port}`, "test-token");
+  try {
+    const pieces: string[] = [];
+    await assert.rejects(
+      async () => {
+        for await (const piece of client.generateStream("hi", "tinyllama-1.1b")) {
+          pieces.push(piece);
+        }
+      },
+      /node died/,
+    );
+    assert.deepEqual(pieces, ["partial"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("generateStream reconstructs a multi-line chunk from multiple data: lines in one frame", async () => {
+  const server = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: line one\ndata: line two\n\n");
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected test server to bind a port");
+  }
+  const client = new SwarmClient(`http://127.0.0.1:${address.port}`, "test-token");
+  try {
+    const pieces: string[] = [];
+    for await (const piece of client.generateStream("hi", "tinyllama-1.1b")) {
+      pieces.push(piece);
+    }
+    assert.deepEqual(pieces, ["line one\nline two"]);
+  } finally {
+    server.close();
+  }
+});
