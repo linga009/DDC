@@ -214,6 +214,12 @@ async function sendChatMessage() {
             assistantMessage.status = "error";
             assistantMessage.text += assistantMessage.text ? ` [error: ${message}]` : `Error: ${message}`;
             renderChatHistory(); // status changed -- needs the CSS class updated too, not just text
+            // An error frame is itself a terminal frame -- "no [DONE]
+            // follows an error frame" is the documented wire contract, not
+            // a truncation. Without this, the sawDone-required check below
+            // would append a bogus "connection lost" suffix on top of the
+            // real error message on every mid-stream failure.
+            sawDone = true;
             continue;
           }
           const dataLines = frame.split("\n").filter(line => line.startsWith("data: "));

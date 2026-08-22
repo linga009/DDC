@@ -1935,6 +1935,50 @@ test("POST /generate with stream:true returns a clean 502 when the node ignores 
   }
 });
 
+test("POST /generate with stream:true relays a node's SSE response even with a mixed-case content-type header", async () => {
+  // Content-Type is case-insensitive per RFC 9110 8.3 -- a federated node
+  // running a different agent build could legally send "Text/Event-Stream"
+  // instead of this repo's own lowercase convention. The relay's own
+  // content-type check must not itself become a false-positive 502 for a
+  // node that is behaving correctly.
+  const server = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "Text/Event-Stream" });
+    res.write("data: hi\n\n");
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected mixed-case-content-type stub to bind a port");
+  }
+  const { server: coordServer, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        endpoint: `http://127.0.0.1:${address.port}`,
+        deviceTier: "desktop",
+        servesModel: "tinyllama-1.1b",
+      }),
+    });
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b", stream: true }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), "data: hi\n\ndata: [DONE]\n\n");
+  } finally {
+    coordServer.close();
+    server.close();
+  }
+});
+
 test("POST /generate without a stream field behaves exactly as before", async () => {
   const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "Paris." } }));
   const { server, baseUrl } = await startTestServer();

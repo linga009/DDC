@@ -515,7 +515,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
               sendJson(res, 502, { error: `node returned status ${nodeRes.status}` });
               return;
             }
-            const nodeContentType = nodeRes.headers.get("content-type") ?? "";
+            const nodeContentType = (nodeRes.headers.get("content-type") ?? "").toLowerCase();
             if (!nodeContentType.startsWith("text/event-stream")) {
               // A node that doesn't understand stream:true (e.g. a
               // pre-Phase-D agent build) answers 200 application/json
