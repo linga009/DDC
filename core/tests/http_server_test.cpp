@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -62,6 +63,40 @@ std::string sendRawRequest(int port, const std::string& rawRequest) {
     }
     closeTestSocket(s);
     return response;
+}
+
+// Like sendRawRequest, but preserves the boundary between separate recv()
+// arrivals instead of collapsing everything into one string -- needed to
+// prove tokens/chunks actually arrive incrementally rather than being
+// buffered and sent all at once, which read-to-EOF-into-one-string can't
+// distinguish.
+std::vector<std::string> sendRawRequestCapturingChunks(int port, const std::string& rawRequest) {
+#ifdef _WIN32
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif
+    socket_t s = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+
+    if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        closeTestSocket(s);
+        throw std::runtime_error("test client failed to connect");
+    }
+
+    send(s, rawRequest.data(), static_cast<int>(rawRequest.size()), 0);
+
+    std::vector<std::string> chunks;
+    char buf[4096];
+    for (;;) {
+        int n = recv(s, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        chunks.emplace_back(buf, static_cast<size_t>(n));
+    }
+    closeTestSocket(s);
+    return chunks;
 }
 
 class HttpServerFixture : public ::testing::Test {
@@ -239,6 +274,119 @@ TEST_F(HttpServerFixture, KeepsTheFirstOfTwoDuplicateHeaders) {
                    "Authorization: Bearer second\r\n\r\n");
 
     EXPECT_EQ(capturedAuth, "Bearer first");
+}
+
+TEST_F(HttpServerFixture, StreamingRouteSendsChunksAsSeparateArrivalsNotOneBufferedBlob) {
+    swarm::HttpServer server(kTestPort + 10);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("first");
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        writer.writeChunk("second");
+    });
+    startServer(server);
+
+    std::vector<std::string> chunks = sendRawRequestCapturingChunks(
+        kTestPort + 10, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    // The 150ms sleep between writeChunk calls means a client reading in a
+    // blocking loop should see at least the headers+"first" frame arrive
+    // separately from "second" -- a coalescing/buffering implementation
+    // would instead deliver everything in one final read.
+    ASSERT_GE(chunks.size(), 2u);
+    std::string assembled;
+    for (const auto& c : chunks) assembled += c;
+    EXPECT_NE(assembled.find("text/event-stream"), std::string::npos);
+    EXPECT_NE(assembled.find("data: first\n\n"), std::string::npos);
+    EXPECT_NE(assembled.find("data: second\n\n"), std::string::npos);
+}
+
+TEST_F(HttpServerFixture, StreamingRouteSplitsAMultiLineChunkIntoMultipleDataLinesInOneFrame) {
+    swarm::HttpServer server(kTestPort + 11);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("line one\nline two");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 11, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    // Per the SSE spec's own multi-line convention: multiple "data: " lines
+    // for one event, not a single line containing a raw newline (which
+    // would look like the frame's own terminator to a spec-compliant parser).
+    EXPECT_NE(response.find("data: line one\ndata: line two\n\n"), std::string::npos);
+}
+
+TEST_F(HttpServerFixture, StreamingRouteSendsAnErrorFrameWhenTheHandlerThrows) {
+    swarm::HttpServer server(kTestPort + 12);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("partial");
+        throw std::runtime_error("boom");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 12, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("data: partial\n\n"), std::string::npos);
+    EXPECT_NE(response.find("event: error"), std::string::npos);
+    EXPECT_NE(response.find(R"("error":"boom")"), std::string::npos);
+}
+
+TEST_F(HttpServerFixture, StreamingRouteHandlerCanWriteANormalNonStreamingResponseInstead) {
+    swarm::HttpServer server(kTestPort + 13);
+    server.routeStreaming("POST", "/maybe-stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeJsonResponse(200, R"({"text":"not streamed"})");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 13, "POST /maybe-stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos);
+    EXPECT_NE(response.find("Content-Type: application/json"), std::string::npos);
+    EXPECT_NE(response.find(R"({"text":"not streamed"})"), std::string::npos);
+    EXPECT_EQ(response.find("text/event-stream"), std::string::npos);
+}
+
+TEST_F(HttpServerFixture, RegularRoutesStillWorkAlongsideAStreamingRoute) {
+    swarm::HttpServer server(kTestPort + 14);
+    server.route("GET", "/health", [](const swarm::HttpRequest&) {
+        return swarm::HttpResponse{200, R"({"status":"ready"})"};
+    });
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("x");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 14, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos);
+    EXPECT_NE(response.find(R"({"status":"ready"})"), std::string::npos);
+    EXPECT_EQ(response.find("text/event-stream"), std::string::npos);
+}
+
+// Pins the ACTUAL cross-table precedence rule, because it is not the
+// "first registration wins" one might assume: run() scans streamingRoutes_
+// before routes_, so registering the same (method, path) via route() FIRST
+// and routeStreaming() second still dispatches to the streaming handler.
+// Neither registration call rejects or overrides the other -- the loser is
+// simply unreachable. This test exists so the header comment documenting
+// that rule is backed by observed behavior rather than assumption.
+TEST_F(HttpServerFixture, AStreamingRouteTakesPrecedenceOverASameKeyRegularRouteRegisteredFirst) {
+    swarm::HttpServer server(kTestPort + 15);
+    bool regularHandlerRan = false;
+    server.route("POST", "/both", [&regularHandlerRan](const swarm::HttpRequest&) {
+        regularHandlerRan = true;
+        return swarm::HttpResponse{200, R"({"from":"regular"})"};
+    });
+    server.routeStreaming("POST", "/both", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("from streaming");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 15, "POST /both HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("text/event-stream"), std::string::npos);
+    EXPECT_NE(response.find("data: from streaming\n\n"), std::string::npos);
+    EXPECT_EQ(response.find(R"({"from":"regular"})"), std::string::npos);
+    EXPECT_FALSE(regularHandlerRan);
 }
 
 }  // namespace

@@ -1,4 +1,5 @@
 #include "swarm/http_server.h"
+#include "swarm/json_utils.h"
 
 #include <cctype>
 #include <csignal>
@@ -226,10 +227,100 @@ void writeResponse(socket_t s, const HttpResponse& response) {
 
 }  // namespace
 
+void ResponseWriter::ensureSseHeadersSent() {
+    if (sseHeadersSent_ || jsonResponseSent_) {
+        // jsonResponseSent_: a complete response was already sent on this
+        // connection -- writing SSE headers now would corrupt the wire by
+        // appending a second response after one that already declared its
+        // own Content-Length and closed. Silently no-op rather than throw:
+        // the only caller of this path (HttpServer::run()'s catch block,
+        // if a handler throws after already calling writeJsonResponse) has
+        // no safe recovery action available either way.
+        return;
+    }
+    socket_t s = static_cast<socket_t>(socketHandle_);
+    static const char kSseHeaders[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    size_t len = sizeof(kSseHeaders) - 1;  // exclude the trailing '\0'
+    size_t sentTotal = 0;
+    while (sentTotal < len) {
+        long long n = sendBytes(s, kSseHeaders + sentTotal, len - sentTotal);
+        if (n <= 0) {
+            throw std::runtime_error("failed to write SSE headers: peer gone");
+        }
+        sentTotal += static_cast<size_t>(n);
+    }
+    sseHeadersSent_ = true;
+}
+
+ResponseWriter::ResponseWriter(intptr_t socketHandle) : socketHandle_(socketHandle) {}
+
+void ResponseWriter::writeJsonResponse(int status, const std::string& body) {
+    if (sseHeadersSent_ || jsonResponseSent_) {
+        return;  // already committed to a response -- see ensureSseHeadersSent's comment
+    }
+    writeResponse(static_cast<socket_t>(socketHandle_), HttpResponse{status, body});
+    jsonResponseSent_ = true;
+}
+
+void ResponseWriter::writeChunk(const std::string& text) {
+    ensureSseHeadersSent();
+    if (jsonResponseSent_) {
+        return;  // a normal response already went out -- see ensureSseHeadersSent's comment
+    }
+    socket_t s = static_cast<socket_t>(socketHandle_);
+    std::ostringstream out;
+    size_t start = 0;
+    for (;;) {
+        size_t nl = text.find('\n', start);
+        std::string line = (nl == std::string::npos) ? text.substr(start) : text.substr(start, nl - start);
+        out << "data: " << line << "\n";
+        if (nl == std::string::npos) {
+            break;
+        }
+        start = nl + 1;
+    }
+    out << "\n";
+    std::string frame = out.str();
+    size_t sentTotal = 0;
+    while (sentTotal < frame.size()) {
+        long long n = sendBytes(s, frame.data() + sentTotal, frame.size() - sentTotal);
+        if (n <= 0) {
+            throw std::runtime_error("failed to write SSE chunk: peer gone");
+        }
+        sentTotal += static_cast<size_t>(n);
+    }
+}
+
+void ResponseWriter::writeError(const std::string& message) {
+    ensureSseHeadersSent();
+    if (jsonResponseSent_) {
+        return;  // a normal response already went out -- see ensureSseHeadersSent's comment
+    }
+    socket_t s = static_cast<socket_t>(socketHandle_);
+    std::string frame = "event: error\ndata: {\"error\":\"" + jsonEscapeString(message) + "\"}\n\n";
+    size_t sentTotal = 0;
+    while (sentTotal < frame.size()) {
+        long long n = sendBytes(s, frame.data() + sentTotal, frame.size() - sentTotal);
+        if (n <= 0) {
+            throw std::runtime_error("failed to write SSE error: peer gone");
+        }
+        sentTotal += static_cast<size_t>(n);
+    }
+}
+
 HttpServer::HttpServer(int port) : port_(port) {}
 
 void HttpServer::route(const std::string& method, const std::string& path, HttpHandler handler) {
     routes_.emplace_back(method, path, std::move(handler));
+}
+
+void HttpServer::routeStreaming(const std::string& method, const std::string& path, StreamingHttpHandler handler) {
+    streamingRoutes_.emplace_back(method, path, std::move(handler));
 }
 
 void HttpServer::run() {
@@ -286,14 +377,34 @@ void HttpServer::run() {
 
             HttpRequest request{parsed.method, parsed.path, body, parsed.headers};
 
-            HttpResponse response{404, ""};
-            for (const auto& routeEntry : routes_) {
+            bool matchedStreaming = false;
+            for (const auto& routeEntry : streamingRoutes_) {
                 if (std::get<0>(routeEntry) == parsed.method && std::get<1>(routeEntry) == parsed.path) {
-                    response = std::get<2>(routeEntry)(request);
+                    matchedStreaming = true;
+                    ResponseWriter writer(static_cast<intptr_t>(client));
+                    try {
+                        std::get<2>(routeEntry)(request, writer);
+                    } catch (const std::exception& e) {
+                        try {
+                            writer.writeError(e.what());
+                        } catch (const std::exception&) {
+                            // peer already gone -- nothing more we can do
+                        }
+                    }
                     break;
                 }
             }
-            writeResponse(client, response);
+
+            if (!matchedStreaming) {
+                HttpResponse response{404, ""};
+                for (const auto& routeEntry : routes_) {
+                    if (std::get<0>(routeEntry) == parsed.method && std::get<1>(routeEntry) == parsed.path) {
+                        response = std::get<2>(routeEntry)(request);
+                        break;
+                    }
+                }
+                writeResponse(client, response);
+            }
         } catch (const std::exception&) {
             writeResponse(client, HttpResponse{400, R"({"error":"malformed request"})"});
         }

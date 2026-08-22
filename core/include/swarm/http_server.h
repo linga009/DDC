@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
@@ -24,21 +25,91 @@ struct HttpResponse {
 
 using HttpHandler = std::function<HttpResponse(const HttpRequest&)>;
 
+// Handed to a StreamingHttpHandler. Exactly one of writeJsonResponse() or
+// one-or-more calls to writeChunk()/writeError() may be made on a given
+// ResponseWriter -- whichever is called first commits this response to
+// being either a normal single JSON response or an SSE stream; any further
+// call (of either kind) after that is a silent no-op, since a response's
+// status line and headers can only be sent once. This lets one
+// streaming-registered route serve both a plain, unchanged non-streaming
+// response (when a handler determines, after inspecting the request, that
+// this particular call shouldn't actually stream) and a real SSE stream,
+// from the same registration -- HttpServer's routing is (method, path)
+// only, so a request body field can't be used to pick between two
+// DIFFERENT registered routes at dispatch time; it can only be inspected
+// by the one handler routing already selected.
+class ResponseWriter {
+public:
+    // Sends one complete, non-streaming HTTP response -- status line,
+    // Content-Type: application/json, Content-Length, Connection: close,
+    // then `body` -- byte-for-byte the same wire format the regular,
+    // non-streaming HttpHandler path produces for an equivalent
+    // HttpResponse{status, body}.
+    void writeJsonResponse(int status, const std::string& body);
+
+    // Sends SSE response headers on the first call to writeChunk() or
+    // writeError() on this ResponseWriter (a no-op on later calls), then
+    // one `data: <text>\n\n` frame. A `text` containing an embedded '\n'
+    // is sent as multiple consecutive `data: ` lines belonging to the same
+    // event, per the SSE spec's own multi-line convention -- otherwise the
+    // embedded newline would look like the frame's own terminator to a
+    // spec-compliant SSE parser. Throws std::runtime_error if the
+    // underlying send fails (peer gone).
+    void writeChunk(const std::string& text);
+
+    // Sends SSE response headers if not already sent, then one terminal
+    // `event: error\ndata: {"error":"<message>"}\n\n` frame -- the defined
+    // way to signal "generation failed" after a stream may have already
+    // delivered real content, which changing the HTTP status code cannot
+    // do once a 200 and its headers are already on the wire. Throws
+    // std::runtime_error if the underlying send fails.
+    void writeError(const std::string& message);
+
+private:
+    friend class HttpServer;
+    explicit ResponseWriter(intptr_t socketHandle);
+    void ensureSseHeadersSent();
+
+    intptr_t socketHandle_;
+    bool sseHeadersSent_ = false;
+    bool jsonResponseSent_ = false;
+};
+
+using StreamingHttpHandler = std::function<void(const HttpRequest&, ResponseWriter&)>;
+
 // Minimal, blocking, single-connection-at-a-time HTTP/1.1 server. Serves
-// only routes registered via route() -- exact (method, path) string match,
-// no wildcards, no query strings, no path parameters. Every response is
-// sent with Content-Type: application/json and the connection is closed
-// immediately after (no keep-alive). This exists to be one process's
-// small, fixed local API surface, not a general-purpose web server -- do
-// not extend it toward one.
+// only routes registered via route()/routeStreaming() -- exact (method,
+// path) string match, no wildcards, no query strings, no path parameters.
+// Every non-streaming response is sent with Content-Type: application/json
+// and the connection is closed immediately after (no keep-alive); a
+// streaming response holds the connection open for the duration of the
+// stream, then also closes (not persistent multi-request keep-alive,
+// just one long-lived single response). This exists to be one process's
+// small, fixed local API surface, not a general-purpose web server --
+// routeStreaming()/ResponseWriter is a deliberate, narrow exception to
+// that (Phase D: token streaming), not a step toward becoming one; do not
+// extend this further without a similarly specific reason.
 class HttpServer {
 public:
     explicit HttpServer(int port);
 
     // Registers a handler for an exact (method, path) pair. Must be called
-    // before run(). Later routes do not override earlier ones with the
-    // same (method, path) -- the first match wins.
+    // before run(). Registering the same (method, path) more than once is
+    // not rejected -- the losing registration is simply never reached.
+    // Within this table the first match wins. Across the two tables, it is
+    // NOT registration order that decides: run() scans the
+    // routeStreaming() table BEFORE this one, so a (method, path) present
+    // in both is always served by the streaming handler, even if the
+    // route() call came first.
     void route(const std::string& method, const std::string& path, HttpHandler handler);
+
+    // Registers a handler that decides, per request, whether to respond
+    // with one complete response (ResponseWriter::writeJsonResponse) or an
+    // SSE stream (writeChunk()/writeError()). Same first-match-wins rule
+    // within this table as route() has within its own; this table is the
+    // one run() consults first, so a (method, path) registered in both
+    // tables resolves here regardless of registration order.
+    void routeStreaming(const std::string& method, const std::string& path, StreamingHttpHandler handler);
 
     // Binds the port on 127.0.0.1 and blocks forever, accepting one
     // connection at a time and dispatching each request to its matching
@@ -52,6 +123,7 @@ public:
 private:
     int port_;
     std::vector<std::tuple<std::string, std::string, HttpHandler>> routes_;
+    std::vector<std::tuple<std::string, std::string, StreamingHttpHandler>> streamingRoutes_;
 };
 
 }  // namespace swarm
