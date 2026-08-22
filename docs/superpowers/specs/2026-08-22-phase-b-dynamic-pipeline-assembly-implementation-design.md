@@ -242,10 +242,21 @@ compute, confirmed still true. Add one more optional, self-reported field
 at registration: `availableMemoryMb?: number` — unverified, exactly like
 `deviceTier`/`localityGroup`/`servesModel` already are (this project's
 established, disclosed posture: self-reported fields answer "who may talk
-to the service", never "is what they claim true"). Used only to filter out
-candidates too small to be a plausible driver before scoring the rest —
-not a new trust mechanism, the same shape as every other capability
-already in the registry.
+to the service", never "is what they claim true").
+
+**Used as a soft preference, not a hard gate** — deliberately not "filter
+out nodes below a per-model memory requirement," since that would need a
+second new number (how much memory each catalog model actually needs) this
+design has no honest basis for: this project's own catalog entries span
+TinyLlama-1.1B through Mixtral-8x22B, and fabricating a threshold per
+model without real measurement data would be worse than not gating at all.
+Instead, among already-reputation-trusted candidates, a higher
+self-reported `availableMemoryMb` is preferred when picking a driver — a
+directionally-safe bias (more memory is never a worse bet) that needs no
+invented per-model number, not a correctness guarantee. A node reporting
+nothing sorts as if it reported `0`, the same fail-open posture
+`deviceTier` already has for "can we trust this claim at all" — it can
+still be picked, just not preferred over a node that reported more.
 
 ### 4. Node selection (`coordinator/src/pipeline_selector.ts`, new, pure function)
 
@@ -254,19 +265,17 @@ state, and a target model:
 
 1. `registry.listActive(reputation)` — the same existing choke point every
    other filtering mechanism in this project already reuses (registered in
-   `CLAUDE.md` as the established pattern since Plan 3).
-2. Filter to nodes reporting `availableMemoryMb` sufficient for the model
-   (a node reporting nothing is treated as unknown, not automatically
-   excluded — same fail-open posture `deviceTier` already has for the
-   analogous "can we trust this claim at all" question).
-3. Pick the highest-`ReputationTracker.score()` remaining candidate as
-   **driver** (reuses Security Hardening Phase 4's existing scoring method
-   verbatim, no new ranking logic).
-4. Pick `requiredNodeCount - 1` **compute contributors**: prefer candidates
+   `CLAUDE.md` as the established pattern since Plan 3). Already trust-filtered;
+   no separate capability-based exclusion step.
+2. Pick the driver: highest `ReputationTracker.score()` first (reuses
+   Security Hardening Phase 4's existing scoring method verbatim, no new
+   ranking logic), `availableMemoryMb` (absent treated as `0`) as the
+   tiebreak among equal scores.
+3. Pick `requiredNodeCount - 1` **compute contributors**: prefer candidates
    sharing the driver's `localityGroup` (via `registry.groupByLocality()`,
    already built in Plan 9 for exactly this purpose), then fall back to any
    remaining trusted candidate, again ranked by `score()`.
-5. Layer placement: for a model needing per-layer sharding, an even split
+4. Layer placement: for a model needing per-layer sharding, an even split
    across the chosen device count, in device order — this project's
    existing `--layer-placement` flag and `InferenceEngine`'s per-layer
    `tensor_buft_overrides` already support explicit per-layer assignment;
