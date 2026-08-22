@@ -161,18 +161,29 @@ int main(int argc, char** argv) {
         // handler could ever receive via server.run()'s dispatch loop) for
         // any unwind path out of this scope. In the normal case server.run()
         // below blocks forever and this scope is never unwound at all.
-        server.route("POST", "/complete", [&engine, &authToken](const swarm::HttpRequest& req) -> swarm::HttpResponse {
+        // Moved from route() to routeStreaming(): HttpServer's routing is
+        // (method, path) only, so a body field like "stream" can't select
+        // between two different registered routes at dispatch time --
+        // only this one handler, once selected, can inspect it. The
+        // non-streaming branch below calls writer.writeJsonResponse(),
+        // which produces byte-for-byte the same wire format this endpoint
+        // always has, so no existing caller (including every test that
+        // predates this change) sees any difference.
+        server.routeStreaming("POST", "/complete", [&engine, &authToken](const swarm::HttpRequest& req, swarm::ResponseWriter& writer) {
             if (!isAuthorized(req, authToken)) {
-                return swarm::HttpResponse{401, R"({"error":"missing or invalid Authorization header"})"};
+                writer.writeJsonResponse(401, R"({"error":"missing or invalid Authorization header"})");
+                return;
             }
             std::string prompt;
             if (!swarm::extractJsonString(req.body, "prompt", prompt)) {
-                return swarm::HttpResponse{400, R"({"error":"prompt must be a JSON string field"})"};
+                writer.writeJsonResponse(400, R"({"error":"prompt must be a JSON string field"})");
+                return;
             }
             int nPredict = 64;
             swarm::extractJsonInt(req.body, "n_predict", nPredict);  // optional -- keep default if absent/malformed
             if (nPredict <= 0) {
-                return swarm::HttpResponse{400, R"({"error":"n_predict must be a positive integer"})"};
+                writer.writeJsonResponse(400, R"({"error":"n_predict must be a positive integer"})");
+                return;
             }
             // Defense-in-depth cap at the agent level: this process is
             // independently network-reachable, and a large n_predict against
@@ -185,15 +196,40 @@ int main(int argc, char** argv) {
             // coordinator-side cap (Phase B) is a separate, independent
             // check -- this one does not depend on it existing.
             if (nPredict > 512) {
-                return swarm::HttpResponse{400, R"({"error":"n_predict must not exceed 512"})"};
+                writer.writeJsonResponse(400, R"({"error":"n_predict must not exceed 512"})");
+                return;
+            }
+            bool stream = false;
+            swarm::extractJsonBool(req.body, "stream", stream);  // optional -- false if absent/malformed
+
+            if (!stream) {
+                try {
+                    std::string text = engine->complete(prompt, nPredict);
+                    writer.writeJsonResponse(200, R"({"text":")" + swarm::jsonEscapeString(text) + R"("})");
+                } catch (const std::exception& e) {
+                    writer.writeJsonResponse(500, R"({"error":")" + swarm::jsonEscapeString(e.what()) + R"("})");
+                }
+                return;
             }
 
-            try {
-                std::string text = engine->complete(prompt, nPredict);
-                return swarm::HttpResponse{200, R"({"text":")" + swarm::jsonEscapeString(text) + R"("})"};
-            } catch (const std::exception& e) {
-                return swarm::HttpResponse{500, R"({"error":")" + swarm::jsonEscapeString(e.what()) + R"("})"};
-            }
+            // Streaming path: any exception completeStreaming() throws (a
+            // genuine C++ exception -- tokenization/decode/context-size
+            // failures) propagates out of this handler uncaught.
+            // HttpServer::run()'s dispatch loop catches it and turns it
+            // into a writer.writeError() SSE frame -- the "signal
+            // generation failed partway through" behavior this needs, in
+            // one place shared by every streaming handler rather than
+            // duplicated here. NOTE: this does NOT cover a remote-RPC node
+            // dying (GGML_ABORT) -- that is an uncatchable process abort,
+            // not a C++ exception; the whole swarm-node-agent process
+            // terminates before any response, streamed or not, could be
+            // sent. Same pre-existing, disclosed limitation as the
+            // non-streaming path already had (see CLAUDE.md's Phase A
+            // section) -- streaming does not fix or worsen it.
+            engine->completeStreaming(prompt, nPredict, [&writer](const std::string& piece) {
+                writer.writeChunk(piece);
+                return true;
+            });
         });
 
         server.run();  // blocks forever

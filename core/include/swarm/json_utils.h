@@ -30,6 +30,14 @@ bool extractJsonString(const std::string& body, const std::string& key, std::str
 // a top-level key with an integer value.
 bool extractJsonInt(const std::string& body, const std::string& key, int& out);
 
+// Extracts the boolean value of a genuinely top-level JSON key, e.g.
+// extractJsonBool(R"({"stream":true})", "stream", out) sets out = true and
+// returns true. "Top-level" has the same meaning as extractJsonString's
+// own definition -- see its comment. Returns false if `key` isn't present
+// as a top-level key with a literal `true` or `false` value (a quoted
+// "true"/"false" string, or 1/0, do not count).
+bool extractJsonBool(const std::string& body, const std::string& key, bool& out);
+
 // Escapes `s` for embedding as a JSON string value (without the
 // surrounding quotes) -- \", \\, \n, \r, \t, and control characters below
 // 0x20 as \u00XX.

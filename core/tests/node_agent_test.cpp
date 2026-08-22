@@ -303,6 +303,34 @@ TEST_F(NodeAgentFixture, CompleteEndpointReturnsRealGeneratedText) {
     EXPECT_GT(textEnd - textStart, 0u);
 }
 
+TEST_F(NodeAgentFixture, CompleteEndpointStreamsRealTokensAsSeparateSseFrames) {
+    std::string body = R"({"prompt":"The capital of France is","n_predict":8,"stream":true})";
+    std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos);
+    EXPECT_NE(response.find("Content-Type: text/event-stream"), std::string::npos);
+    // At least one real "data: " frame must have arrived -- the test model
+    // and n_predict=8 keep this fast, and shape (not exact tiny-model
+    // output) is what's asserted, matching this repo's existing convention.
+    EXPECT_NE(response.find("data: "), std::string::npos);
+}
+
+TEST_F(NodeAgentFixture, CompleteEndpointWithoutStreamFieldBehavesExactlyAsBefore) {
+    std::string body = R"({"prompt":"The capital of France is","n_predict":8})";
+    std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos);
+    EXPECT_NE(response.find("Content-Type: application/json"), std::string::npos);
+    EXPECT_NE(response.find("\"text\":\""), std::string::npos);
+    EXPECT_EQ(response.find("text/event-stream"), std::string::npos);
+}
+
 TEST_F(NodeAgentFixture, CompleteEndpointRejectsAMissingPromptWith400) {
     std::string body = R"({"n_predict":8})";
     std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +

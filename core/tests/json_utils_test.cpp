@@ -148,4 +148,31 @@ TEST(JsonUtilsTest, ReturnsFalseWhenTheValueIsAnArray) {
     EXPECT_FALSE(swarm::extractJsonString(R"({"prompt":["hello"],"n_predict":4})", "prompt", out));
 }
 
+TEST(JsonUtilsTest, ExtractsABooleanTrue) {
+    bool out = false;
+    ASSERT_TRUE(swarm::extractJsonBool(R"({"stream":true})", "stream", out));
+    EXPECT_TRUE(out);
+}
+
+TEST(JsonUtilsTest, ExtractsABooleanFalse) {
+    bool out = true;
+    ASSERT_TRUE(swarm::extractJsonBool(R"({"stream":false})", "stream", out));
+    EXPECT_FALSE(out);
+}
+
+TEST(JsonUtilsTest, ExtractJsonBoolReturnsFalseWhenTheKeyIsMissing) {
+    bool out = false;
+    EXPECT_FALSE(swarm::extractJsonBool(R"({"other":true})", "stream", out));
+}
+
+TEST(JsonUtilsTest, ExtractJsonBoolReturnsFalseForAStringValue) {
+    bool out = false;
+    EXPECT_FALSE(swarm::extractJsonBool(R"({"stream":"true"})", "stream", out));
+}
+
+TEST(JsonUtilsTest, ExtractJsonBoolReturnsFalseForANumericValue) {
+    bool out = false;
+    EXPECT_FALSE(swarm::extractJsonBool(R"({"stream":1})", "stream", out));
+}
+
 }  // namespace

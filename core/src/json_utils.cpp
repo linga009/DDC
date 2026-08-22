@@ -162,6 +162,26 @@ bool extractJsonInt(const std::string& body, const std::string& key, int& out) {
     return true;
 }
 
+bool extractJsonBool(const std::string& body, const std::string& key, bool& out) {
+    size_t colon = findTopLevelKeyColon(body, key);
+    if (colon == std::string::npos) {
+        return false;
+    }
+    size_t i = colon + 1;
+    while (i < body.size() && std::isspace(static_cast<unsigned char>(body[i]))) {
+        ++i;
+    }
+    if (body.compare(i, 4, "true") == 0) {
+        out = true;
+        return true;
+    }
+    if (body.compare(i, 5, "false") == 0) {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
 std::string jsonEscapeString(const std::string& s) {
     std::string out;
     out.reserve(s.size());
