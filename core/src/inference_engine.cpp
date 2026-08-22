@@ -152,7 +152,8 @@ InferenceEngine::~InferenceEngine() {
     }
 }
 
-std::string InferenceEngine::complete(const std::string& prompt, int n_predict) {
+void InferenceEngine::completeStreaming(const std::string& prompt, int n_predict,
+                                          const std::function<bool(const std::string&)>& onToken) {
     llama_memory_clear(llama_get_memory(ctx_), true);
 
     const llama_vocab* vocab = llama_model_get_vocab(model_);
@@ -175,18 +176,29 @@ std::string InferenceEngine::complete(const std::string& prompt, int n_predict) 
 
     llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
     llama_sampler* sampler = llama_sampler_chain_init(sampler_params);
+    // RAII wrapper: the original complete() called llama_sampler_free at two
+    // separate throw sites plus the normal-return path (three manual call
+    // sites for one resource). Turning this loop inside-out to invoke a
+    // caller-supplied callback per token adds new ways for control flow to
+    // leave this function (the callback itself throwing) that a fourth
+    // manual free call site would otherwise need to cover. A local RAII
+    // guard covers every exit path -- including ones this function's own
+    // code never explicitly anticipates -- for free.
+    struct SamplerGuard {
+        llama_sampler* sampler;
+        ~SamplerGuard() { llama_sampler_free(sampler); }
+    } guard{sampler};
+
     llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
 
     llama_batch batch = llama_batch_get_one(
         prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()));
 
-    std::string result;
     llama_token new_token;
     int n_generated = 0;
 
     while (n_generated < n_predict) {
         if (llama_decode(ctx_, batch) != 0) {
-            llama_sampler_free(sampler);
             throw std::runtime_error("llama_decode failed");
         }
 
@@ -198,16 +210,23 @@ std::string InferenceEngine::complete(const std::string& prompt, int n_predict) 
         char piece[128];
         int n = llama_token_to_piece(vocab, new_token, piece, sizeof(piece), 0, true);
         if (n < 0) {
-            llama_sampler_free(sampler);
             throw std::runtime_error("failed to convert token to text");
         }
-        result.append(piece, n);
+        if (!onToken(std::string(piece, n))) {
+            break;
+        }
 
         batch = llama_batch_get_one(&new_token, 1);
         n_generated += 1;
     }
+}
 
-    llama_sampler_free(sampler);
+std::string InferenceEngine::complete(const std::string& prompt, int n_predict) {
+    std::string result;
+    completeStreaming(prompt, n_predict, [&result](const std::string& piece) {
+        result.append(piece);
+        return true;
+    });
     return result;
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,20 @@ public:
     InferenceEngine& operator=(const InferenceEngine&) = delete;
 
     std::string complete(const std::string& prompt, int n_predict);
+
+    // Calls onToken(piece) once per generated token's text, in order, as
+    // each is produced -- identical tokenization, sampling, batching, and
+    // end-of-generation detection as complete() (which is now implemented
+    // as a thin wrapper around this). onToken returning false requests
+    // early stop, checked after each token (same effect as reaching
+    // n_predict or hitting the model's own end-of-generation token).
+    // Throws exactly what complete() would: failed tokenization, prompt
+    // too long for the context's batch size, a decode failure, or a
+    // token-to-text conversion failure -- before any callback has fired
+    // for a pre-generation failure, or after the last successful callback
+    // for a mid-generation one.
+    void completeStreaming(const std::string& prompt, int n_predict,
+                            const std::function<bool(const std::string&)>& onToken);
 
     // Speculative decoding: `draft` (a second, independent InferenceEngine)
     // proposes up to `lookahead` tokens at a time, which this engine (the

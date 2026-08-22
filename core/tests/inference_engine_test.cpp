@@ -329,3 +329,70 @@ TEST_F(RpcServerFixture, ExplicitRemotePlacementOverridesSpecificLayer) {
     std::regex overridden_layer_4(R"(blk\.4\.ffn_[a-z]+_exps\.weight [^\n]*overridden to)");
     EXPECT_FALSE(std::regex_search(captured_log, overridden_layer_4)) << captured_log;
 }
+
+TEST(InferenceEngine, CompleteStreamingInvokesCallbackAtLeastOnce) {
+    swarm::InferenceEngine engine(test_model_path());
+    int call_count = 0;
+
+    engine.completeStreaming("The capital of France is", 8, [&call_count](const std::string&) {
+        ++call_count;
+        return true;
+    });
+
+    EXPECT_GT(call_count, 0);
+    EXPECT_LE(call_count, 8);
+}
+
+TEST(InferenceEngine, CompleteStreamingConcatenationMatchesComplete) {
+    swarm::InferenceEngine engine(test_model_path());
+    std::string streamed;
+
+    engine.completeStreaming("The capital of France is", 8, [&streamed](const std::string& piece) {
+        streamed += piece;
+        return true;
+    });
+    std::string direct = engine.complete("The capital of France is", 8);
+
+    // Relies on the same per-engine determinism RepeatedCompleteCallsAreDeterministic
+    // above already proves (same prompt/n_predict on one engine instance
+    // yields identical output) -- reused here rather than re-derived, and
+    // avoids loading the model a second time.
+    EXPECT_EQ(streamed, direct);
+}
+
+TEST(InferenceEngine, CompleteStreamingStopsEarlyWhenCallbackReturnsFalse) {
+    swarm::InferenceEngine engine(test_model_path());
+    int call_count = 0;
+
+    engine.completeStreaming("The capital of France is", 8, [&call_count](const std::string&) {
+        ++call_count;
+        return call_count < 2;  // stop after the second token
+    });
+
+    EXPECT_EQ(call_count, 2);
+}
+
+TEST(InferenceEngine, CompleteStreamingThrowsOnPromptExceedingBatchSizeBeforeAnyCallback) {
+    swarm::InferenceEngine engine(test_model_path());
+    std::string long_prompt;
+    for (int i = 0; i < 3000; ++i) {
+        long_prompt += "hello ";
+    }
+    bool callback_invoked = false;
+
+    EXPECT_THROW(
+        engine.completeStreaming(long_prompt, 8, [&callback_invoked](const std::string&) {
+            callback_invoked = true;
+            return true;
+        }),
+        std::runtime_error);
+    EXPECT_FALSE(callback_invoked);
+}
+
+TEST(InferenceEngine, CompleteStillReturnsNonEmptyTextAfterBecomingAWrapper) {
+    swarm::InferenceEngine engine(test_model_path());
+
+    std::string result = engine.complete("The capital of France is", 8);
+
+    EXPECT_FALSE(result.empty());
+}
