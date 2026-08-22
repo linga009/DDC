@@ -1475,7 +1475,9 @@ git commit -m "swarm-node-agent's /complete honors an optional stream:true field
 
 **Interfaces:**
 - Consumes: Task 3's `/complete` `stream: true` behavior (tested here against a stub HTTP server that speaks the same SSE dialect, not the real C++ agent -- matching this project's existing coordinator-test convention; the real C++ agent is exercised at the whole-branch-review stage).
-- Produces: `/generate` accepts an optional top-level `"stream": true` field. Task 5 depends on the exact wire format this produces (raw passthrough of the node's own `data: .../event: error` SSE bytes).
+- Produces: `/generate` accepts an optional top-level `"stream": true` field. Task 5 depends on the exact wire format this produces (raw passthrough of the node's own `data: .../event: error/data: [DONE]` SSE bytes).
+
+**Note on the `[DONE]` terminal frame** (added during Tasks 2/3's own fix round, after this task was originally written): the real `swarm-node-agent`'s streaming `/complete` now always ends a successful stream with a literal `data: [DONE]\n\n` sentinel frame (matching the convention real OpenAI-compatible APIs use), via `ResponseWriter::writeDone()` -- this is what lets a client tell "generation finished" apart from "the connection just died." `/generate`'s relay code below needs **no change** for this -- it already does raw byte-for-byte passthrough of whatever the node sends, so `[DONE]` flows through automatically. Only the **test fixtures** below need to simulate it, so the tests exercise the real wire shape Task 5 will actually receive.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1485,8 +1487,11 @@ Add this streaming stub helper to `coordinator/tests/server.test.ts`, directly a
 // Like startStubNodeAgent, but for a POST /complete request with
 // stream: true -- responds with a real SSE stream, writing each of
 // `chunks` as its own "data: ...\n\n" frame with `delayMs` between writes,
-// so a caller relaying this incrementally (not buffering the whole thing)
-// can be told apart from one that isn't.
+// then a terminal "data: [DONE]\n\n" frame (matching the real
+// swarm-node-agent's ResponseWriter::writeDone() behavior), so a caller
+// relaying this incrementally (not buffering the whole thing) can be told
+// apart from one that isn't, and so tests exercise the real terminal-frame
+// wire shape Task 5 depends on.
 async function startStreamingStubNodeAgent(chunks: string[], delayMs = 20) {
   const server = createHttpServer(async (req, res) => {
     for await (const _chunk of req) { /* drain the request body */ }
@@ -1495,6 +1500,7 @@ async function startStreamingStubNodeAgent(chunks: string[], delayMs = 20) {
       res.write(`data: ${chunk}\n\n`);
       await new Promise(resolve => setTimeout(resolve, delayMs));
     }
+    res.write("data: [DONE]\n\n");
     res.end();
   });
   await new Promise<void>(resolve => server.listen(0, resolve));
@@ -1528,7 +1534,7 @@ test("POST /generate with stream:true relays SSE chunks from the node", async ()
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("content-type"), "text/event-stream");
     const text = await res.text();
-    assert.equal(text, "data: Paris\n\ndata:  is\n\ndata:  nice\n\n");
+    assert.equal(text, "data: Paris\n\ndata:  is\n\ndata:  nice\n\ndata: [DONE]\n\n");
   } finally {
     server.close();
     stub.server.close();
