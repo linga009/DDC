@@ -39,12 +39,13 @@ swarm of these engines instead of one.
 and Phase A of the request-routing initiative that follows them is done too
 — see [`CLAUDE.md`](CLAUDE.md)'s Plan Roadmap for exactly what's built
 versus what's still ahead. In short: the compute engine, a federated
-coordinator service, a browser client, and a working end-to-end
-request-routing path (`POST /generate`, routing a prompt through the safety
-gate to a real `swarm-node-agent` and back) all work and are tested. What's
-still missing is dynamic node selection instead of manual registration
-(Phase B), background pre-warming/autoscaling of warm pipelines (Phase C),
-and token streaming (Phase D). That's the natural next place to contribute.
+coordinator service, a browser client, a working end-to-end request-routing
+path (`POST /generate`, routing a prompt through the safety gate to a real
+`swarm-node-agent` and back), and real token streaming (`"stream": true`,
+Phase D) all work and are tested. What's still missing is dynamic node
+selection instead of manual registration (Phase B) and background
+pre-warming/autoscaling of warm pipelines (Phase C). That's the natural
+next place to contribute.
 
 ## Get involved
 
@@ -52,10 +53,10 @@ This is early, real infrastructure — not a finished product — and it's
 built in the open specifically so people can pick up a piece of it. Useful
 ways to help right now:
 
-- **Dynamic pipeline assembly, pre-warming, and streaming** — Phases B, C,
-  and D of the request-routing initiative (see above); manual, single-node,
-  non-streaming routing (Phase A) is done, but nothing dynamic,
-  demand-driven, or streamed exists yet. Every existing piece (capacity
+- **Dynamic pipeline assembly and pre-warming** — Phases B and C of the
+  request-routing initiative (see above); manual, single-node routing
+  (Phase A) and token streaming (Phase D) are both done, but nothing
+  dynamic or demand-driven exists yet. Every existing piece (capacity
   tracking, safety gate, reputation, locality) is groundwork waiting for
   this.
 - **Client apps** — this repo currently ships a browser dashboard only
@@ -422,18 +423,32 @@ Endpoints:
   also callable directly and independently of `/generate` below — it is
   not exclusively an internal implementation detail of routing.
 - `POST /generate` — submit `{ "prompt": string, "modelId": string,
-  "n_predict"?: number }`, get back `{ "text": string }`. Classifies the
+  "n_predict"?: number, "stream"?: boolean }`, get back `{ "text": string }`
+  (the default) or, with `"stream": true`, a real `text/event-stream`
+  response: one `data: <token>\n\n` frame per generated token, in order,
+  terminated by a `data: [DONE]\n\n` sentinel on success or an
+  `event: error\ndata: {"error":...}\n\n` frame on mid-stream failure (the
+  two are mutually exclusive — a stream never carries both). Classifies the
   prompt first (fails closed on an unsafe prompt or a classifier error,
-  same posture as `/classify`), finds an active node whose self-reported
-  `servesModel` matches `modelId`, forwards the request to that node's
-  `swarm-node-agent` `POST /complete` endpoint, and returns its generated
-  text. Returns `400` if the request is invalid or the prompt was
+  same posture as `/classify`, and gates identically whether or not
+  `stream` is set), finds an active node whose self-reported `servesModel`
+  matches `modelId`, forwards the request to that node's `swarm-node-agent`
+  `POST /complete` endpoint, and returns its generated text — streamed via
+  raw byte-for-byte SSE passthrough when `stream` is set, no decode/re-encode
+  in between. Returns `400` if the request is invalid or the prompt was
   classified unsafe, `503` if no active node currently serves the
-  requested model, `502` if the selected node is unreachable or returns a
-  malformed response. `n_predict` defaults to 64 and is capped at 512,
-  mirroring `swarm-node-agent`'s own cap. Single attempt only — no retry,
-  no fallback to a different node on failure, no streaming (the response
-  arrives complete or not at all). Combined with Security Hardening Phase
+  requested model, `502` if the selected node is unreachable, returns a
+  malformed response, or (with `stream: true`) answers with a content-type
+  other than `text/event-stream` (e.g. a node running a pre-Phase-D agent
+  build that doesn't understand the `stream` field). `n_predict` defaults
+  to 64 and is capped at 512, mirroring `swarm-node-agent`'s own cap.
+  Single attempt only — no retry, no fallback to a different node on
+  failure. A `stream: true` caller must check for `[DONE]` before treating
+  the reply as complete: the SSE response has no `Content-Length` (it is
+  connection-close-delimited), so a node process dying mid-generation and a
+  genuinely finished stream both read as a clean end-of-stream with no other
+  signal — `SwarmClient.generateStream()` and the dashboard both do this
+  check; a hand-rolled consumer must too. Combined with Security Hardening Phase
   4's random tie-break among equally-scored candidates (see below): if one
   of several tied nodes is dead, identical requests now succeed or 502
   *at random* from call to call, rather than the deterministic 100% 502 a
@@ -466,16 +481,17 @@ must also keep sending `POST /nodes/:nodeId/heartbeat` periodically (the
 same 30-second liveness timeout every other endpoint relies on) — once it
 ages out of the registry from a missed heartbeat, `/generate` stops finding
 it and returns `503` again, exactly as if it had never registered. This is
-still only Phase A of the request-routing initiative: node selection is
-reputation-ranked as of Security Hardening Phase 4 (see below) rather than
-a raw first-match scan, but is still not locality-aware or a general load
-balancer, there is no background pre-warming of pipelines ahead of demand,
-and there is no token streaming (a `/generate` call blocks until the full
-response is ready or the request fails). See
+still only Phase A (plus Phase D's streaming) of the request-routing
+initiative: node selection is reputation-ranked as of Security Hardening
+Phase 4 (see below) rather than a raw first-match scan, but is still not
+locality-aware or a general load balancer, and there is no background
+pre-warming of pipelines ahead of demand. See
 [`docs/superpowers/specs/2026-08-16-request-routing-design.md`](docs/superpowers/specs/2026-08-16-request-routing-design.md)
-for Phases B (dynamic, coordinator-driven pipeline assembly), C
-(pre-warming and demand-based autoscaling), and D (token streaming) — none
-of which are implemented yet.
+for Phases B (dynamic, coordinator-driven pipeline assembly) and C
+(pre-warming and demand-based autoscaling) — neither of which is
+implemented yet. Phase D (token streaming,
+[`docs/superpowers/plans/2026-08-22-phase-d-token-streaming.md`](docs/superpowers/plans/2026-08-22-phase-d-token-streaming.md))
+is done — see the `stream` field on `POST /generate` above.
 
 A node with zero recorded checks is trusted by default. Ejection (excluding
 the node from `GET /nodes`, `GET /capacity`, and `/catalog`'s active-node
@@ -712,10 +728,15 @@ For programmatic access to the coordinator, two things exist:
   call it makes will `401` (each operation documents that `401`). The doc
   itself stays reachable without a token, deliberately — that is how a
   developer discovers a token is required in the first place.
-- **`coordinator/src/client.ts`** — a minimal `SwarmClient` class, one typed
+- **`coordinator/src/client.ts`** — a minimal `SwarmClient` class that talks
+  to those routes directly (independent of the OpenAPI document): one typed
   method per JSON API endpoint listed above (the static dashboard routes
-  and `/openapi.json` itself are excluded), that talks to those routes
-  directly (independent of the OpenAPI document). It is plain TypeScript
+  and `/openapi.json` itself are excluded), plus one extra for `/generate`'s
+  streaming form — `generateStream()`, an `AsyncGenerator<string>` that
+  yields each generated text piece as it arrives, throwing if the stream
+  ends without its `[DONE]` sentinel (see the endpoint's own entry above for
+  why that check matters) or if it carries an `event: error` frame. It is
+  plain TypeScript
   with zero dependencies (only native `fetch`) and runs directly under
   Node.js's native TypeScript execution, no build step — developers can
   import it as-is or copy it as a starting point for their own client.
@@ -735,13 +756,13 @@ For programmatic access to the coordinator, two things exist:
   to that question and is raised instead of being flattened into the same
   `false`.
 
-**`POST /generate` (and `SwarmClient.generate()`) is the one inference-request
-path that exists today** — both the OpenAPI document and `SwarmClient`
-describe/wrap it the same way as every other route. See the Coordinator
-service section above for what it requires (a running, registered
-`swarm-node-agent` with a matching `servesModel`) and what it still doesn't
-do (dynamic node selection, pre-warming, or streaming — Phases B–D of the
-request-routing design).
+**`POST /generate` (and `SwarmClient.generate()`/`generateStream()`) is the
+one inference-request path that exists today** — both the OpenAPI document
+and `SwarmClient` describe/wrap it the same way as every other route. See
+the Coordinator service section above for what it requires (a running,
+registered `swarm-node-agent` with a matching `servesModel`) and what it
+still doesn't do (dynamic node selection or pre-warming — Phases B and C of
+the request-routing design; token streaming, Phase D, is done).
 
 ## Web client
 
@@ -755,28 +776,33 @@ list above). It shows:
   `GET /capacity`) and the model catalog with each entry's minimum
   active-node threshold and current availability (from `GET /catalog`),
   polled every 5 seconds.
-- **A chat panel that runs real inference.** Pick a model, type a message,
-  and it calls the real `POST /generate` endpoint (see the Coordinator
-  service section above) and shows the generated reply — this is genuine
-  inference, produced by a real `swarm-node-agent`, not a demo. The backend
-  has no chat-template or session-memory support of its own (`POST
-  /generate` is a single stateless completion call every time), so the
-  page fakes multi-turn "memory" itself: each new message resends the last
-  6 messages of the conversation as a plain `User: …\nAssistant: …`
-  transcript ahead of the new one. This means a long conversation
-  gradually "forgets" its earliest turns once they age out of that window
-  — silently, with no warning in the UI — and reply quality depends
-  entirely on how well the selected model continues a plain-text
-  transcript, since no model-specific chat formatting exists anywhere in
-  this codebase. The model picker locks for the duration of a conversation
-  (switching models mid-conversation with concatenated history sent to a
-  different model doesn't make sense) and unlocks on "New chat," which
-  also clears history. Every message is safety-checked exactly like
-  `/classify` before it's ever sent to a node — a blocked message renders
-  as a distinct notice and never reaches `/generate`'s node-selection step
-  at all. No streaming (Phase D isn't built — a reply arrives whole, which
-  can take up to two minutes) and no persistence across a page reload
-  (conversation state lives only in the page's memory).
+- **A chat panel that runs real inference, with real token streaming.** Pick
+  a model, type a message, and it calls `POST /generate` with `"stream":
+  true` (see the Coordinator service section above) and renders the reply
+  progressively, token by token, as it arrives — this is genuine streamed
+  inference, produced by a real `swarm-node-agent`, not a demo and not a
+  fake single-chunk simulation. The backend has no chat-template or
+  session-memory support of its own (`POST /generate` is a single
+  stateless completion call every time), so the page fakes multi-turn
+  "memory" itself: each new message resends the last 6 messages of the
+  conversation as a plain `User: …\nAssistant: …` transcript ahead of the
+  new one. This means a long conversation gradually "forgets" its earliest
+  turns once they age out of that window — silently, with no warning in
+  the UI — and reply quality depends entirely on how well the selected
+  model continues a plain-text transcript, since no model-specific chat
+  formatting exists anywhere in this codebase. The model picker locks for
+  the duration of a conversation (switching models mid-conversation with
+  concatenated history sent to a different model doesn't make sense) and
+  unlocks on "New chat," which also clears history. Every message is
+  safety-checked exactly like `/classify` before it's ever sent to a node
+  — a blocked message renders as a distinct notice and never reaches
+  `/generate`'s node-selection step at all. If the connection is lost
+  mid-reply (the node process dies, or the request exceeds the
+  120-second server-side timeout) the partial reply is flagged as
+  truncated rather than silently presented as complete — the dashboard
+  requires the stream's `[DONE]` terminator, exactly like `SwarmClient`
+  does. No persistence across a page reload (conversation state lives
+  only in the page's memory).
 - **A `/classify` demo**, separate from the chat panel — a text box and
   button that submit a prompt to `POST /classify` directly and display the
   resulting `safe`/`categories` verdict without spending an inference
