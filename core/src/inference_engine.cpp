@@ -153,7 +153,10 @@ InferenceEngine::~InferenceEngine() {
 }
 
 void InferenceEngine::completeStreaming(const std::string& prompt, int n_predict,
-                                          const std::function<bool(const std::string&)>& onToken) {
+                                          const std::function<bool(const std::string&)>& onToken,
+                                          int* out_prompt_tokens,
+                                          int* out_completion_tokens,
+                                          bool* out_reached_token_limit) {
     llama_memory_clear(llama_get_memory(ctx_), true);
 
     const llama_vocab* vocab = llama_model_get_vocab(model_);
@@ -219,6 +222,10 @@ void InferenceEngine::completeStreaming(const std::string& prompt, int n_predict
         batch = llama_batch_get_one(&new_token, 1);
         n_generated += 1;
     }
+
+    if (out_prompt_tokens) *out_prompt_tokens = n_prompt_tokens;
+    if (out_completion_tokens) *out_completion_tokens = n_generated;
+    if (out_reached_token_limit) *out_reached_token_limit = (n_generated >= n_predict);
 }
 
 std::string InferenceEngine::complete(const std::string& prompt, int n_predict) {

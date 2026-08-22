@@ -71,8 +71,29 @@ public:
     // token-to-text conversion failure -- before any callback has fired
     // for a pre-generation failure, or after the last successful callback
     // for a mid-generation one.
+    //
+    // The three trailing parameters are optional (default nullptr) and, if
+    // non-null, are written once, right before this function returns
+    // normally -- never on an exception path, matching the throws-before-
+    // any-callback / throws-after-the-last-successful-callback contract
+    // above exactly (a caller that gets an exception never sees stale or
+    // zero-initialized data presented as real). All three already exist as
+    // internal local variables in this function's implementation; exposing
+    // them costs nothing:
+    //   out_prompt_tokens: the real tokenizer-computed prompt length.
+    //   out_completion_tokens: the number of tokens actually generated
+    //     (equal to the number of onToken calls that returned true).
+    //   out_reached_token_limit: true if and only if generation stopped
+    //     because n_predict was reached, as opposed to the model's own
+    //     end-of-generation token firing or onToken returning false --
+    //     equivalent to comparing *out_completion_tokens against n_predict
+    //     after the call, exposed directly so a caller doesn't have to
+    //     also request out_completion_tokens just to compute it.
     void completeStreaming(const std::string& prompt, int n_predict,
-                            const std::function<bool(const std::string&)>& onToken);
+                            const std::function<bool(const std::string&)>& onToken,
+                            int* out_prompt_tokens = nullptr,
+                            int* out_completion_tokens = nullptr,
+                            bool* out_reached_token_limit = nullptr);
 
     // Speculative decoding: `draft` (a second, independent InferenceEngine)
     // proposes up to `lookahead` tokens at a time, which this engine (the

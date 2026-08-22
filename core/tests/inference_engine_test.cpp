@@ -396,3 +396,58 @@ TEST(InferenceEngine, CompleteStillReturnsNonEmptyTextAfterBecomingAWrapper) {
 
     EXPECT_FALSE(result.empty());
 }
+
+TEST(InferenceEngine, CompleteStreamingReportsRealPromptTokenCount) {
+    swarm::InferenceEngine engine(test_model_path());
+    int promptTokens = 0;
+    engine.completeStreaming("The capital of France is", 5, [](const std::string&) { return true; },
+                              &promptTokens, nullptr, nullptr);
+    EXPECT_GT(promptTokens, 0);
+    // A short handful-of-words prompt tokenizes to more than 1 token (BOS +
+    // subwords) but nowhere near, say, 50 -- a loose sanity bound, not an
+    // exact hardcoded tokenizer-internal count (which would be brittle
+    // across model files).
+    EXPECT_LT(promptTokens, 50);
+}
+
+TEST(InferenceEngine, CompleteStreamingReportsSameCompletionTokenCountAsCallbackInvocations) {
+    swarm::InferenceEngine engine(test_model_path());
+    int callbackCount = 0;
+    int completionTokens = -1;
+    engine.completeStreaming("The capital of France is", 5, [&callbackCount](const std::string&) {
+        callbackCount += 1;
+        return true;
+    }, nullptr, &completionTokens, nullptr);
+    EXPECT_EQ(completionTokens, callbackCount);
+}
+
+TEST(InferenceEngine, CompleteStreamingReachedTokenLimitMatchesCompletionTokensReachingNPredict) {
+    swarm::InferenceEngine engine(test_model_path());
+    const int n_predict = 3;
+    bool reachedLimit = false;
+    int completionTokens = -1;
+    // Checks the CONTRACT (reachedLimit is true exactly when completionTokens
+    // reached n_predict), not a specific model behavior -- this holds
+    // regardless of whether this particular prompt/model combination
+    // actually hits the cap or emits its own end-of-generation token first.
+    engine.completeStreaming("Once upon a time, in a kingdom far away, there lived a dragon named", n_predict,
+                              [](const std::string&) { return true; }, nullptr, &completionTokens, &reachedLimit);
+    EXPECT_EQ(reachedLimit, completionTokens >= n_predict);
+}
+
+TEST(InferenceEngine, CompleteStreamingReachedTokenLimitIsFalseWhenGenerationStopsBeforeNPredict) {
+    swarm::InferenceEngine engine(test_model_path());
+    bool reachedLimit = true;  // pre-set to the wrong value, so a false assertion below proves it was actually written
+    int completionTokens = -1;
+    // onToken returns false on its very first call, forcing an early stop
+    // (unless the model's own end-of-generation token fires even earlier,
+    // in which case onToken is never called at all) -- either way,
+    // completionTokens must be 0 (the break in both cases happens BEFORE
+    // n_generated is incremented) and reachedLimit must be false, since
+    // n_predict=400 was never reached.
+    engine.completeStreaming("Once upon a time, in a kingdom far away, there lived a dragon named", 400,
+                              [](const std::string&) { return false; },
+                              nullptr, &completionTokens, &reachedLimit);
+    EXPECT_EQ(completionTokens, 0);
+    EXPECT_FALSE(reachedLimit);
+}
