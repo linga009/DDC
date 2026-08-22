@@ -2422,7 +2422,7 @@ test("POST /v1/chat/completions with stream:true omits the trailing usage chunk 
     capturedNodeRequest = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write("data: Par\n\n");
-    res.write('event: usage\ndata: {"prompt_tokens":7,"completion_tokens":1,"finish_reason":"stop"}\n\n');
+    res.write('event: usage\ndata: {"prompt_tokens":7,"completion_tokens":1,"finish_reason":"length"}\n\n');
     res.write("data: [DONE]\n\n");
     res.end();
   });
@@ -2464,7 +2464,10 @@ test("POST /v1/chat/completions with stream:true omits the trailing usage chunk 
     for (const chunk of chunks) {
       assert.equal(chunk.usage, undefined);
     }
-    assert.equal(chunks[2].choices[0].finish_reason, "stop", "finish_reason must come from the node's real usage frame, not a hardcoded default");
+    // The stub's usage frame says "length" -- the code's own hardcoded
+    // fallback is "stop", so this can only pass if the real frame data was
+    // consumed, not defaulted.
+    assert.equal(chunks[2].choices[0].finish_reason, "length", "finish_reason must come from the node's real usage frame, not a hardcoded default");
   } finally {
     server.close();
     usageStub.close();

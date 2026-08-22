@@ -409,7 +409,7 @@ export const openApiDocument = {
                       },
                     },
                   },
-                  max_tokens: { type: "integer", minimum: 1, maximum: 512 },
+                  max_tokens: { type: "integer", minimum: 1, maximum: 512, nullable: true },
                   stream: { type: "boolean" },
                   stream_options: {
                     type: "object",

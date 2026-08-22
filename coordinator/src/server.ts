@@ -585,7 +585,8 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
       if (method === "GET" && parts[0] === "v1" && parts[1] === "models" && parts.length === 2) {
         // catalog.availability()'s per-entry `available` field is dropped
         // below (OpenAI's schema has no place for it -- this route lists
-        // every catalog entry regardless, see the comment on data), so the
+        // every catalog entry regardless, matching GET /catalog's own
+        // never-filter-out-under-capacity-models behavior), so the
         // count it's computed from doesn't matter -- calling
         // federatedActiveNodeCount() here would pay this route's callers
         // (typically a client's model picker, polled routinely) the full
