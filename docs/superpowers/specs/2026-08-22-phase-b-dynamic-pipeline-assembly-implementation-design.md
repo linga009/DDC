@@ -149,11 +149,26 @@ pattern in `core/`):
 ```
 POST /pipeline
 { "model": "mixtral-8x7b", "remoteEndpoints": "127.0.0.1:50060,127.0.0.1:50061",
-  "layerPlacements": "0:127.0.0.1:50060,16:127.0.0.1:50061", "agentPort": 8090 }
+  "layerPlacements": "0:127.0.0.1:50060,16:127.0.0.1:50061" }
 ```
 
-**Two things the original sketch's request shape left unresolved, both
+**Three things the original sketch's request shape left unresolved, all
 closed here rather than left for plan-time guesswork:**
+
+- **No `agentPort` in the request.** The original sketch had the
+  coordinator dictate the spawned agent's port per call — but the spawned
+  agent is *also* loopback-only (Architecture #2's `HttpServer` finding
+  applies to it too), so the coordinator can only ever reach it through
+  the same tunnel that reaches the launcher. A tunnel the operator sets up
+  once can only forward ports known in advance; a port chosen fresh by the
+  coordinator on each reassembly can't be pre-tunneled. Resolved the same
+  way as `--models-dir`: the launcher takes its own `--agent-port N` flag
+  at startup, fixed for that launcher's whole lifetime. The operator
+  tunnels exactly two known ports once (the launcher's own, and this
+  fixed agent port) and never has to redo that setup on reassembly. The
+  coordinator learns this port from the launcher's own registration
+  (Architecture #2b adds it to `LauncherInfo`), not from choosing one
+  itself.
 
 - **No JSON arrays.** `core/include/swarm/json_utils.h` is explicitly
   documented as a top-level-scalar-only extractor, deliberately *not* a
@@ -191,13 +206,15 @@ of the `swarm-node-agent` it just spawned, which requires that header like
 every other endpoint in this swarm.
 
 Kills any `swarm-node-agent` this launcher previously started (if
-reassembling), spawns a fresh one with those flags, polls its `/health`
-until `200`, responds `200 {"status":"ready"}` to the coordinator once
-confirmed ready (or a real error status/body if the model file is missing,
-the spawn fails, or the health-poll times out). The coordinator already
-knows which launcher URL it called and which `agentPort` it requested, so
-it can construct the new agent's own endpoint itself — the launcher's
-response doesn't need to echo it back. No new C++ HTTP surface needed
+reassembling), spawns a fresh one with `--port <its own fixed --agent-port>`
+plus those flags, polls its `/health` until `200`, responds
+`200 {"status":"ready"}` to the coordinator once confirmed ready (or a real
+error status/body if the model file is missing, the spawn fails, or the
+health-poll times out). The coordinator already knows which launcher URL it
+called and that launcher's registered `agentPort` (Architecture #2b), so it
+can construct the new agent's own endpoint itself — same host as the
+launcher URL it just called, that fixed port — without the launcher's
+response needing to echo anything back. No new C++ HTTP surface needed
 beyond this one route — reuses `HttpServer`/`ResponseWriter` from Phase
 D's own work, non-streaming only.
 
@@ -211,21 +228,25 @@ small registry, and the closest existing precedent is
 `coordinator/src/peer_registry.ts` (read fresh: `register(endpoint):
 peerId`, endpoint-match-refreshes-instead-of-duplicating, `heartbeat`,
 `listActive()`, 30s timeout) — a `LauncherRegistry` mirrors that shape
-exactly, with one addition: a launcher declares which models it's able to
+exactly, with two additions: a launcher declares which models it's able to
 serve as driver for (i.e., which are present under its own
 `--models-dir`), so pipeline assembly can find one that actually has the
-needed model instead of trying every registered launcher in turn:
+needed model instead of trying every registered launcher in turn; and it
+reports its own fixed `agentPort` (Architecture #2's `--agent-port`), so
+the coordinator can construct a freshly-assembled driver's endpoint without
+the launcher needing to echo it back on every `POST /pipeline` call:
 
 ```typescript
 export interface LauncherInfo {
   launcherId: string;
   endpoint: string;
   servesModels: string[];
+  agentPort: number;
 }
 ```
 
-New route `POST /launchers/register` (`{endpoint, servesModels}` →
-`{launcherId}`) and `POST /launchers/:launcherId/heartbeat`, both requiring
+New route `POST /launchers/register` (`{endpoint, servesModels, agentPort}`
+→ `{launcherId}`) and `POST /launchers/:launcherId/heartbeat`, both requiring
 the bearer token like every other coordinator route — this is coordinator
 API surface, governed by the existing swarm-wide auth model, entirely
 separate from the launcher's own localhost-only HTTP surface described
