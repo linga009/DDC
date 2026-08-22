@@ -202,6 +202,24 @@ a deliberate, acknowledged exception to that stated intent — worth saying
 so explicitly in the updated header comment, not silently working around
 it.
 
+**Post-implementation correction (found while writing the implementation
+plan, before any code was written):** the sketch below has `ResponseWriter`
+send SSE headers unconditionally in its constructor. That's wrong for
+`/complete`, which must keep responding with a *plain* JSON body when the
+caller doesn't ask to stream — and `HttpServer` routes purely on `(method,
+path)`, so a body field like `stream` can't be used to pick between two
+*different* registered routes at dispatch time; only the one handler
+routing already selected can inspect it. The actual plan makes
+`ResponseWriter` lazier: no header-sending in its constructor, plus a new
+`writeJsonResponse(status, body)` method that sends a normal, complete,
+non-streaming response byte-identical to today's `writeResponse()` output.
+SSE headers are sent lazily, on the first `writeChunk()`/`writeError()`
+call. Whichever of `writeJsonResponse()` or `writeChunk()`/`writeError()`
+is called first commits the response to that mode; the implementation
+plan's Task 2 has the corrected full API. This does not change anything
+else in this design — `/complete` and `/generate` still both gain the same
+optional `stream: true` field, described accurately below.
+
 New parallel handler type and registration method, alongside the existing
 `route()`/`HttpHandler` (both keep working exactly as today for every
 non-streaming route — including every route registered before this phase,
@@ -264,15 +282,21 @@ same safety properties as a single blocking send.
 Gains an optional `stream` boolean field on the existing request body
 (alongside the existing `prompt`/`n_predict`) rather than a new URL — one
 endpoint, mode-switched by a field, consistent with what the coordinator
-(and, later, the OpenAI-compat plan) will both want. When absent or
-`false`: registered via the existing `route()`, behavior byte-identical to
-today. When `true`: registered via the new `routeStreaming()`, calls
+(and, later, the OpenAI-compat plan) will both want. The whole `/complete`
+route moves to `routeStreaming()` (a single registration, not two — see
+the correction above), and the handler itself branches on the parsed
+`stream` field: `false`/absent calls `writer.writeJsonResponse(...)`,
+byte-identical to today's behavior; `true` calls
 `engine->completeStreaming(prompt, nPredict, onToken)` with a callback that
-calls `writer.writeChunk(piece)` per token; a thrown exception from
-`completeStreaming()` (including the known dead-remote-RPC-device
-`GGML_ABORT` case named in Phase A's disclosed limitations) is caught and
-turned into one `writer.writeError(...)` frame before the connection
-closes, rather than an uncaught exception or a silently dropped connection.
+calls `writer.writeChunk(piece)` per token. A genuine C++ exception thrown
+from `completeStreaming()` (tokenization/decode/context-size failures) is
+caught by `HttpServer::run()`'s dispatch loop and turned into one
+`writer.writeError(...)` frame. **Post-implementation correction:** this
+does *not* cover the known dead-remote-RPC-device `GGML_ABORT` case named
+in Phase A's disclosed limitations — that is an uncatchable process-level
+abort, not a C++ exception, so the whole `swarm-node-agent` process
+terminates before any response (streamed or not) could be sent. Streaming
+neither fixes nor worsens this pre-existing, already-disclosed limitation.
 
 ### 4. Coordinator `POST /generate` (`coordinator/src/server.ts`)
 
@@ -377,10 +401,18 @@ authenticated `fetch()` call, no new auth mechanism).
   frame reaches the caller.
 - Live-adversarial-probing whole-branch review (per this project's
   established, consistently bug-finding practice for exactly this kind of
-  change): a real node process killed mid-stream (the disclosed
-  `GGML_ABORT`-on-dead-remote-device case, now happening *after* a `200`
-  and partial content instead of before anything was sent), a client
-  aborting the fetch mid-stream (confirm the node/agent side doesn't hang
+  change): a real node **process** killed outright mid-stream (`taskkill`/
+  `kill -9` from outside, simulating any hard crash — confirm the
+  coordinator surfaces a clean failure to its own caller rather than
+  hanging, since this is a connection drop, not something `writeError` can
+  frame). **Post-implementation correction:** the disclosed
+  `GGML_ABORT`-on-dead-remote-device case specifically is a process abort,
+  not a catchable exception — do not probe expecting an `event: error`
+  frame from it; expect the same abrupt connection loss as any other
+  killed process, now possibly *after* a `200` and partial content instead
+  of before anything was sent, which is itself worth confirming the
+  coordinator handles cleanly. A client aborting the fetch mid-stream
+  (confirm the node/agent side doesn't hang
   or crash — even though cleanly stopping generation early is a Non-Goal,
   the connection teardown itself must not misbehave), and concurrent
   streaming requests against the still-single-threaded agent.
