@@ -41,11 +41,13 @@ and Phase A of the request-routing initiative that follows them is done too
 versus what's still ahead. In short: the compute engine, a federated
 coordinator service, a browser client, a working end-to-end request-routing
 path (`POST /generate`, routing a prompt through the safety gate to a real
-`swarm-node-agent` and back), and real token streaming (`"stream": true`,
-Phase D) all work and are tested. What's still missing is dynamic node
-selection instead of manual registration (Phase B) and background
-pre-warming/autoscaling of warm pipelines (Phase C). That's the natural
-next place to contribute.
+`swarm-node-agent` and back), real token streaming (`"stream": true`, Phase
+D), and an OpenAI-compatible `POST /v1/chat/completions` + `GET /v1/models`
+(so an unmodified OpenAI SDK, or any tool built against the real OpenAI API,
+can use this swarm as a drop-in model provider) all work and are tested.
+What's still missing is dynamic node selection instead of manual
+registration (Phase B) and background pre-warming/autoscaling of warm
+pipelines (Phase C). That's the natural next place to contribute.
 
 ## Get involved
 
@@ -466,6 +468,17 @@ Endpoints:
   client section below)
 - `GET /style.css` — serves the web dashboard's stylesheet (see Web client
   section below)
+- `POST /v1/chat/completions` — OpenAI-compatible chat completions. Submit
+  `{ "model": string, "messages": [{ "role": "system"|"user"|"assistant",
+  "content": string }], "stream"?: boolean, "max_tokens"?: number|null,
+  "stream_options"?: { "include_usage"?: boolean } }`, get back a real
+  OpenAI-shaped `chat.completion` object (or, with `stream: true`, a real
+  SSE stream of `chat.completion.chunk` objects) — see the paragraph below
+  for the full detail and known gaps.
+- `GET /v1/models` — the model catalog in OpenAI's `{ object: "list", data:
+  [{ id, object: "model", created, owned_by }] }` shape, so an
+  OpenAI-compatible client's model picker works against this swarm
+  unmodified. Requires auth, unlike real OpenAI's version of this endpoint.
 - `GET /openapi.json` — serves the hand-written OpenAPI 3.0 document
   describing the JSON API routes above (see Developer API section below)
 
@@ -492,6 +505,86 @@ for Phases B (dynamic, coordinator-driven pipeline assembly) and C
 implemented yet. Phase D (token streaming,
 [`docs/superpowers/plans/2026-08-22-phase-d-token-streaming.md`](docs/superpowers/plans/2026-08-22-phase-d-token-streaming.md))
 is done — see the `stream` field on `POST /generate` above.
+
+**`POST /v1/chat/completions` and `GET /v1/models` let an unmodified
+OpenAI-API-compatible client (the official Python/Node SDKs, `deepseek-harness`,
+Open WebUI, LangChain, etc.) use this swarm as a drop-in model provider,
+pointed at this coordinator via its `baseURL`.** Built on top of `/generate`'s
+existing pipeline — classify, reputation-rank, select a node, forward — not a
+parallel implementation of it, and with **real token counts, not
+estimates**: `prompt_tokens`/`completion_tokens` come from the C++ engine's
+own tokenizer and generation loop (`InferenceEngine::completeStreaming()`'s
+optional out-parameters), the same way `finish_reason` (`"stop"` when the
+model's own end-of-generation token fires, `"length"` when the token cap is
+hit) is real rather than hardcoded. `messages[]` is flattened into the same
+plain-text `"Role: content\n"` transcript convention the dashboard's own
+chat panel already uses (`system`/`user`/`assistant` labels, a trailing bare
+`Assistant:` prompting continuation) — this project has no chat-template
+support anywhere, so reply quality depends entirely on how well the selected
+model continues that transcript, exactly like the dashboard already
+discloses for itself. `max_tokens` maps 1:1 onto `/generate`'s own
+`n_predict` (same 1–512 range; an explicit `null`, which both official SDKs
+send for "unspecified", is treated the same as omitting it — only an
+`undefined`/absent field defaults quietly, per OpenAI's own convention).
+
+A `stream: true` request cannot use `/generate`'s raw-byte SSE passthrough,
+since the wire *shapes* genuinely differ (`/generate`'s internal frames
+carry raw token text; this endpoint's frames are JSON-wrapped
+`chat.completion.chunk` objects) — the coordinator parses the node's stream
+and re-emits its own. A `stream_options: { include_usage: true }` request
+(OpenAI's own convention) gets one extra trailing chunk with an empty
+`choices` array and a top-level `usage` object, just before `[DONE]`; the
+coordinator always asks the node for real usage data internally regardless
+of whether the caller requested it, so the streamed `finish_reason` is
+always real. **A truncated stream (the node process dies mid-generation, or
+the request exceeds the 120-second server-side timeout) is never reported
+as a false success**: the coordinator's SSE parser requires either a
+`[DONE]` sentinel or an `event: error` frame before treating the connection
+ending as legitimate, and throws otherwise — but the resulting response is
+still a well-formed, complete HTTP chunked-encoding body at the transport
+level, just one with no chunk ever carrying a non-`null` `finish_reason`.
+**Neither official OpenAI SDK raises an exception on a missing `[DONE]`** —
+their SSE decoders simply stop iterating when the body ends — so **a
+truncated reply looks, to unmodified SDK code, like a short-but-complete
+one unless the caller checks `finish_reason` on the last chunk it
+received.** This is a real, live-verified consequence of the design choice
+(synthesizing a fake `finish_reason: "stop"` chunk to paper over a
+truncation would be strictly worse — an outright lie about completion — so
+the tradeoff is disclosed here rather than "fixed"), not a bug.
+
+**Known, disclosed OpenAI-compatibility gaps** (accepted but not honored,
+or simply not implemented — an unmodified SDK will not error on most of
+these, it just won't get the behavior it asked for):
+- No sampling-parameter support at all — the engine is greedy-only
+  (`llama_sampler_init_greedy()`). `temperature`, `top_p`,
+  `presence_penalty`, etc. are accepted and silently have no effect.
+- No tool/function calling (`tools`, `tool_choice`, `function_call` are
+  accepted, never honored — no tool-call machinery exists anywhere in this
+  codebase) and no `n > 1` (always exactly one `choices[0]` entry).
+- `content` must be a plain string. The modern multi-part array shape
+  (`content: [{"type":"text","text":"..."}]`, used by several current
+  SDK/client versions) is rejected with `400`, not accepted-and-ignored.
+- Only `system`/`user`/`assistant` roles are accepted. OpenAI's newer
+  `developer` role (the current replacement for `system` in reasoning
+  models) is rejected with `400`, as is `tool` (no tool support to route
+  it to anyway).
+- `max_completion_tokens` (OpenAI's newer name for `max_tokens`) is not
+  recognized at all — silently ignored, falling back to the 64-token
+  default rather than honoring the caller's actual request.
+- `GET /v1/models/{id}` (`client.models.retrieve(id)`) is not implemented
+  — `404`.
+- A `401` (missing/invalid `SWARM_AUTH_TOKEN`) on this route returns the
+  same `{error: string}` shape every other endpoint in this service uses,
+  not this route's own `{error: {message, type, code}}` envelope — the
+  401 response is generated by shared, swarm-wide authentication code
+  (see the Authentication section below), so fixing this route-by-route
+  isn't a local decision.
+- No automatic reputation feedback from a completion's success/failure
+  (matching `/generate`'s own pre-existing, already-disclosed gap in this
+  area).
+- No conversation persistence of any kind — every request is independently
+  stateless, exactly like `/generate`; the caller resends full
+  `messages[]` every time.
 
 A node with zero recorded checks is trusted by default. Ejection (excluding
 the node from `GET /nodes`, `GET /capacity`, and `/catalog`'s active-node
