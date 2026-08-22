@@ -22,17 +22,23 @@ export interface SseFrame {
 // into SseFrame.data.
 //
 // Throws if the underlying stream ends WITHOUT ever seeing a [DONE]
-// sentinel or an "event: error" frame -- mirroring the exact safety check
-// client.ts's own generateStream() already has. The underlying HTTP
-// response has no Content-Length (it's SSE, connection-delimited), so a
-// node process dying mid-generation and a genuinely finished stream both
-// report `done: true` from the reader with no other signal; without this
-// check a truncated reply would be silently indistinguishable from a
-// successfully completed one. An "event: error" frame counts as a
-// legitimate terminal signal on its own -- core/src/http_server.cpp's
+// sentinel or an "event: error" frame -- the same truncation-detection
+// mechanism client.ts's own generateStream() already has (a sawDone flag,
+// throw if the reader reports done without it), applied here more
+// generally. The underlying HTTP response has no Content-Length (it's SSE,
+// connection-delimited), so a node process dying mid-generation and a
+// genuinely finished stream both report `done: true` from the reader with
+// no other signal; without this check a truncated reply would be silently
+// indistinguishable from a successfully completed one. An "event: error"
+// frame counts as a legitimate terminal signal on its own -- core/src/http_server.cpp's
 // ResponseWriter never sends [DONE] after an error frame (the two are
 // code-enforced as mutually exclusive on the wire) -- so a stream ending
-// right after one does NOT throw.
+// right after one does NOT throw. Note this differs from client.ts's OWN
+// error-frame handling, which throws immediately on "event: error" rather
+// than yielding it: this function is a lower-level, event-agnostic parser
+// (see the class-level comment above) that leaves the decision of what to
+// do with an error frame to its caller, rather than making that decision
+// unilaterally the way the outward-facing SDK does.
 export async function* readSseFrames(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<SseFrame> {
   const decoder = new TextDecoder();
   let buffer = "";
