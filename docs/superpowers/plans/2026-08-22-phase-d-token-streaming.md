@@ -257,6 +257,12 @@ void InferenceEngine::completeStreaming(const std::string& prompt, int n_predict
         llama_sampler* sampler;
         ~SamplerGuard() { llama_sampler_free(sampler); }
     } guard{sampler};
+    // MUST NOT be dropped when transcribing this: llama_sampler_sample()
+    // below asserts on an empty chain (GGML_ASSERT in llama-sampler.cpp --
+    // an uncatchable process abort, not a throwable exception) if this line
+    // is missing. Caught by Task 1's own implementer against a real build;
+    // restored here so the plan text itself is correct, not just the diff.
+    llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
 
     llama_batch batch = llama_batch_get_one(
         prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()));
