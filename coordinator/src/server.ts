@@ -598,12 +598,20 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         let body: unknown;
         try {
           body = await readJsonBody(req);
-        } catch {
+        } catch (err) {
           // A malformed body would otherwise fall through to the shared
           // outer catch below, which answers {error: string} -- breaking
           // this route's own documented "always OpenAI's {error: {message,
           // type, code}} envelope" contract in openapi.ts. Guarded locally
-          // so every 400 this route can produce keeps the same shape.
+          // so every 400 this route can produce keeps the same shape. Only
+          // a genuine parse failure is a 400 here -- rethrow anything else
+          // (e.g. the request stream itself erroring, a client disconnect
+          // mid-upload) so it still reaches the outer handler's generic 500,
+          // matching every other route's readJsonBody() call site instead of
+          // mislabeling a connection failure as "malformed JSON".
+          if (!(err instanceof JsonParseError)) {
+            throw err;
+          }
           sendJson(res, 400, { error: { message: "request body is not valid JSON", type: "invalid_request_error", code: null } });
           return;
         }
