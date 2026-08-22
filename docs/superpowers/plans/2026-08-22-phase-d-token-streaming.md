@@ -333,6 +333,7 @@ git commit -m "Add InferenceEngine::completeStreaming(); complete() becomes a th
 **Interfaces:**
 - Consumes: nothing from Task 1 (this task is independent of it; both feed into Task 3).
 - Produces: `class ResponseWriter` with `writeJsonResponse(int status, const std::string& body)`, `writeChunk(const std::string& text)`, `writeError(const std::string& message)`; `using StreamingHttpHandler = std::function<void(const HttpRequest&, ResponseWriter&)>`; `HttpServer::routeStreaming(const std::string& method, const std::string& path, StreamingHttpHandler handler)`. Task 3 depends on exactly these names/signatures.
+- `ResponseWriter` is **non-copyable** (copy constructor and copy assignment are `= delete`d). Task 3 and any later consumer must always take and pass it by reference — `[&writer]`, never `[writer]`, if a handler ever puts it in a lambda. This is enforced at compile time on purpose: the writer's `sseHeadersSent_`/`jsonResponseSent_` flags track what has already gone out on a socket it does not own, so a copy would silently diverge and re-emit SSE headers mid-stream instead of erroring.
 
 **Design note carried over from this plan's own scoping**: `HttpServer` routes purely on `(method, path)` — a request body field like `stream: true` can't be used to pick between two *different* registered routes at dispatch time, only inspected by whichever single handler routing already selected. So `routeStreaming()` handlers decide, per request, whether to call `writeJsonResponse()` (a normal, complete, non-streaming response — used when the caller didn't ask to stream) or one-or-more `writeChunk()`/`writeError()` calls (an SSE stream). Exactly one of these is ever used per request; `ResponseWriter` enforces that the first call wins.
 
@@ -376,7 +377,7 @@ std::vector<std::string> sendRawRequestCapturingChunks(int port, const std::stri
 }
 ```
 
-Add `#include <vector>` to this file's includes if not already present (check the top of the file first — it already includes `<string>` and `<thread>` but may not include `<vector>` directly).
+Add `#include <vector>` and `#include <type_traits>` to this file's includes if not already present (check the top of the file first — it already includes `<string>` and `<thread>` but may not include these directly). `<type_traits>` is for the non-copyability test at the end of this listing.
 
 Then add these tests at the end of the file, before the closing `}  // namespace`:
 
@@ -418,6 +419,70 @@ TEST_F(HttpServerFixture, StreamingRouteSplitsAMultiLineChunkIntoMultipleDataLin
     // for one event, not a single line containing a raw newline (which
     // would look like the frame's own terminator to a spec-compliant parser).
     EXPECT_NE(response.find("data: line one\ndata: line two\n\n"), std::string::npos);
+}
+
+// The SSE spec defines a line as terminated by "\r\n", "\r", OR "\n" -- all
+// three, not just "\n". A bare '\r' (which a BPE vocabulary can genuinely
+// emit, and Phase D streams raw detokenized model output) left raw inside a
+// `data: ` line therefore does NOT reach an EventSource-compliant parser as
+// text: the parser ends the line at the '\r' and then reads "after" as a
+// malformed field name, silently discarding it. The word is lost from the
+// stream entirely, with no error anywhere. Splitting on '\r' exactly the way
+// '\n' is already split keeps both halves on the wire and readable.
+TEST_F(HttpServerFixture, StreamingRouteSplitsAChunkOnABareCarriageReturnToo) {
+    swarm::HttpServer server(kTestPort + 16);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("before\rafter");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 16, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("data: before\ndata: after\n\n"), std::string::npos);
+
+    // Belt and braces: no raw '\r' may survive anywhere inside the frame --
+    // a surviving one is precisely what truncates the event for a real
+    // parser. (Everything before the frame is the header block, whose own
+    // CRLFs are legitimate, so scan only from the frame's start.)
+    size_t frameStart = response.find("data: before");
+    ASSERT_NE(frameStart, std::string::npos);
+    EXPECT_EQ(response.find('\r', frameStart), std::string::npos);
+}
+
+// The other half of the same rule: "\r\n" is ONE line terminator, not two.
+// Splitting on '\r' and '\n' independently would emit a spurious empty
+// `data: ` line between the two words, which a compliant parser decodes as
+// an extra blank line in the event's text ("before\n\nafter") -- corrupting
+// the model's output rather than losing it.
+TEST_F(HttpServerFixture, StreamingRouteTreatsCrlfAsOneLineBreakNotTwo) {
+    swarm::HttpServer server(kTestPort + 17);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("before\r\nafter");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 17, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("data: before\ndata: after\n\n"), std::string::npos);
+    size_t frameStart = response.find("data: before");
+    ASSERT_NE(frameStart, std::string::npos);
+    EXPECT_EQ(response.find('\r', frameStart), std::string::npos);
+}
+
+// A ResponseWriter tracks, in its own members, whether SSE headers or a
+// complete JSON response have already gone out on its socket -- state that
+// is only correct if exactly one object owns it for the life of the
+// response. A copy carries a snapshot of those flags and then diverges: a
+// handler that captured the writer by value into a callback ([writer]
+// instead of the correct [&writer]) would mutate a throwaway whose
+// sseHeadersSent_/jsonResponseSent_ updates never propagate back, and the
+// real object would go on re-emitting SSE headers mid-stream -- silent wire
+// corruption with no exception and no failed send. Deleting the copy
+// operations turns that whole bug class into a compile error at the point
+// the bad capture is written.
+TEST(ResponseWriterTest, IsNotCopyable) {
+    EXPECT_FALSE(std::is_copy_constructible<swarm::ResponseWriter>::value);
+    EXPECT_FALSE(std::is_copy_assignable<swarm::ResponseWriter>::value);
 }
 
 TEST_F(HttpServerFixture, StreamingRouteSendsAnErrorFrameWhenTheHandlerThrows) {
@@ -500,6 +565,8 @@ TEST_F(HttpServerFixture, AStreamingRouteTakesPrecedenceOverASameKeyRegularRoute
 Run: `cmake --build build --target inference_engine_test`
 Expected: FAIL — `routeStreaming` is not a member of `HttpServer`, `ResponseWriter` is not declared.
 
+One test in the listing above is deliberately a *runtime* red, not a compile-time one: `ResponseWriterTest.IsNotCopyable` asserts on `std::is_copy_constructible`/`std::is_copy_assignable`, which compile fine either way and simply report `true` until the copy operations are deleted in Step 3. That's intentional — the alternative, a `static_assert`, would make the red state fail to build at all and so couldn't be observed as a clean red-then-green. Once `ResponseWriter` exists at all (end of Step 3), re-running this target should show that one test failing on its `EXPECT_FALSE`s rather than failing to compile.
+
 - [ ] **Step 3: Update the header**
 
 Replace the full contents of `core/include/swarm/http_server.h` with:
@@ -556,12 +623,18 @@ public:
 
     // Sends SSE response headers on the first call to writeChunk() or
     // writeError() on this ResponseWriter (a no-op on later calls), then
-    // one `data: <text>\n\n` frame. A `text` containing an embedded '\n'
-    // is sent as multiple consecutive `data: ` lines belonging to the same
-    // event, per the SSE spec's own multi-line convention -- otherwise the
-    // embedded newline would look like the frame's own terminator to a
-    // spec-compliant SSE parser. Throws std::runtime_error if the
-    // underlying send fails (peer gone).
+    // one `data: <text>\n\n` frame. A `text` containing an embedded line
+    // break is sent as multiple consecutive `data: ` lines belonging to the
+    // same event, per the SSE spec's own multi-line convention -- otherwise
+    // the embedded break would look like the frame's own terminator to a
+    // spec-compliant SSE parser. All three of the spec's line terminators
+    // count as a break here -- "\r\n", a bare "\r", and a bare "\n" -- with
+    // "\r\n" treated as one break rather than two. A bare '\r' matters as
+    // much as '\n' because a BPE vocabulary can emit one in real
+    // detokenized output, and a raw '\r' inside a `data: ` line silently
+    // truncates the event at a compliant parser: everything after it on
+    // that line is read as a malformed field name and discarded. Throws
+    // std::runtime_error if the underlying send fails (peer gone).
     void writeChunk(const std::string& text);
 
     // Sends SSE response headers if not already sent, then one terminal
@@ -570,7 +643,28 @@ public:
     // delivered real content, which changing the HTTP status code cannot
     // do once a 200 and its headers are already on the wire. Throws
     // std::runtime_error if the underlying send fails.
+    //
+    // Note this one needs NO line-break splitting of its own: the message
+    // goes through jsonEscapeString(), which already turns a '\r' into a
+    // literal backslash-r inside the JSON string, so it cannot put a raw
+    // '\r' on the wire the way writeChunk() could.
     void writeError(const std::string& message);
+
+    // Non-copyable, deliberately. The sseHeadersSent_/jsonResponseSent_
+    // flags below are only correct while exactly one object owns them for
+    // the life of the response: they record what has already gone out on a
+    // socket this object does not own and cannot re-open. A copy takes a
+    // snapshot and then diverges -- a handler capturing the writer by value
+    // into a callback ([writer] instead of the correct [&writer]) would
+    // mutate a throwaway whose flag updates never reach the real object,
+    // which would then re-emit SSE headers mid-stream: silent wire
+    // corruption, no exception, no failed send. Deleting these makes that
+    // whole bug class a compile error at the bad capture instead. run()
+    // constructs exactly one writer per streaming request in place and
+    // passes it only by reference (StreamingHttpHandler takes
+    // ResponseWriter&), so nothing in this codebase needs a copy.
+    ResponseWriter(const ResponseWriter&) = delete;
+    ResponseWriter& operator=(const ResponseWriter&) = delete;
 
 private:
     friend class HttpServer;
@@ -706,13 +800,24 @@ void ResponseWriter::writeChunk(const std::string& text) {
     std::ostringstream out;
     size_t start = 0;
     for (;;) {
-        size_t nl = text.find('\n', start);
-        std::string line = (nl == std::string::npos) ? text.substr(start) : text.substr(start, nl - start);
+        // The SSE spec terminates a line on "\r\n", "\r", OR "\n" -- all
+        // three, so all three must become a separate `data: ` line here. A
+        // bare '\r' left raw inside a line (a BPE vocabulary can genuinely
+        // emit one, and this streams raw detokenized model output) would end
+        // the line at the parser anyway, and everything after it on that line
+        // would be read as a malformed field name and silently discarded --
+        // losing real generated text with no error on either side.
+        size_t brk = text.find_first_of("\r\n", start);
+        std::string line = (brk == std::string::npos) ? text.substr(start) : text.substr(start, brk - start);
         out << "data: " << line << "\n";
-        if (nl == std::string::npos) {
+        if (brk == std::string::npos) {
             break;
         }
-        start = nl + 1;
+        // "\r\n" is ONE terminator, not two: consume both bytes together, or
+        // the '\n' would start another (empty) line and inject a spurious
+        // blank line into the event's decoded text.
+        bool isCrlf = text[brk] == '\r' && brk + 1 < text.size() && text[brk + 1] == '\n';
+        start = brk + (isCrlf ? 2 : 1);
     }
     out << "\n";
     std::string frame = out.str();
@@ -855,8 +960,10 @@ Replace with:
 
 - [ ] **Step 5: Build and run the tests**
 
-Run: `cmake --build build --target inference_engine_test && cd build && ctest -R HttpServer --output-on-failure`
-Expected: PASS — all `HttpServerFixture.*` tests, including the 5 new ones and every pre-existing one (route dispatch, 404, malformed-request handling, Content-Length validation, header parsing/trimming/dedup).
+Run: `cmake --build build --target inference_engine_test && cd build && ctest -R 'HttpServer|ResponseWriter' --output-on-failure`
+Expected: PASS — all `HttpServerFixture.*` tests, including the 7 new ones and every pre-existing one (route dispatch, 404, malformed-request handling, Content-Length validation, header parsing/trimming/dedup), plus `ResponseWriterTest.IsNotCopyable`.
+
+Note the `-R` pattern: `ResponseWriterTest.IsNotCopyable` is a plain `TEST`, not a `TEST_F` on `HttpServerFixture` (it needs no server, no socket, and no port — it's a pure compile-time-property assertion), so a bare `-R HttpServer` silently skips it rather than failing. Match both suite names.
 
 - [ ] **Step 6: Run the full existing suite to check for regressions**
 
