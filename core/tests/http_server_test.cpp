@@ -518,6 +518,77 @@ TEST_F(HttpServerFixture, StreamingHandlerCannotWriteMoreChunksAfterCallingWrite
     EXPECT_EQ(response.find("[DONE]", firstDone + 1), std::string::npos);
 }
 
+TEST_F(HttpServerFixture, StreamingRouteWriteUsageSendsAnEventUsageFrameBeforeDone) {
+    swarm::HttpServer server(kTestPort + 23);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("hi");
+        writer.writeUsage(5, 10, "stop");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 23, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("data: hi\n\n"), std::string::npos);
+    EXPECT_NE(response.find("event: usage\ndata: {\"prompt_tokens\":5,\"completion_tokens\":10,\"finish_reason\":\"stop\"}\n\n"),
+              std::string::npos);
+    // The usage frame must come before the automatically-appended [DONE] --
+    // find() returns the position of the FIRST byte of each match, so a
+    // smaller offset for "event: usage" than "[DONE]" proves the ordering.
+    size_t usagePos = response.find("event: usage");
+    size_t donePos = response.find("[DONE]");
+    ASSERT_NE(usagePos, std::string::npos);
+    ASSERT_NE(donePos, std::string::npos);
+    EXPECT_LT(usagePos, donePos);
+}
+
+TEST_F(HttpServerFixture, WriteUsageIsANoOpAfterWriteDone) {
+    swarm::HttpServer server(kTestPort + 24);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("hi");
+        writer.writeDone();
+        // A handler is not expected to call writeDone() itself, but if one
+        // does (or the stream otherwise already ended) and then calls
+        // writeUsage(), the usage frame must not reach the wire after the
+        // stream already declared itself complete.
+        writer.writeUsage(5, 10, "stop");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 24, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_EQ(response.find("event: usage"), std::string::npos);
+}
+
+TEST_F(HttpServerFixture, WriteUsageIsANoOpAfterWriteError) {
+    swarm::HttpServer server(kTestPort + 25);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("hi");
+        writer.writeError("boom");
+        writer.writeUsage(5, 10, "stop");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 25, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("event: error"), std::string::npos);
+    EXPECT_EQ(response.find("event: usage"), std::string::npos);
+}
+
+TEST_F(HttpServerFixture, WriteUsageIsANoOpAfterWriteJsonResponse) {
+    swarm::HttpServer server(kTestPort + 26);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeJsonResponse(200, R"({"text":"hi"})");
+        writer.writeUsage(5, 10, "stop");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 26, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find(R"({"text":"hi"})"), std::string::npos);
+    EXPECT_EQ(response.find("text/event-stream"), std::string::npos);
+    EXPECT_EQ(response.find("event: usage"), std::string::npos);
+}
+
 TEST_F(HttpServerFixture, StreamingRouteHandlerCanWriteANormalNonStreamingResponseInstead) {
     swarm::HttpServer server(kTestPort + 13);
     server.routeStreaming("POST", "/maybe-stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {

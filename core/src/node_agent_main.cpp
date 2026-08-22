@@ -201,11 +201,25 @@ int main(int argc, char** argv) {
             }
             bool stream = false;
             swarm::extractJsonBool(req.body, "stream", stream);  // optional -- false if absent/malformed
+            bool includeUsage = false;
+            swarm::extractJsonBool(req.body, "includeUsage", includeUsage);  // optional -- false if absent/malformed; only meaningful when stream is true
 
             if (!stream) {
                 try {
-                    std::string text = engine->complete(prompt, nPredict);
-                    writer.writeJsonResponse(200, R"({"text":")" + swarm::jsonEscapeString(text) + R"("})");
+                    std::string text;
+                    int promptTokens = 0;
+                    int completionTokens = 0;
+                    bool reachedLimit = false;
+                    engine->completeStreaming(prompt, nPredict, [&text](const std::string& piece) {
+                        text += piece;
+                        return true;
+                    }, &promptTokens, &completionTokens, &reachedLimit);
+                    const std::string finishReason = reachedLimit ? "length" : "stop";
+                    writer.writeJsonResponse(200,
+                        R"({"text":")" + swarm::jsonEscapeString(text) +
+                        R"(","prompt_tokens":)" + std::to_string(promptTokens) +
+                        R"(,"completion_tokens":)" + std::to_string(completionTokens) +
+                        R"(,"finish_reason":")" + finishReason + R"("})");
                 } catch (const std::exception& e) {
                     writer.writeJsonResponse(500, R"({"error":")" + swarm::jsonEscapeString(e.what()) + R"("})");
                 }
@@ -226,10 +240,16 @@ int main(int argc, char** argv) {
             // sent. Same pre-existing, disclosed limitation as the
             // non-streaming path already had (see CLAUDE.md's Phase A
             // section) -- streaming does not fix or worsen it.
+            int promptTokens = 0;
+            int completionTokens = 0;
+            bool reachedLimit = false;
             engine->completeStreaming(prompt, nPredict, [&writer](const std::string& piece) {
                 writer.writeChunk(piece);
                 return true;
-            });
+            }, &promptTokens, &completionTokens, &reachedLimit);
+            if (includeUsage) {
+                writer.writeUsage(promptTokens, completionTokens, reachedLimit ? "length" : "stop");
+            }
         });
 
         server.run();  // blocks forever

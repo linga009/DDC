@@ -341,6 +341,83 @@ TEST_F(NodeAgentFixture, CompleteEndpointWithoutStreamFieldBehavesExactlyAsBefor
     EXPECT_EQ(response.find("text/event-stream"), std::string::npos);
 }
 
+TEST_F(NodeAgentFixture, CompleteEndpointNonStreamingResponseIncludesRealTokenCounts) {
+    std::string body = R"({"prompt":"The capital of France is","n_predict":8})";
+    std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos);
+    EXPECT_NE(response.find("\"prompt_tokens\":"), std::string::npos);
+    EXPECT_NE(response.find("\"completion_tokens\":"), std::string::npos);
+    // finish_reason must be present and be one of exactly two valid values --
+    // the precise boundary logic (reachedLimit vs completionTokens) is
+    // already proven at the InferenceEngine unit level (Task 1); this test
+    // only proves the JSON WIRING is correct, not the boundary condition
+    // itself.
+    bool hasStop = response.find("\"finish_reason\":\"stop\"") != std::string::npos;
+    bool hasLength = response.find("\"finish_reason\":\"length\"") != std::string::npos;
+    EXPECT_TRUE(hasStop || hasLength);
+    // This is included REGARDLESS of any includeUsage field -- confirmed by
+    // omitting it entirely from this request's body above.
+}
+
+TEST_F(NodeAgentFixture, CompleteEndpointStreamingWithIncludeUsageSendsUsageFrameBeforeDone) {
+    std::string body = R"({"prompt":"The capital of France is","n_predict":8,"stream":true,"includeUsage":true})";
+    std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos);
+    size_t usagePos = response.find("event: usage");
+    size_t donePos = response.find("data: [DONE]");
+    ASSERT_NE(usagePos, std::string::npos);
+    ASSERT_NE(donePos, std::string::npos);
+    EXPECT_LT(usagePos, donePos);
+    EXPECT_NE(response.find("\"prompt_tokens\":"), std::string::npos);
+    EXPECT_NE(response.find("\"completion_tokens\":"), std::string::npos);
+}
+
+TEST_F(NodeAgentFixture, CompleteEndpointStreamingWithoutIncludeUsageOmitsUsageFrame) {
+    // Regression test: the existing streaming wire format (Phase D, already
+    // shipped and consumed by SwarmClient/the dashboard) must be
+    // byte-for-byte unaffected when includeUsage is absent.
+    std::string body = R"({"prompt":"The capital of France is","n_predict":8,"stream":true})";
+    std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_EQ(response.find("event: usage"), std::string::npos);
+    size_t done = response.find("data: [DONE]\n\n");
+    ASSERT_NE(done, std::string::npos);
+    EXPECT_EQ(done + std::strlen("data: [DONE]\n\n"), response.size());
+}
+
+TEST_F(NodeAgentFixture, CompleteEndpointStreamingWithIncludeUsageFalseOmitsUsageFrame) {
+    // Same regression guarantee as above, but with includeUsage EXPLICITLY
+    // false rather than merely absent -- both must behave identically.
+    std::string body = R"({"prompt":"The capital of France is","n_predict":8,"stream":true,"includeUsage":false})";
+    std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_EQ(response.find("event: usage"), std::string::npos);
+}
+
+TEST_F(NodeAgentFixture, CompleteEndpointNonStreamingWithIncludeUsageFieldStillJustReturnsJson) {
+    // includeUsage only has meaning for the streaming path -- a non-streaming
+    // request that happens to set it must still get the same plain JSON
+    // response (with counts, per the first test above), not an SSE stream.
+    std::string body = R"({"prompt":"The capital of France is","n_predict":8,"includeUsage":true})";
+    std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos);
+    EXPECT_NE(response.find("Content-Type: application/json"), std::string::npos);
+    EXPECT_EQ(response.find("text/event-stream"), std::string::npos);
+}
+
 TEST_F(NodeAgentFixture, CompleteEndpointRejectsAMissingPromptWith400) {
     std::string body = R"({"n_predict":8})";
     std::string request = "POST /complete HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +

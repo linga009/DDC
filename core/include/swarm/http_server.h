@@ -127,6 +127,18 @@ public:
     // for any future caller of writeError() too.
     void writeError(const std::string& message);
 
+    // Sends one terminal metadata frame:
+    // "event: usage\ndata: {"prompt_tokens":N,"completion_tokens":M,"finish_reason":"<finishReason>"}\n\n".
+    // Intended to be called at most once, by a handler, after generation
+    // completes and before returning -- i.e. before HttpServer::run()'s
+    // automatic writeDone() call, so the real wire order is: token chunks,
+    // this usage frame, then [DONE]. A silent no-op under the same
+    // terminal-state rules as writeChunk()/writeError() -- if a plain JSON
+    // response was already sent, or the stream already ended (a [DONE]
+    // sentinel or an error frame already went out), this call does nothing.
+    // Throws std::runtime_error if the underlying send fails (peer gone).
+    void writeUsage(int promptTokens, int completionTokens, const std::string& finishReason);
+
     // Non-copyable, deliberately. The sseHeadersSent_/jsonResponseSent_
     // flags below are only correct while exactly one object owns them for
     // the life of the response: they record what has already gone out on a

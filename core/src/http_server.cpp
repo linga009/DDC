@@ -391,6 +391,31 @@ void ResponseWriter::writeError(const std::string& message) {
     }
 }
 
+void ResponseWriter::writeUsage(int promptTokens, int completionTokens, const std::string& finishReason) {
+    ensureSseHeadersSent();
+    if (jsonResponseSent_) {
+        return;  // a normal response already went out -- see ensureSseHeadersSent's comment
+    }
+    if (doneSent_ || errorSent_) {
+        // The stream already sent its terminal frame ([DONE] or an error) --
+        // writing more content now would put it after the stream's own
+        // terminator, which no compliant client is still reading for.
+        return;
+    }
+    socket_t s = static_cast<socket_t>(socketHandle_);
+    std::string frame = "event: usage\ndata: {\"prompt_tokens\":" + std::to_string(promptTokens) +
+                        ",\"completion_tokens\":" + std::to_string(completionTokens) +
+                        ",\"finish_reason\":\"" + jsonEscapeString(finishReason) + "\"}\n\n";
+    size_t sentTotal = 0;
+    while (sentTotal < frame.size()) {
+        long long n = sendBytes(s, frame.data() + sentTotal, frame.size() - sentTotal);
+        if (n <= 0) {
+            throw std::runtime_error("failed to write SSE usage frame: peer gone");
+        }
+        sentTotal += static_cast<size_t>(n);
+    }
+}
+
 HttpServer::HttpServer(int port) : port_(port) {}
 
 void HttpServer::route(const std::string& method, const std::string& path, HttpHandler handler) {
