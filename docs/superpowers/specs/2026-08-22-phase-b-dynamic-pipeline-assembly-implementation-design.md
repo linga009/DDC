@@ -130,16 +130,91 @@ pattern in `core/`):
 
 ```
 POST /pipeline
-{ "model": "mixtral-8x7b", "modelPath": "...", "remoteEndpoints": ["host:port", ...],
-  "layerPlacements": [{"layer": 0, "device_endpoint": "..."}, ...], "agentPort": 8081 }
+{ "model": "mixtral-8x7b", "remoteEndpoints": "127.0.0.1:50060,127.0.0.1:50061",
+  "layerPlacements": "0:127.0.0.1:50060,16:127.0.0.1:50061", "agentPort": 8090 }
 ```
+
+**Two things the original sketch's request shape left unresolved, both
+closed here rather than left for plan-time guesswork:**
+
+- **No JSON arrays.** `core/include/swarm/json_utils.h` is explicitly
+  documented as a top-level-scalar-only extractor, deliberately *not* a
+  general JSON parser and not meant to grow toward one (confirmed by
+  reading it fresh). `remoteEndpoints` and `layerPlacements` are therefore
+  comma-separated strings, not JSON arrays — `remoteEndpoints` splits
+  directly into repeated `--remote <endpoint>` flags;
+  `layerPlacements`'s entries are already in `swarm-node-agent`'s own
+  `N:endpoint` shape (`core/src/node_agent_main.cpp`'s
+  `parseLayerPlacement`), so the launcher only needs to split on commas
+  and pass each piece straight through as its own `--layer-placement`
+  value — no re-parsing of the `N:endpoint` shape needed on the launcher's
+  side at all.
+- **No `modelPath`.** The original sketch implied the coordinator would
+  supply one, but the coordinator cannot know a valid path on an arbitrary
+  driver machine — two drivers can (and, across real operators, will)
+  store the same model at different local paths. Resolving this is the
+  launcher's own job: it takes a `--models-dir <path>` flag at its own
+  startup (mirroring `swarm-node-agent`'s existing `--model <path>`
+  pattern) and expects `<models-dir>/<model>.gguf` to exist — a disclosed,
+  locally-configured convention, consistent with this project's existing
+  "self-reported and locally-configured, not centrally dictated" posture
+  for `deviceTier`/`localityGroup`/`servesModel`. A request naming a model
+  the launcher has no file for is a real, reported `404`-equivalent
+  error, not a confusing downstream `InferenceEngine` failure three
+  layers removed from the actual cause.
+
+The launcher itself still needs `SWARM_AUTH_TOKEN` in its own process
+environment (refusing to start without it, matching the fail-fast posture
+every other component already has for this variable) — not to authenticate
+*incoming* `POST /pipeline` calls (trust there is structural, via
+localhost-only reachability, per the decision above), but because it must
+send `Authorization: Bearer <token>` when it polls the `/health` endpoint
+of the `swarm-node-agent` it just spawned, which requires that header like
+every other endpoint in this swarm.
 
 Kills any `swarm-node-agent` this launcher previously started (if
 reassembling), spawns a fresh one with those flags, polls its `/health`
-until `200`, responds `200` to the coordinator once confirmed ready (or a
-real error status if the spawn or health-poll fails). No new C++ HTTP
-surface needed beyond this one route — reuses `HttpServer`/`ResponseWriter`
-from Phase D's own work, non-streaming only.
+until `200`, responds `200 {"status":"ready"}` to the coordinator once
+confirmed ready (or a real error status/body if the model file is missing,
+the spawn fails, or the health-poll times out). The coordinator already
+knows which launcher URL it called and which `agentPort` it requested, so
+it can construct the new agent's own endpoint itself — the launcher's
+response doesn't need to echo it back. No new C++ HTTP surface needed
+beyond this one route — reuses `HttpServer`/`ResponseWriter` from Phase
+D's own work, non-streaming only.
+
+### 2b. Launcher discovery (`coordinator/src/launcher_registry.ts`, new)
+
+A third gap the original sketch didn't specify: *how does the coordinator
+know a launcher exists, or where to reach it?* A launcher isn't a `NodeInfo`
+— nothing has been spawned yet, so there's no `/complete`-serving endpoint
+to register via the existing `POST /nodes/register`. This needs its own
+small registry, and the closest existing precedent is
+`coordinator/src/peer_registry.ts` (read fresh: `register(endpoint):
+peerId`, endpoint-match-refreshes-instead-of-duplicating, `heartbeat`,
+`listActive()`, 30s timeout) — a `LauncherRegistry` mirrors that shape
+exactly, with one addition: a launcher declares which models it's able to
+serve as driver for (i.e., which are present under its own
+`--models-dir`), so pipeline assembly can find one that actually has the
+needed model instead of trying every registered launcher in turn:
+
+```typescript
+export interface LauncherInfo {
+  launcherId: string;
+  endpoint: string;
+  servesModels: string[];
+}
+```
+
+New route `POST /launchers/register` (`{endpoint, servesModels}` →
+`{launcherId}`) and `POST /launchers/:launcherId/heartbeat`, both requiring
+the bearer token like every other coordinator route — this is coordinator
+API surface, governed by the existing swarm-wide auth model, entirely
+separate from the launcher's own localhost-only HTTP surface described
+above. The operator running a launcher registers it with the coordinator
+the same way they already register a manually-run `swarm-node-agent`
+today — a one-time (well, heartbeat-refreshed) setup step, not something
+Phase B tries to automate discovery of.
 
 ### 3. Per-node capability data (`coordinator/src/registry.ts`)
 
@@ -198,21 +273,22 @@ random)`) gains a preceding check, only for `requiredNodeCount > 1` models:
    still in `registry.listActive(reputation)` → route to it exactly like
    today (no behavior change from the caller's point of view).
 2. No tracked pipeline, or its driver has aged out / been reputation-ejected
-   (i.e., no longer in `listActive()`) → synchronously call the node
-   selector (#4), then the launcher (#2) to assemble a fresh pipeline; on
+   (i.e., no longer in `listActive()`) → look up `launcherRegistry.findForModel(modelId)`
+   (Architecture #2b); if one is registered, synchronously call the node
+   selector (#4) then that launcher (#2) to assemble a fresh pipeline; on
    success, register the driver via the registry exactly like a manual
    `POST /nodes/register` would, mark it `"warm"`, and proceed with this
    request. This is the design doc's own minimal answer to reassembly,
    confirmed still sufficient: staleness detection is just "is the driver
    still in the set `listActive()` already recomputes every call," no new
    liveness machinery needed.
-3. No launcher reachable, or assembly fails (a real `swarm-launcher` never
-   configured for a candidate driver, a spawn failure, a `/health` timeout)
+3. `launcherRegistry.findForModel(modelId)` finds nothing, or the launcher
+   call fails (a spawn failure, a missing model file, a `/health` timeout)
    → fall back to whatever's already manually registered for this
    `servesModel`, i.e. today's Phase A behavior, unchanged. `requiredNodeCount
-   > 1` models with no operator-run launcher anywhere are simply never
-   assembled automatically — the same "acceptable degradation, not a gap"
-   the original doc already named for this case.
+   > 1` models with no operator-run launcher registered anywhere are simply
+   never assembled automatically — the same "acceptable degradation, not a
+   gap" the original doc already named for this case.
 
 ## Rejected Approaches
 
@@ -277,18 +353,39 @@ implementation-time details (exact layer-split heuristic tuning, exact
   discouraging log line. The launcher's own implementation needs the same
   live confirmation, not an assumption that "127.0.0.1 in the code" is
   automatically equivalent to "actually unreachable remotely."
+- **`LauncherRegistry`** (Architecture #2b) needs the same test coverage
+  its `PeerRegistry` precedent already has: register-refreshes-not-duplicates
+  for a repeated endpoint, heartbeat renewal, expiry pruning on
+  `listActive()`, and — new relative to `PeerRegistry` — `findForModel()`
+  correctly matching only launchers that declared the requested model in
+  their own `servesModels`.
+- **The `--models-dir` resolution path** needs its own real (not mocked)
+  coverage: a request naming a model with no corresponding
+  `<models-dir>/<model>.gguf` file must fail with a clear, specific error
+  before ever attempting to spawn anything — not a generic spawn failure
+  three layers removed from "the file doesn't exist," and not a silent
+  fall-through to spawning `swarm-node-agent` with a bad path anyway.
 - **`/generate`'s new pre-selection check** (tracked-pipeline lookup,
   staleness detection, launcher-triggered reassembly, and the
   no-launcher-available fallback) needs real HTTP tests against this
   project's established `startTestServer`/real-stub-node pattern — covering
   all three branches in Architecture #5 (warm and reachable; stale,
-  triggers reassembly; launcher absent, falls back to manual).
+  triggers reassembly; launcher absent or assembly fails, falls back to
+  manual).
 - **Live-adversarial-probing whole-branch review is essential here**
   (this project's established, consistently bug-finding practice) given
   the launcher is a genuinely new class of risk nothing built so far has
-  had — this design's own grounding pass already found one real
-  documentation-vs-code question worth re-confirming live (does
-  `swarm-rpc-server`'s bind call actually reject non-loopback connections,
-  or does only its startup message discourage remote exposure?) before
-  assuming the launcher's own implementation gets this right by analogy
-  alone.
+  had. In particular: confirm live that the launcher's bind genuinely
+  refuses a non-loopback connection attempt (this design's own grounding
+  pass already confirmed `swarm-rpc-server`'s real, not just claimed,
+  enforcement of the identical constraint by reading
+  `ggml_backend_rpc_start_server()`'s actual socket-creation call — the
+  launcher's own implementation deserves the same live check, not an
+  assumption of correctness by analogy alone); confirm a spawned
+  `swarm-node-agent` that fails to become healthy (bad model file,
+  port collision) is cleaned up rather than left orphaned; and confirm a
+  real end-to-end pipeline assembly (coordinator → launcher → spawned
+  agent → registered with the coordinator → served a real `/generate`
+  request) against a real multi-device setup, mirroring how Phase A's own
+  whole-branch review required a real `--remote`-sharded run, not just a
+  single-device one.
