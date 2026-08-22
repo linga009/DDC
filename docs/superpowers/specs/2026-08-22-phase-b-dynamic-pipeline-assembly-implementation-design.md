@@ -101,6 +101,24 @@ gap. The launcher adopts the identical posture rather than inventing a
 second, weaker pattern (a new bearer token, over this project's
 by-design-no-TLS plain HTTP) for an even more dangerous surface.
 
+**This decision costs zero new binding code, and is not actually a new
+posture for this project at all — confirmed by reading, not assumed:**
+`core/src/http_server.cpp`'s `HttpServer` (the *exact same* class
+`swarm-node-agent`'s `/health`/`/complete` already run on) hardcodes
+`addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK)` in its own bind call —
+every server built on `HttpServer` has *always* been loopback-only, not
+just `swarm-rpc-server`. This means the launcher inherits the identical
+restriction automatically just by being built on `HttpServer` like every
+other binary in `core/` — no new socket code, and no new *kind* of
+constraint being introduced to this project. It also reframes what "real
+cross-machine operation" has actually meant here all along: every existing
+HTTP hop (coordinator↔node-agent) and RPC hop (node-agent↔`swarm-rpc-server`)
+already requires the operator to bridge loopback-only endpoints across
+machines themselves (a tunnel, or genuinely co-located processes) — this
+design doesn't invent that requirement for the launcher, it's simply the
+first time it's been stated explicitly rather than left implicit in a bind
+call nobody had occasion to point at directly.
+
 **Two alternatives were considered and explicitly rejected, ranked on
 actual safety, not convenience:**
 - **Reuse `SWARM_AUTH_TOKEN`.** Rejected: escalates that token's blast
@@ -375,13 +393,18 @@ implementation-time details (exact layer-split heuristic tuning, exact
 - **Live-adversarial-probing whole-branch review is essential here**
   (this project's established, consistently bug-finding practice) given
   the launcher is a genuinely new class of risk nothing built so far has
-  had. In particular: confirm live that the launcher's bind genuinely
-  refuses a non-loopback connection attempt (this design's own grounding
-  pass already confirmed `swarm-rpc-server`'s real, not just claimed,
-  enforcement of the identical constraint by reading
-  `ggml_backend_rpc_start_server()`'s actual socket-creation call — the
-  launcher's own implementation deserves the same live check, not an
-  assumption of correctness by analogy alone); confirm a spawned
+  had. In particular: confirm live that the launcher genuinely refuses a
+  non-loopback connection attempt — this design's own grounding pass
+  already confirmed, by reading the actual code (`core/src/http_server.cpp`'s
+  `bind()` call, and separately `ggml_backend_rpc_start_server()`'s real
+  socket-creation call for `swarm-rpc-server`'s own identical constraint),
+  that `HttpServer` itself enforces this for every server built on it —
+  so the live check here is really "does the launcher's `main()` construct
+  a plain `HttpServer(port)` with nothing overriding that bind," not
+  "does new, bespoke binding logic work correctly." Still worth confirming
+  live rather than by code-reading alone, matching this project's
+  established practice, but the risk surface is much smaller than writing
+  new socket code would have been. Also confirm a spawned
   `swarm-node-agent` that fails to become healthy (bad model file,
   port collision) is cleaned up rather than left orphaned; and confirm a
   real end-to-end pipeline assembly (coordinator → launcher → spawned
