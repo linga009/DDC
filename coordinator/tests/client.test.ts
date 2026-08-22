@@ -343,6 +343,39 @@ test("generateStream throws when the stream emits an error frame", async () => {
   }
 });
 
+test("generateStream throws when the connection ends without a [DONE] terminator", async () => {
+  const server = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: partial\n\n");
+    res.end(); // ends cleanly, but WITHOUT a data: [DONE] frame -- simulates
+               // a node process dying mid-generation, which a
+               // connection-close-delimited SSE response cannot otherwise
+               // distinguish from a genuinely finished stream (both report
+               // `done: true` from the reader with no other signal).
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected test server to bind a port");
+  }
+  const client = new SwarmClient(`http://127.0.0.1:${address.port}`, "test-token");
+  try {
+    const pieces: string[] = [];
+    await assert.rejects(
+      async () => {
+        for await (const piece of client.generateStream("hi", "tinyllama-1.1b")) {
+          pieces.push(piece);
+        }
+      },
+      /\[DONE\]/,
+    );
+    assert.deepEqual(pieces, ["partial"]);
+  } finally {
+    server.close();
+  }
+});
+
 test("generateStream reconstructs a multi-line chunk from multiple data: lines in one frame", async () => {
   const server = createHttpServer(async (req, res) => {
     for await (const _chunk of req) { /* drain */ }

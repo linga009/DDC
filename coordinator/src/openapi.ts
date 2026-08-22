@@ -25,8 +25,12 @@ export const openApiDocument = {
       "prompt, routes it to a single active node whose self-reported " +
       "servesModel matches (reputation-ranked with a random tie-break " +
       "among equal scores, no locality-awareness, no retry/fallback), " +
-      "and returns the generated text. Dynamic node " +
-      "selection, pre-warming, and streaming are not implemented yet.\n\n" +
+      "and returns the generated text -- or, with \"stream\": true in the " +
+      "request body, relays the node's generation as a real Server-Sent " +
+      "Events stream (text/event-stream), one data: frame per token, " +
+      "terminated by a data: [DONE] sentinel on success or an " +
+      "event: error frame on mid-stream failure. Dynamic node " +
+      "selection and pre-warming are not implemented yet.\n\n" +
       "Authentication: every endpoint described here requires a shared " +
       "secret, sent as `Authorization: Bearer <token>`. The operator sets it " +
       "on the coordinator as the SWARM_AUTH_TOKEN environment variable (the " +
@@ -276,7 +280,7 @@ export const openApiDocument = {
     },
     "/generate": {
       post: {
-        summary: "Classify a prompt, route it to an active node serving the requested model, and return the generated text. No inference-request endpoint existed before this; still no streaming (the response arrives complete or not at all), no retry, and no fallback to a different node on failure.",
+        summary: "Classify a prompt, route it to an active node serving the requested model, and return the generated text -- as one JSON response by default, or as a real Server-Sent Events stream when \"stream\": true is set in the request body. No retry and no fallback to a different node on failure.",
         requestBody: {
           content: {
             "application/json": {
@@ -287,6 +291,17 @@ export const openApiDocument = {
                   prompt: { type: "string" },
                   modelId: { type: "string" },
                   n_predict: { type: "integer", minimum: 1, maximum: 512 },
+                  stream: {
+                    type: "boolean",
+                    description:
+                      "When true, the 200 response is text/event-stream instead of application/json: " +
+                      "one \"data: <token>\\n\\n\" frame per generated token, in order, terminated by a " +
+                      "\"data: [DONE]\\n\\n\" sentinel on success or an \"event: error\\ndata: " +
+                      "{\"error\":...}\\n\\n\" frame if generation fails after streaming has already " +
+                      "begun. Every other response status (400/401/502/503) is unaffected by this field " +
+                      "and is still a plain JSON error body, since those failures are detected before any " +
+                      "streaming commitment is made.",
+                  },
                 },
               },
             },
@@ -294,7 +309,24 @@ export const openApiDocument = {
         },
         responses: {
           "401": UNAUTHORIZED_RESPONSE,
-          "200": { description: "Generated text", content: { "application/json": { schema: { type: "object", properties: { text: { type: "string" } } } } } },
+          "200": {
+            description: "Generated text. The response shape depends on whether the request set \"stream\": true.",
+            content: {
+              "application/json": {
+                schema: { type: "object", properties: { text: { type: "string" } } },
+              },
+              "text/event-stream": {
+                schema: {
+                  type: "string",
+                  description:
+                    "A sequence of SSE frames: \"data: <token>\\n\\n\" for each generated token, in " +
+                    "order, followed by a terminal \"data: [DONE]\\n\\n\" frame. A mid-stream failure " +
+                    "instead ends the sequence with an \"event: error\\ndata: {\"error\":\"<message>\"}\\n\\n\" " +
+                    "frame -- no [DONE] follows an error frame, the two are mutually exclusive on the wire.",
+                },
+              },
+            },
+          },
           "400": {
             description:
               "Invalid request, or the prompt was classified unsafe. Two distinct shapes are possible: a " +

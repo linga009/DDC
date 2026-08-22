@@ -196,6 +196,7 @@ async function sendChatMessage() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let sawDone = false;
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -218,7 +219,14 @@ async function sendChatMessage() {
           const dataLines = frame.split("\n").filter(line => line.startsWith("data: "));
           if (dataLines.length === 0) continue;
           const piece = dataLines.map(line => line.slice("data: ".length)).join("\n");
-          if (piece === "[DONE]") continue; // terminal sentinel -- not literal generated text
+          if (piece === "[DONE]") {
+            // Terminal sentinel, not literal generated text. Stop
+            // processing immediately -- matching SwarmClient.generateStream()'s
+            // `return` -- so any bytes a misbehaving node sent after its
+            // own [DONE] never reach the rendered chat.
+            sawDone = true;
+            break;
+          }
           assistantMessage.text += piece;
           if (!assistantMessageAdded) {
             chatHistory.push(assistantMessage);
@@ -228,8 +236,28 @@ async function sendChatMessage() {
             appendToLastChatMessage(piece); // later pieces -- avoid a full rebuild per token
           }
         }
+        if (sawDone) break;
       }
-      if (!assistantMessageAdded) {
+      if (!sawDone) {
+        // The connection ended (the coordinator relayed a clean
+        // end-of-stream) without the terminal [DONE] sentinel ever
+        // arriving -- e.g. the node process died mid-generation. The
+        // response has no Content-Length (it's SSE, connection-delimited),
+        // so a mid-stream drop and a genuinely finished stream both report
+        // `done: true` from the reader with no other signal. Without this
+        // check a truncated reply would render identically to a
+        // successfully completed one.
+        if (assistantMessageAdded) {
+          assistantMessage.status = "error";
+          assistantMessage.text += " [truncated: connection lost before the reply finished]";
+        } else {
+          chatHistory.push({
+            role: "assistant",
+            text: "Connection lost before any output arrived.",
+            status: "error",
+          });
+        }
+      } else if (!assistantMessageAdded) {
         chatHistory.push({ role: "assistant", text: "(no output)" });
       }
     }

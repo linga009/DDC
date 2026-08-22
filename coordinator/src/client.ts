@@ -67,8 +67,15 @@ export class SwarmClient {
   // Yields one generated text piece per SSE "data: ..." frame the
   // coordinator relays, in order, as they arrive -- does not buffer the
   // whole reply before the caller sees anything. Throws if the stream
-  // emits an "event: error" frame (with that frame's message), or if the
-  // initial request itself fails before any streaming could begin.
+  // emits an "event: error" frame (with that frame's message), if the
+  // initial request itself fails before any streaming could begin, or if
+  // the connection ends WITHOUT ever seeing the terminal "data: [DONE]"
+  // sentinel -- e.g. the node process died mid-generation. That last case
+  // matters because the underlying HTTP response has no Content-Length (it
+  // closes the connection instead), so a mid-stream connection drop and a
+  // clean end-of-stream are otherwise indistinguishable: reader.read()
+  // reports `done: true` for both. Without this check a truncated reply
+  // would silently look identical to a successfully completed one.
   // A trailing "data: [DONE]\n\n" frame marks a successful stream's end --
   // it is a terminal sentinel, not generated text, and is never yielded.
   async *generateStream(prompt: string, modelId: string, n_predict?: number, signal?: AbortSignal): AsyncGenerator<string> {
@@ -80,9 +87,13 @@ export class SwarmClient {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let sawDone = false;
     for (;;) {
       const { done, value } = await reader.read();
       if (done) {
+        if (!sawDone) {
+          throw new Error("generateStream ended without a [DONE] terminator -- the connection was likely lost mid-stream");
+        }
         break;
       }
       buffer += decoder.decode(value, { stream: true });
@@ -100,6 +111,7 @@ export class SwarmClient {
         }
         const text = dataLines.map(line => line.slice("data: ".length)).join("\n");
         if (text === "[DONE]") {
+          sawDone = true;
           return; // terminal sentinel -- stream is complete, not literal generated text
         }
         yield text;

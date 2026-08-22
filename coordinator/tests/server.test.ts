@@ -1903,6 +1903,38 @@ test("POST /generate with stream:true returns a normal 502 when the selected nod
   }
 });
 
+test("POST /generate with stream:true returns a clean 502 when the node ignores stream and answers JSON", async () => {
+  // A pre-Phase-D node agent (or any node that doesn't understand
+  // stream:true) responds 200 application/json regardless of what the
+  // request asked for. Relaying that body under a text/event-stream
+  // content-type would look like a well-formed, successfully-completed
+  // empty stream to every consumer -- this must be caught and reported
+  // instead, before any response headers are committed.
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "I am a pre-Phase-D node." } }));
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b", stream: true }),
+    });
+
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get("content-type"), "application/json");
+    const body = await res.json();
+    assert.equal(typeof body.error, "string");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
 test("POST /generate without a stream field behaves exactly as before", async () => {
   const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "Paris." } }));
   const { server, baseUrl } = await startTestServer();

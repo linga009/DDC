@@ -515,6 +515,18 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
               sendJson(res, 502, { error: `node returned status ${nodeRes.status}` });
               return;
             }
+            const nodeContentType = nodeRes.headers.get("content-type") ?? "";
+            if (!nodeContentType.startsWith("text/event-stream")) {
+              // A node that doesn't understand stream:true (e.g. a
+              // pre-Phase-D agent build) answers 200 application/json
+              // instead of an SSE stream. Relaying that body under a
+              // text/event-stream content-type would produce a
+              // well-formed-looking response that silently yields zero
+              // pieces to every consumer -- fail loudly instead, before
+              // committing to any response headers.
+              sendJson(res, 502, { error: "node did not return a streaming response" });
+              return;
+            }
             // Raw passthrough, not decode-then-re-encode: both hops speak
             // the identical SSE dialect (this coordinator's own choice, see
             // the Phase D design doc), so the node's bytes are already
