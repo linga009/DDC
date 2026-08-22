@@ -463,6 +463,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           sendJson(res, 400, { error: "modelId must be a known catalog model id" });
           return;
         }
+        const stream = candidate.stream === true;
         let nPredict = DEFAULT_N_PREDICT;
         if (candidate.n_predict !== undefined) {
           if (
@@ -499,6 +500,47 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         const node = selectNode(registry.listActive(reputation), reputation, candidate.modelId, random);
         if (!node) {
           sendJson(res, 503, { error: `no active node currently serves model "${candidate.modelId}"` });
+          return;
+        }
+
+        if (stream) {
+          try {
+            const nodeRes = await fetch(`${node.endpoint}/complete`, {
+              method: "POST",
+              headers: { "content-type": "application/json", "authorization": `Bearer ${authToken}` },
+              body: JSON.stringify({ prompt: candidate.prompt, n_predict: nPredict, stream: true }),
+              signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
+            });
+            if (!nodeRes.ok || !nodeRes.body) {
+              sendJson(res, 502, { error: `node returned status ${nodeRes.status}` });
+              return;
+            }
+            // Raw passthrough, not decode-then-re-encode: both hops speak
+            // the identical SSE dialect (this coordinator's own choice, see
+            // the Phase D design doc), so the node's bytes are already
+            // exactly what this response needs to send -- including any
+            // "event: error" frame the node emits mid-stream, which flows
+            // through unchanged.
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            const reader = nodeRes.body.getReader();
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              res.write(value);
+            }
+            res.end();
+          } catch (err) {
+            console.warn(`failed to forward streaming /generate to node ${node.endpoint}:`, err);
+            // If SSE headers haven't gone out yet, a normal error response
+            // is still possible; once they have, the only safe recovery is
+            // to close the connection -- a fresh 502 can't be layered onto
+            // a response that already declared itself a 200 text/event-stream.
+            if (!res.headersSent) {
+              sendJson(res, 502, { error: "failed to reach the selected node" });
+            } else {
+              res.end();
+            }
+          }
           return;
         }
 

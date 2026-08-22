@@ -1544,6 +1544,33 @@ async function startStubNodeAgent(handler: (body: unknown) => { status: number; 
   return { server, endpoint: `http://127.0.0.1:${address.port}` };
 }
 
+// Like startStubNodeAgent, but for a POST /complete request with
+// stream: true -- responds with a real SSE stream, writing each of
+// `chunks` as its own "data: ...\n\n" frame with `delayMs` between writes,
+// then a terminal "data: [DONE]\n\n" frame (matching the real
+// swarm-node-agent's ResponseWriter::writeDone() behavior), so a caller
+// relaying this incrementally (not buffering the whole thing) can be told
+// apart from one that isn't, and so tests exercise the real terminal-frame
+// wire shape Task 5 depends on.
+async function startStreamingStubNodeAgent(chunks: string[], delayMs = 20) {
+  const server = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain the request body */ }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    for (const chunk of chunks) {
+      res.write(`data: ${chunk}\n\n`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected streaming stub node agent to bind to a port");
+  }
+  return { server, endpoint: `http://127.0.0.1:${address.port}` };
+}
+
 test("POST /generate classifies, routes to a matching node, and returns its response", async () => {
   const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "Paris." } }));
   const { server, baseUrl } = await startTestServer();
@@ -1766,5 +1793,137 @@ test("POST /generate breaks a tie between equally-scored nodes using the injecte
     server.close();
     firstStub.server.close();
     secondStub.server.close();
+  }
+});
+
+test("POST /generate with stream:true relays SSE chunks from the node", async () => {
+  const stub = await startStreamingStubNodeAgent(["Paris", " is", " nice"]);
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b", stream: true }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "text/event-stream");
+    const text = await res.text();
+    assert.equal(text, "data: Paris\n\ndata:  is\n\ndata:  nice\n\ndata: [DONE]\n\n");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /generate with stream:true relays chunks as they arrive, not buffered until the end", async () => {
+  const stub = await startStreamingStubNodeAgent(["first", "second"], 150);
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b", stream: true }),
+    });
+
+    assert.ok(res.body);
+    const reader = res.body!.getReader();
+    const arrivalTimesMs: number[] = [];
+    const start = Date.now();
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) break;
+      arrivalTimesMs.push(Date.now() - start);
+    }
+
+    // The stub sleeps 150ms between its two writes -- if the coordinator
+    // buffered the whole response before relaying it, all reads would
+    // arrive together near the end of the stub's total delay. Real
+    // incremental relay means the first read arrives well before the stub
+    // has even reached its own inter-chunk sleep.
+    assert.ok(arrivalTimesMs.length >= 2, `expected at least 2 separate reads, got ${arrivalTimesMs.length}`);
+    assert.ok(
+      arrivalTimesMs[0] < 100,
+      `first chunk arrived at ${arrivalTimesMs[0]}ms, expected well under the stub's 150ms inter-chunk delay`,
+    );
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /generate with stream:true still classifies the prompt before contacting any node", async () => {
+  const classifier = new KeywordSafetyClassifier([{ category: "test", pattern: /blocked/i }]);
+  const { server, baseUrl } = await startTestServer(undefined, undefined, classifier);
+  try {
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "this is blocked", modelId: "tinyllama-1.1b", stream: true }),
+    });
+
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { safe: false, categories: ["test"] });
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /generate with stream:true returns a normal 502 when the selected node is unreachable", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:1", deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b", stream: true }),
+    });
+
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get("content-type"), "application/json");
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /generate without a stream field behaves exactly as before", async () => {
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "Paris." } }));
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "application/json");
+    assert.deepEqual(await res.json(), { text: "Paris." });
+  } finally {
+    server.close();
+    stub.server.close();
   }
 });
