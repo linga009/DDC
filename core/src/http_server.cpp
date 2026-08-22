@@ -276,13 +276,24 @@ void ResponseWriter::writeChunk(const std::string& text) {
     std::ostringstream out;
     size_t start = 0;
     for (;;) {
-        size_t nl = text.find('\n', start);
-        std::string line = (nl == std::string::npos) ? text.substr(start) : text.substr(start, nl - start);
+        // The SSE spec terminates a line on "\r\n", "\r", OR "\n" -- all
+        // three, so all three must become a separate `data: ` line here. A
+        // bare '\r' left raw inside a line (a BPE vocabulary can genuinely
+        // emit one, and this streams raw detokenized model output) would end
+        // the line at the parser anyway, and everything after it on that line
+        // would be read as a malformed field name and silently discarded --
+        // losing real generated text with no error on either side.
+        size_t brk = text.find_first_of("\r\n", start);
+        std::string line = (brk == std::string::npos) ? text.substr(start) : text.substr(start, brk - start);
         out << "data: " << line << "\n";
-        if (nl == std::string::npos) {
+        if (brk == std::string::npos) {
             break;
         }
-        start = nl + 1;
+        // "\r\n" is ONE terminator, not two: consume both bytes together, or
+        // the '\n' would start another (empty) line and inject a spurious
+        // blank line into the event's decoded text.
+        bool isCrlf = text[brk] == '\r' && brk + 1 < text.size() && text[brk + 1] == '\n';
+        start = brk + (isCrlf ? 2 : 1);
     }
     out << "\n";
     std::string frame = out.str();

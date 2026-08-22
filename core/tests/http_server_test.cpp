@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #ifdef _WIN32
@@ -313,6 +314,70 @@ TEST_F(HttpServerFixture, StreamingRouteSplitsAMultiLineChunkIntoMultipleDataLin
     // for one event, not a single line containing a raw newline (which
     // would look like the frame's own terminator to a spec-compliant parser).
     EXPECT_NE(response.find("data: line one\ndata: line two\n\n"), std::string::npos);
+}
+
+// The SSE spec defines a line as terminated by "\r\n", "\r", OR "\n" -- all
+// three, not just "\n". A bare '\r' (which a BPE vocabulary can genuinely
+// emit, and Phase D streams raw detokenized model output) left raw inside a
+// `data: ` line therefore does NOT reach an EventSource-compliant parser as
+// text: the parser ends the line at the '\r' and then reads "after" as a
+// malformed field name, silently discarding it. The word is lost from the
+// stream entirely, with no error anywhere. Splitting on '\r' exactly the way
+// '\n' is already split keeps both halves on the wire and readable.
+TEST_F(HttpServerFixture, StreamingRouteSplitsAChunkOnABareCarriageReturnToo) {
+    swarm::HttpServer server(kTestPort + 16);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("before\rafter");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 16, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("data: before\ndata: after\n\n"), std::string::npos);
+
+    // Belt and braces: no raw '\r' may survive anywhere inside the frame --
+    // a surviving one is precisely what truncates the event for a real
+    // parser. (Everything before the frame is the header block, whose own
+    // CRLFs are legitimate, so scan only from the frame's start.)
+    size_t frameStart = response.find("data: before");
+    ASSERT_NE(frameStart, std::string::npos);
+    EXPECT_EQ(response.find('\r', frameStart), std::string::npos);
+}
+
+// The other half of the same rule: "\r\n" is ONE line terminator, not two.
+// Splitting on '\r' and '\n' independently would emit a spurious empty
+// `data: ` line between the two words, which a compliant parser decodes as
+// an extra blank line in the event's text ("before\n\nafter") -- corrupting
+// the model's output rather than losing it.
+TEST_F(HttpServerFixture, StreamingRouteTreatsCrlfAsOneLineBreakNotTwo) {
+    swarm::HttpServer server(kTestPort + 17);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("before\r\nafter");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 17, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("data: before\ndata: after\n\n"), std::string::npos);
+    size_t frameStart = response.find("data: before");
+    ASSERT_NE(frameStart, std::string::npos);
+    EXPECT_EQ(response.find('\r', frameStart), std::string::npos);
+}
+
+// A ResponseWriter tracks, in its own members, whether SSE headers or a
+// complete JSON response have already gone out on its socket -- state that
+// is only correct if exactly one object owns it for the life of the
+// response. A copy carries a snapshot of those flags and then diverges: a
+// handler that captured the writer by value into a callback ([writer]
+// instead of the correct [&writer]) would mutate a throwaway whose
+// sseHeadersSent_/jsonResponseSent_ updates never propagate back, and the
+// real object would go on re-emitting SSE headers mid-stream -- silent wire
+// corruption with no exception and no failed send. Deleting the copy
+// operations turns that whole bug class into a compile error at the point
+// the bad capture is written.
+TEST(ResponseWriterTest, IsNotCopyable) {
+    EXPECT_FALSE(std::is_copy_constructible<swarm::ResponseWriter>::value);
+    EXPECT_FALSE(std::is_copy_assignable<swarm::ResponseWriter>::value);
 }
 
 TEST_F(HttpServerFixture, StreamingRouteSendsAnErrorFrameWhenTheHandlerThrows) {

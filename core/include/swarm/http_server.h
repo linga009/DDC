@@ -49,12 +49,18 @@ public:
 
     // Sends SSE response headers on the first call to writeChunk() or
     // writeError() on this ResponseWriter (a no-op on later calls), then
-    // one `data: <text>\n\n` frame. A `text` containing an embedded '\n'
-    // is sent as multiple consecutive `data: ` lines belonging to the same
-    // event, per the SSE spec's own multi-line convention -- otherwise the
-    // embedded newline would look like the frame's own terminator to a
-    // spec-compliant SSE parser. Throws std::runtime_error if the
-    // underlying send fails (peer gone).
+    // one `data: <text>\n\n` frame. A `text` containing an embedded line
+    // break is sent as multiple consecutive `data: ` lines belonging to the
+    // same event, per the SSE spec's own multi-line convention -- otherwise
+    // the embedded break would look like the frame's own terminator to a
+    // spec-compliant SSE parser. All three of the spec's line terminators
+    // count as a break here -- "\r\n", a bare "\r", and a bare "\n" -- with
+    // "\r\n" treated as one break rather than two. A bare '\r' matters as
+    // much as '\n' because a BPE vocabulary can emit one in real
+    // detokenized output, and a raw '\r' inside a `data: ` line silently
+    // truncates the event at a compliant parser: everything after it on
+    // that line is read as a malformed field name and discarded. Throws
+    // std::runtime_error if the underlying send fails (peer gone).
     void writeChunk(const std::string& text);
 
     // Sends SSE response headers if not already sent, then one terminal
@@ -63,7 +69,28 @@ public:
     // delivered real content, which changing the HTTP status code cannot
     // do once a 200 and its headers are already on the wire. Throws
     // std::runtime_error if the underlying send fails.
+    //
+    // Note this one needs NO line-break splitting of its own: the message
+    // goes through jsonEscapeString(), which already turns a '\r' into a
+    // literal backslash-r inside the JSON string, so it cannot put a raw
+    // '\r' on the wire the way writeChunk() could.
     void writeError(const std::string& message);
+
+    // Non-copyable, deliberately. The sseHeadersSent_/jsonResponseSent_
+    // flags below are only correct while exactly one object owns them for
+    // the life of the response: they record what has already gone out on a
+    // socket this object does not own and cannot re-open. A copy takes a
+    // snapshot and then diverges -- a handler capturing the writer by value
+    // into a callback ([writer] instead of the correct [&writer]) would
+    // mutate a throwaway whose flag updates never reach the real object,
+    // which would then re-emit SSE headers mid-stream: silent wire
+    // corruption, no exception, no failed send. Deleting these makes that
+    // whole bug class a compile error at the bad capture instead. run()
+    // constructs exactly one writer per streaming request in place and
+    // passes it only by reference (StreamingHttpHandler takes
+    // ResponseWriter&), so nothing in this codebase needs a copy.
+    ResponseWriter(const ResponseWriter&) = delete;
+    ResponseWriter& operator=(const ResponseWriter&) = delete;
 
 private:
     friend class HttpServer;
