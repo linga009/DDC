@@ -2,6 +2,12 @@ export interface CatalogEntry {
   id: string;
   displayName: string;
   minActiveNodes: number;
+  // Total pipeline size (driver plus compute contributors together, not
+  // contributors alone) this model needs to run at all -- absent or 1
+  // means today's existing single-node path, untouched by Phase B. Only
+  // >1 models ever engage pipeline_selector.ts/PipelineTracker/the
+  // launcher.
+  requiredNodeCount?: number;
 }
 
 export interface AvailabilityEntry extends CatalogEntry {
@@ -37,5 +43,9 @@ export class ModelCatalog {
 
   hasModel(id: string): boolean {
     return this.entries.some(entry => entry.id === id);
+  }
+
+  requiredNodeCount(id: string): number {
+    return this.entries.find(entry => entry.id === id)?.requiredNodeCount ?? 1;
   }
 }

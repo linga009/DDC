@@ -46,3 +46,24 @@ test("hasModel returns true for a known catalog id and false for an unknown one"
   assert.equal(catalog.hasModel("tinyllama-1.1b"), true);
   assert.equal(catalog.hasModel("nonexistent-model"), false);
 });
+
+test("requiredNodeCount defaults to 1 for a catalog entry that doesn't specify it", () => {
+  const catalog = new ModelCatalog([{ id: "small", displayName: "Small", minActiveNodes: 0 }]);
+  assert.equal(catalog.requiredNodeCount("small"), 1);
+});
+
+test("requiredNodeCount returns the entry's own value when specified", () => {
+  const catalog = new ModelCatalog([{ id: "big", displayName: "Big", minActiveNodes: 5, requiredNodeCount: 3 }]);
+  assert.equal(catalog.requiredNodeCount("big"), 3);
+});
+
+test("requiredNodeCount returns 1 for an unknown model id", () => {
+  const catalog = new ModelCatalog([{ id: "small", displayName: "Small", minActiveNodes: 0 }]);
+  assert.equal(catalog.requiredNodeCount("nonexistent-model"), 1);
+});
+
+test("availability() output is unaffected by requiredNodeCount -- purely additive field", () => {
+  const catalog = new ModelCatalog([{ id: "big", displayName: "Big", minActiveNodes: 5, requiredNodeCount: 3 }]);
+  const result = catalog.availability(10);
+  assert.deepEqual(result, [{ id: "big", displayName: "Big", minActiveNodes: 5, requiredNodeCount: 3, available: true }]);
+});
