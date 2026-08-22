@@ -476,6 +476,48 @@ TEST_F(HttpServerFixture, StreamingRouteSendsAnErrorFrameWhenTheHandlerThrows) {
     EXPECT_EQ(response.find("[DONE]"), std::string::npos);
 }
 
+TEST_F(HttpServerFixture, StreamingHandlerThatCallsWriteErrorThenReturnsNormallyDoesNotAlsoGetADoneFrame) {
+    swarm::HttpServer server(kTestPort + 21);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("partial");
+        writer.writeError("handled internally");
+        // Returns normally (no throw) -- run()'s automatic writeDone() call
+        // must not append [DONE] after this handler already terminated the
+        // stream itself via writeError().
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 21, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("data: partial\n\n"), std::string::npos);
+    EXPECT_NE(response.find("event: error"), std::string::npos);
+    EXPECT_EQ(response.find("[DONE]"), std::string::npos);
+}
+
+TEST_F(HttpServerFixture, StreamingHandlerCannotWriteMoreChunksAfterCallingWriteDoneItself) {
+    swarm::HttpServer server(kTestPort + 22);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("first");
+        writer.writeDone();
+        // A handler is not expected to call writeDone() itself (run() does
+        // it automatically), but if one does and then keeps writing, the
+        // extra chunk must not reach the wire after the stream already
+        // declared itself complete.
+        writer.writeChunk("should not appear");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 22, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("data: first\n\n"), std::string::npos);
+    EXPECT_EQ(response.find("should not appear"), std::string::npos);
+    // Exactly one [DONE] -- run()'s own automatic call afterward must also
+    // no-op, not send a second sentinel.
+    size_t firstDone = response.find("[DONE]");
+    ASSERT_NE(firstDone, std::string::npos);
+    EXPECT_EQ(response.find("[DONE]", firstDone + 1), std::string::npos);
+}
+
 TEST_F(HttpServerFixture, StreamingRouteHandlerCanWriteANormalNonStreamingResponseInstead) {
     swarm::HttpServer server(kTestPort + 13);
     server.routeStreaming("POST", "/maybe-stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {

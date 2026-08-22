@@ -42,6 +42,17 @@ using HttpHandler = std::function<HttpResponse(const HttpRequest&)>;
 // only, so a request body field can't be used to pick between two
 // DIFFERENT registered routes at dispatch time; it can only be inspected
 // by the one handler routing already selected.
+//
+// Once an SSE stream has ended -- via writeDone() sending its [DONE]
+// sentinel or writeError() sending its terminal error frame -- it stays
+// ended: writeChunk()/writeDone()/writeError() are all silent no-ops for
+// the rest of this object's life. This is enforced by the doneSent_/
+// errorSent_ flags below, not merely a documented calling convention a
+// handler must follow: a handler that calls writeError() itself (rather
+// than letting an exception propagate to HttpServer::run(), which is the
+// only call site in this codebase today) and then keeps writing cannot put
+// content or a second terminal frame on the wire after the stream already
+// declared itself over.
 class ResponseWriter {
 public:
     // Sends one complete, non-streaming HTTP response -- status line,
@@ -63,7 +74,9 @@ public:
     // much as '\n' because a BPE vocabulary can emit one in real
     // detokenized output, and a raw '\r' inside a `data: ` line silently
     // truncates the event at a compliant parser: everything after it on
-    // that line is read as a malformed field name and discarded. Throws
+    // that line is read as a malformed field name and discarded. A silent
+    // no-op if the stream already ended (writeDone() or writeError() already
+    // sent its terminal frame) -- see the class comment above. Throws
     // std::runtime_error if the underlying send fails (peer gone).
     void writeChunk(const std::string& text);
 
@@ -72,9 +85,12 @@ public:
     // then a terminal `data: [DONE]\n\n` frame -- the defined way to signal
     // "this stream completed successfully; there is no more content coming."
     // A no-op if a plain JSON response was already sent via writeJsonResponse
-    // (nothing streaming-related to terminate). Matches the same sentinel
-    // real OpenAI-compatible streaming APIs use. Throws std::runtime_error if
-    // the underlying send fails (peer gone).
+    // (nothing streaming-related to terminate), or if the stream already
+    // ended -- via a prior writeDone() call, or because writeError() already
+    // sent a terminal error frame (a stream cannot both fail and succeed on
+    // the same wire). Matches the same sentinel real OpenAI-compatible
+    // streaming APIs use. Throws std::runtime_error if the underlying send
+    // fails (peer gone).
     //
     // HttpServer::run() calls this automatically, exactly once, after a
     // StreamingHttpHandler returns normally -- handlers do not need to call
@@ -93,18 +109,22 @@ public:
     // signal failure is one terminal
     // `event: error\ndata: {"error":"<message>"}\n\n` frame -- the defined
     // way to say "generation failed" after real content may already have
-    // been delivered. Throws std::runtime_error if the underlying send
-    // fails.
+    // been delivered. A no-op if the stream already ended (a prior
+    // writeError() call already sent this frame, or writeDone() already sent
+    // its [DONE] sentinel -- a stream cannot both succeed and fail on the
+    // same wire). Throws std::runtime_error if the underlying send fails.
     //
     // Note the SSE branch needs NO line-break splitting of its own: the
     // message goes through jsonEscapeString(), which already turns a '\r'
     // into a literal backslash-r inside the JSON string, so it cannot put a
     // raw '\r' on the wire the way writeChunk() could.
     //
-    // A response that ends in an error frame never also carries a
-    // `[DONE]` sentinel: run() calls writeDone() only on the path where the
-    // handler returned normally, so "succeeded" and "failed" stay mutually
-    // exclusive on the wire.
+    // A response that ends in an error frame never also carries a `[DONE]`
+    // sentinel: run() calls writeDone() only on the path where the handler
+    // returned normally (so "succeeded" and "failed" stay mutually exclusive
+    // on the wire for the one call site in this codebase today), and this is
+    // now also enforced directly by writeDone()'s own errorSent_ check above,
+    // for any future caller of writeError() too.
     void writeError(const std::string& message);
 
     // Non-copyable, deliberately. The sseHeadersSent_/jsonResponseSent_
@@ -132,6 +152,7 @@ private:
     bool sseHeadersSent_ = false;
     bool jsonResponseSent_ = false;
     bool doneSent_ = false;
+    bool errorSent_ = false;
 };
 
 using StreamingHttpHandler = std::function<void(const HttpRequest&, ResponseWriter&)>;

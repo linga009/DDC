@@ -272,6 +272,12 @@ void ResponseWriter::writeChunk(const std::string& text) {
     if (jsonResponseSent_) {
         return;  // a normal response already went out -- see ensureSseHeadersSent's comment
     }
+    if (doneSent_ || errorSent_) {
+        // The stream already sent its terminal frame ([DONE] or an error) --
+        // writing more content now would put it after the stream's own
+        // terminator, which no compliant client is still reading for.
+        return;
+    }
     socket_t s = static_cast<socket_t>(socketHandle_);
     std::ostringstream out;
     size_t start = 0;
@@ -318,6 +324,12 @@ void ResponseWriter::writeDone() {
     if (doneSent_) {
         return;  // one stream, one terminal sentinel
     }
+    if (errorSent_) {
+        // The stream already ended in failure -- appending a success
+        // sentinel after an error frame would tell a client the same stream
+        // both failed and completed successfully.
+        return;
+    }
     // Deliberately BEFORE the send, not after: a handler that already streamed
     // real content and then loses the peer must not leave this false and
     // invite a second sentinel attempt from a later caller.
@@ -357,6 +369,13 @@ void ResponseWriter::writeError(const std::string& message) {
         writeJsonResponse(500, R"({"error":")" + jsonEscapeString(message) + R"("})");
         return;
     }
+    if (doneSent_ || errorSent_) {
+        // The stream already ended (a [DONE] sentinel or a prior error frame
+        // already went out) -- a second terminal frame now would corrupt the
+        // wire by telling the client the same stream ended twice.
+        return;
+    }
+    errorSent_ = true;
     // Already streaming -- the only way left to signal failure is an SSE
     // error frame; the status line and Content-Type are already committed
     // and cannot be changed now.
