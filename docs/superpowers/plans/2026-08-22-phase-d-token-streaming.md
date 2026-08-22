@@ -1821,6 +1821,7 @@ git commit -m "Coordinator's POST /generate honors an optional stream:true field
 - Consumes: Task 4's `/generate` `stream: true` SSE wire format.
 - Produces: nothing consumed by a later task -- this is the last task in this plan.
 - **Important note, not obvious from the design doc**: `coordinator/public/app.js` is a plain `<script>`-tag browser file with no bundler and no ES module imports (confirmed: it has zero `import` statements today) -- it CANNOT literally call `SwarmClient.generateStream()` from `client.ts`. This task's dashboard changes therefore implement their own independent SSE-parsing logic in `app.js`, structurally similar to `client.ts`'s but not sharing code with it. Both exist; neither depends on the other.
+- **Important note on the `[DONE]` terminal sentinel** (added by Task 2/3's fix round, after this task was originally drafted): every successful stream now ends with a `data: [DONE]\n\n` frame (see Task 2's `ResponseWriter::writeDone()` and Task 3's per-token `/complete` wiring) -- this guarantees a non-empty wire response even when the model generates zero tokens (e.g. immediate end-of-generation), which is exactly the case one of this task's own tests below exercises. Both `client.ts`'s `generateStream()` and `app.js`'s `sendChatMessage()` MUST recognize a `data:` payload of exactly `"[DONE]"` as stream termination and never surface it as generated text. A stream that fails via a C++ exception ends with `event: error` instead and does NOT get `[DONE]` appended afterward (`HttpServer::run()`'s dispatch loop only calls `writeDone()` after a streaming handler returns normally, never on the exception path) -- this is why the "throws on error frame" test below deliberately does NOT add a trailing `[DONE]` frame to its stub, and a model literally generating the text "[DONE]" is a known, accepted ambiguity this task does not attempt to solve (the same tradeoff real OpenAI-compatible streaming APIs already carry).
 
 - [ ] **Step 1: Write the failing `client.ts` test**
 
@@ -1834,6 +1835,7 @@ test("generateStream yields each SSE chunk's text in order", async () => {
     res.write("data: Paris\n\n");
     res.write("data:  is\n\n");
     res.write("data:  nice\n\n");
+    res.write("data: [DONE]\n\n");
     res.end();
   });
   await new Promise<void>(resolve => server.listen(0, resolve));
@@ -1848,6 +1850,30 @@ test("generateStream yields each SSE chunk's text in order", async () => {
       pieces.push(piece);
     }
     assert.deepEqual(pieces, ["Paris", " is", " nice"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("generateStream does not yield the [DONE] terminal sentinel as a piece", async () => {
+  const server = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected test server to bind a port");
+  }
+  const client = new SwarmClient(`http://127.0.0.1:${address.port}`, "test-token");
+  try {
+    const pieces: string[] = [];
+    for await (const piece of client.generateStream("hi", "tinyllama-1.1b")) {
+      pieces.push(piece);
+    }
+    assert.deepEqual(pieces, []);
   } finally {
     server.close();
   }
@@ -1888,6 +1914,7 @@ test("generateStream reconstructs a multi-line chunk from multiple data: lines i
     for await (const _chunk of req) { /* drain */ }
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write("data: line one\ndata: line two\n\n");
+    res.write("data: [DONE]\n\n");
     res.end();
   });
   await new Promise<void>(resolve => server.listen(0, resolve));
@@ -1947,6 +1974,8 @@ Replace with:
   // whole reply before the caller sees anything. Throws if the stream
   // emits an "event: error" frame (with that frame's message), or if the
   // initial request itself fails before any streaming could begin.
+  // A trailing "data: [DONE]\n\n" frame marks a successful stream's end --
+  // it is a terminal sentinel, not generated text, and is never yielded.
   async *generateStream(prompt: string, modelId: string, n_predict?: number, signal?: AbortSignal): AsyncGenerator<string> {
     const res = await this.postJson("/generate", { prompt, modelId, n_predict, stream: true }, signal);
     if (!res.ok || !res.body) {
@@ -1971,9 +2000,14 @@ Replace with:
           throw new Error(`generateStream failed mid-stream: ${message}`);
         }
         const dataLines = frame.split("\n").filter(line => line.startsWith("data: "));
-        if (dataLines.length > 0) {
-          yield dataLines.map(line => line.slice("data: ".length)).join("\n");
+        if (dataLines.length === 0) {
+          continue;
         }
+        const text = dataLines.map(line => line.slice("data: ".length)).join("\n");
+        if (text === "[DONE]") {
+          return; // terminal sentinel -- stream is complete, not literal generated text
+        }
+        yield text;
       }
     }
   }
@@ -1982,7 +2016,7 @@ Replace with:
 - [ ] **Step 4: Run the `client.ts` tests**
 
 Run: `cd coordinator && npm test -- --test-name-pattern="generateStream"`
-Expected: PASS (all 3 new tests green).
+Expected: PASS (all 4 new tests green).
 
 - [ ] **Step 5: Write the dashboard's incremental rendering (manual verification only -- no automated test)**
 
@@ -2157,6 +2191,7 @@ async function sendChatMessage() {
           const dataLines = frame.split("\n").filter(line => line.startsWith("data: "));
           if (dataLines.length === 0) continue;
           const piece = dataLines.map(line => line.slice("data: ".length)).join("\n");
+          if (piece === "[DONE]") continue; // terminal sentinel -- not literal generated text
           assistantMessage.text += piece;
           if (!assistantMessageAdded) {
             chatHistory.push(assistantMessage);
@@ -2203,7 +2238,7 @@ echo
 echo "Now open http://127.0.0.1:18370 in a real browser."
 ```
 
-In the browser: paste `stream-verify`, save the token, confirm the chat panel's model dropdown lists `TinyLlama 1.1B`. Send a message and watch closely -- confirm text visibly appears progressively (word by word / piece by piece), not in one jump at the end after a long wait (the tell-tale sign of accidentally-still-buffered delivery). Send a follow-up to confirm multi-turn context still works exactly as it did non-streaming (this task didn't touch `buildChatPrompt`). Stop the node agent mid-conversation and send another message -- confirm an inline error message appears in the chat (not a hang, not a raw uncaught-exception in the browser console with nothing shown to the user).
+In the browser: paste `stream-verify`, save the token, confirm the chat panel's model dropdown lists `TinyLlama 1.1B`. Send a message and watch closely -- confirm text visibly appears progressively (word by word / piece by piece), not in one jump at the end after a long wait (the tell-tale sign of accidentally-still-buffered delivery). **Confirm the literal string "[DONE]" never appears anywhere in the rendered reply** -- this is the concrete, visible check that the `[DONE]`-filtering logic in `sendChatMessage()` actually works, not just that it compiles. Send a follow-up to confirm multi-turn context still works exactly as it did non-streaming (this task didn't touch `buildChatPrompt`). Stop the node agent mid-conversation and send another message -- confirm an inline error message appears in the chat (not a hang, not a raw uncaught-exception in the browser console with nothing shown to the user).
 
 When done:
 
