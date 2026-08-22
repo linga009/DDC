@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -316,6 +317,15 @@ TEST_F(NodeAgentFixture, CompleteEndpointStreamsRealTokensAsSeparateSseFrames) {
     // and n_predict=8 keep this fast, and shape (not exact tiny-model
     // output) is what's asserted, matching this repo's existing convention.
     EXPECT_NE(response.find("data: "), std::string::npos);
+    // The real end-to-end wire format ends with the same terminal sentinel
+    // OpenAI-compatible streaming APIs use, and it is the LAST thing on the
+    // wire -- this is what lets a client tell "the generation finished" apart
+    // from "the connection died mid-stream", which a bare socket close
+    // cannot express. A successful stream also carries no error frame.
+    size_t done = response.find("data: [DONE]\n\n");
+    ASSERT_NE(done, std::string::npos);
+    EXPECT_EQ(done + std::strlen("data: [DONE]\n\n"), response.size());
+    EXPECT_EQ(response.find("event: error"), std::string::npos);
 }
 
 TEST_F(NodeAgentFixture, CompleteEndpointWithoutStreamFieldBehavesExactlyAsBefore) {

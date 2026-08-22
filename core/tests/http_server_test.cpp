@@ -364,6 +364,81 @@ TEST_F(HttpServerFixture, StreamingRouteTreatsCrlfAsOneLineBreakNotTwo) {
     EXPECT_EQ(response.find('\r', frameStart), std::string::npos);
 }
 
+// The zero-chunk stream is a REAL, reachable case, not a synthetic one: an
+// instruct model handed an already-complete turn emits its end-of-generation
+// token as the very first token, so InferenceEngine::completeStreaming()
+// breaks before ever invoking its callback and the handler never calls
+// writeChunk(). Because SSE headers are sent lazily on first write, that
+// used to put literally ZERO bytes on the wire -- run() just closed the
+// socket, and a real client (verified with curl) reported "Empty reply from
+// server", indistinguishable from a crashed process. run() now calls
+// writeDone() after any streaming handler that returns normally, so even a
+// stream with no content is a well-formed 200 that terminates explicitly.
+TEST_F(HttpServerFixture, StreamingRouteThatWritesNothingStillSendsADoneTerminatedResponse) {
+    swarm::HttpServer server(kTestPort + 18);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter&) {
+        // Writes nothing at all -- a generation that produced zero tokens.
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 18, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_FALSE(response.empty());
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos);
+    EXPECT_NE(response.find("Content-Type: text/event-stream"), std::string::npos);
+    EXPECT_NE(response.find("data: [DONE]\n\n"), std::string::npos);
+}
+
+// The `data: [DONE]\n\n` sentinel is the same one real OpenAI-compatible
+// streaming APIs use, and it must come LAST -- a client reading frames in
+// order treats it as "the stream completed successfully, no more content is
+// coming", which is only true if no further frame follows it.
+TEST_F(HttpServerFixture, StreamingRouteAppendsADoneFrameAfterTheLastChunk) {
+    swarm::HttpServer server(kTestPort + 19);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("alpha");
+        writer.writeChunk("beta");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 19, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    size_t alpha = response.find("data: alpha\n\n");
+    size_t beta = response.find("data: beta\n\n");
+    size_t done = response.find("data: [DONE]\n\n");
+    ASSERT_NE(alpha, std::string::npos);
+    ASSERT_NE(beta, std::string::npos);
+    ASSERT_NE(done, std::string::npos);
+    EXPECT_LT(alpha, beta);
+    EXPECT_LT(beta, done);
+    // Nothing at all after the sentinel -- it is the final frame on the wire.
+    EXPECT_EQ(done + std::strlen("data: [DONE]\n\n"), response.size());
+}
+
+// A failure that happens BEFORE any byte has been written is still a normal
+// HTTP error: the status line hasn't been committed yet, so a real
+// `500 application/json` is available and matches byte-for-byte what the
+// same failure produces on this endpoint's non-streaming path. Committing to
+// a `200 text/event-stream` just to carry an error frame would tell every
+// client "this request succeeded" about a request that never started.
+TEST_F(HttpServerFixture, StreamingHandlerThatThrowsBeforeWritingAnythingGetsAJsonErrorNotAnSseStream) {
+    swarm::HttpServer server(kTestPort + 20);
+    server.routeStreaming("POST", "/stream", [](const swarm::HttpRequest&, swarm::ResponseWriter&) {
+        throw std::runtime_error("prompt too long");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 20, "POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("HTTP/1.1 500"), std::string::npos);
+    EXPECT_NE(response.find("Content-Type: application/json"), std::string::npos);
+    EXPECT_NE(response.find(R"({"error":"prompt too long"})"), std::string::npos);
+    EXPECT_EQ(response.find("text/event-stream"), std::string::npos);
+    EXPECT_EQ(response.find("event: error"), std::string::npos);
+    // A failed request must never claim success, by any route.
+    EXPECT_EQ(response.find("[DONE]"), std::string::npos);
+}
+
 // A ResponseWriter tracks, in its own members, whether SSE headers or a
 // complete JSON response have already gone out on its socket -- state that
 // is only correct if exactly one object owns it for the life of the
@@ -393,6 +468,12 @@ TEST_F(HttpServerFixture, StreamingRouteSendsAnErrorFrameWhenTheHandlerThrows) {
     EXPECT_NE(response.find("data: partial\n\n"), std::string::npos);
     EXPECT_NE(response.find("event: error"), std::string::npos);
     EXPECT_NE(response.find(R"("error":"boom")"), std::string::npos);
+    // The success sentinel and the error frame are mutually exclusive: run()
+    // calls writeDone() only on the path where the handler RETURNED, never
+    // on the path where it threw. A stream that ended in an error must not
+    // also announce "[DONE]" -- that would tell the client the generation
+    // completed successfully when it was cut short partway through.
+    EXPECT_EQ(response.find("[DONE]"), std::string::npos);
 }
 
 TEST_F(HttpServerFixture, StreamingRouteHandlerCanWriteANormalNonStreamingResponseInstead) {
@@ -408,6 +489,14 @@ TEST_F(HttpServerFixture, StreamingRouteHandlerCanWriteANormalNonStreamingRespon
     EXPECT_NE(response.find("Content-Type: application/json"), std::string::npos);
     EXPECT_NE(response.find(R"({"text":"not streamed"})"), std::string::npos);
     EXPECT_EQ(response.find("text/event-stream"), std::string::npos);
+    // writeDone() runs after EVERY streaming handler that returns normally,
+    // including this one -- but a handler that chose a plain JSON response
+    // has nothing streaming to terminate, so writeDone() must be a no-op
+    // there. Appending anything after a Content-Length-delimited body would
+    // corrupt the wire for every non-streaming caller of a
+    // routeStreaming()-registered endpoint (which is exactly what
+    // swarm-node-agent's /complete is without "stream": true).
+    EXPECT_EQ(response.find("[DONE]"), std::string::npos);
 }
 
 TEST_F(HttpServerFixture, RegularRoutesStillWorkAlongsideAStreamingRoute) {

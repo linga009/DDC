@@ -307,11 +307,59 @@ void ResponseWriter::writeChunk(const std::string& text) {
     }
 }
 
-void ResponseWriter::writeError(const std::string& message) {
-    ensureSseHeadersSent();
+void ResponseWriter::writeDone() {
     if (jsonResponseSent_) {
-        return;  // a normal response already went out -- see ensureSseHeadersSent's comment
+        // The handler chose a plain, complete JSON response -- there is no
+        // stream to terminate, and appending anything after a
+        // Content-Length-delimited body would corrupt the wire for every
+        // non-streaming caller of a routeStreaming()-registered endpoint.
+        return;
     }
+    if (doneSent_) {
+        return;  // one stream, one terminal sentinel
+    }
+    // Deliberately BEFORE the send, not after: a handler that already streamed
+    // real content and then loses the peer must not leave this false and
+    // invite a second sentinel attempt from a later caller.
+    doneSent_ = true;
+    // Unconditionally ensures headers first -- this is the whole point of the
+    // method. A generation that emitted its end-of-generation token as its
+    // very first token (a normal case for an instruct model handed an
+    // already-complete turn) never calls writeChunk(), so without this the
+    // lazily-sent SSE headers would never go out at all and the client would
+    // get zero bytes: an empty reply indistinguishable from a crashed server.
+    ensureSseHeadersSent();
+    socket_t s = static_cast<socket_t>(socketHandle_);
+    static const char kDoneFrame[] = "data: [DONE]\n\n";
+    size_t len = sizeof(kDoneFrame) - 1;  // exclude the trailing '\0'
+    size_t sentTotal = 0;
+    while (sentTotal < len) {
+        long long n = sendBytes(s, kDoneFrame + sentTotal, len - sentTotal);
+        if (n <= 0) {
+            throw std::runtime_error("failed to write SSE completion marker: peer gone");
+        }
+        sentTotal += static_cast<size_t>(n);
+    }
+}
+
+void ResponseWriter::writeError(const std::string& message) {
+    if (jsonResponseSent_) {
+        return;  // already committed to a response -- see ensureSseHeadersSent's comment
+    }
+    if (!sseHeadersSent_) {
+        // Nothing has been sent to the client yet -- a real error status is
+        // still possible and matches the non-streaming path's behavior for
+        // the identical failure, instead of committing to a 200
+        // text/event-stream just to report a failure that happened before
+        // any generation began. (A too-long prompt rejected during
+        // tokenization is the live example: the same request without
+        // "stream": true already gets exactly this 500 + JSON body.)
+        writeJsonResponse(500, R"({"error":")" + jsonEscapeString(message) + R"("})");
+        return;
+    }
+    // Already streaming -- the only way left to signal failure is an SSE
+    // error frame; the status line and Content-Type are already committed
+    // and cannot be changed now.
     socket_t s = static_cast<socket_t>(socketHandle_);
     std::string frame = "event: error\ndata: {\"error\":\"" + jsonEscapeString(message) + "\"}\n\n";
     size_t sentTotal = 0;
@@ -395,6 +443,19 @@ void HttpServer::run() {
                     ResponseWriter writer(static_cast<intptr_t>(client));
                     try {
                         std::get<2>(routeEntry)(request, writer);
+                        // Only on the path where the handler RETURNED, never
+                        // where it threw: `[DONE]` means "completed
+                        // successfully", so a stream that ended via
+                        // writeError() below must not also claim it. This
+                        // placement is what makes the three outcomes of a
+                        // streaming response distinguishable on the wire --
+                        // clean completion (including zero chunks) ends with
+                        // `data: [DONE]`, a genuine C++ exception ends with
+                        // `event: error`, and an outright process abort (the
+                        // disclosed, uncatchable GGML_ABORT-on-dead-remote
+                        // case) ends with neither, which is the honest signal
+                        // for it.
+                        writer.writeDone();
                     } catch (const std::exception& e) {
                         try {
                             writer.writeError(e.what());
