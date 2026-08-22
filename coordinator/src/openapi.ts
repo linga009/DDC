@@ -354,5 +354,142 @@ export const openApiDocument = {
         },
       },
     },
+    "/v1/models": {
+      get: {
+        summary: "List the model catalog in OpenAI's /v1/models shape. Requires auth (unlike real OpenAI, this is live swarm-backed data, not a fixed list) -- lists every catalog entry regardless of current per-model node availability, mirroring GET /catalog's own behavior; a currently-unavailable model still returns the same 503 from /v1/chat/completions or /generate that an unavailable model always has.",
+        responses: {
+          "401": UNAUTHORIZED_RESPONSE,
+          "200": {
+            description: "The model catalog, OpenAI-shaped",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    object: { type: "string" },
+                    data: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          id: { type: "string" },
+                          object: { type: "string" },
+                          created: { type: "integer" },
+                          owned_by: { type: "string" },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/v1/chat/completions": {
+      post: {
+        summary: "OpenAI-compatible chat completions. Classifies the flattened prompt, routes to a reputation-ranked active node serving the requested model, and returns a real generated reply with real token counts (not estimates) -- as one JSON chat.completion object by default, or a real SSE stream of chat.completion.chunk objects when \"stream\": true is set. No chat-template awareness (messages[] is flattened into a plain-text transcript -- see README), no sampling-parameter support (the engine is greedy-only; temperature/top_p/etc. are accepted but silently have no effect), no tool calls, and no n>1.",
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["model", "messages"],
+                properties: {
+                  model: { type: "string" },
+                  messages: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      required: ["role", "content"],
+                      properties: {
+                        role: { type: "string", enum: ["system", "user", "assistant"] },
+                        content: { type: "string" },
+                      },
+                    },
+                  },
+                  max_tokens: { type: "integer", minimum: 1, maximum: 512 },
+                  stream: { type: "boolean" },
+                  stream_options: {
+                    type: "object",
+                    properties: { include_usage: { type: "boolean" } },
+                    description: "Only include_usage is honored; when stream is true and this is true, one extra trailing chunk with an empty choices array and a top-level usage object is sent just before [DONE].",
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "401": UNAUTHORIZED_RESPONSE,
+          "200": {
+            description: "A chat.completion object (application/json) or a chat.completion.chunk SSE stream (text/event-stream), depending on \"stream\".",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    object: { type: "string" },
+                    created: { type: "integer" },
+                    model: { type: "string" },
+                    choices: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          index: { type: "integer" },
+                          message: { type: "object", properties: { role: { type: "string" }, content: { type: "string" } } },
+                          finish_reason: { type: "string" },
+                        },
+                      },
+                    },
+                    usage: {
+                      type: "object",
+                      properties: {
+                        prompt_tokens: { type: "integer" },
+                        completion_tokens: { type: "integer" },
+                        total_tokens: { type: "integer" },
+                      },
+                    },
+                  },
+                },
+              },
+              "text/event-stream": {
+                schema: {
+                  type: "string",
+                  description: "A sequence of \"data: <chat.completion.chunk JSON>\\n\\n\" frames terminated by \"data: [DONE]\\n\\n\", or an \"event: error\\ndata: {\"error\":{...}}\\n\\n\" frame on mid-stream failure.",
+                },
+              },
+            },
+          },
+          "400": {
+            description: "Invalid request, an unknown model, or a prompt classified unsafe -- always OpenAI's {error: {message, type, code}} envelope.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    error: {
+                      type: "object",
+                      properties: { message: { type: "string" }, type: { type: "string" }, code: { type: "string", nullable: true } },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          "503": {
+            description: "No active node currently serves the requested model",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "object" } } } } },
+          },
+          "502": {
+            description: "The selected node was unreachable or returned a malformed response",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "object" } } } } },
+          },
+        },
+      },
+    },
   },
 };

@@ -2003,3 +2003,488 @@ test("POST /generate without a stream field behaves exactly as before", async ()
     stub.server.close();
   }
 });
+
+test("POST /v1/chat/completions returns a real OpenAI-shaped response with real usage numbers", async () => {
+  const stub = await startStubNodeAgent(() => ({
+    status: 200,
+    body: { text: "Paris.", prompt_tokens: 12, completion_tokens: 3, finish_reason: "stop" },
+  }));
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "tinyllama-1.1b",
+        messages: [{ role: "user", content: "What is the capital of France?" }],
+      }),
+    });
+
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.object, "chat.completion");
+    assert.equal(body.model, "tinyllama-1.1b");
+    assert.equal(typeof body.id, "string");
+    assert.ok(body.id.startsWith("chatcmpl-"));
+    assert.equal(typeof body.created, "number");
+    assert.equal(body.choices.length, 1);
+    assert.equal(body.choices[0].index, 0);
+    assert.deepEqual(body.choices[0].message, { role: "assistant", content: "Paris." });
+    assert.equal(body.choices[0].finish_reason, "stop");
+    assert.deepEqual(body.usage, { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 });
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /v1/chat/completions flattens a system+user transcript before forwarding to the node", async () => {
+  let capturedPrompt = "";
+  const stub = await startStubNodeAgent((body) => {
+    capturedPrompt = (body as { prompt: string }).prompt;
+    return { status: 200, body: { text: "Hello!", prompt_tokens: 5, completion_tokens: 2, finish_reason: "stop" } };
+  });
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "tinyllama-1.1b",
+        messages: [
+          { role: "system", content: "Be concise." },
+          { role: "user", content: "Hi" },
+        ],
+      }),
+    });
+
+    assert.equal(capturedPrompt, "System: Be concise.\nUser: Hi\nAssistant:");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /v1/chat/completions returns 400 in OpenAI's error envelope for an unknown model", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "nonexistent-model", messages: [{ role: "user", content: "hi" }] }),
+    });
+
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error.type, "invalid_request_error");
+    assert.equal(typeof body.error.message, "string");
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /v1/chat/completions classifies before contacting any node and reports the block in error.message", async () => {
+  const classifier = new KeywordSafetyClassifier([{ category: "test", pattern: /blocked/i }]);
+  const { server, baseUrl } = await startTestServer(undefined, undefined, classifier);
+  try {
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "tinyllama-1.1b", messages: [{ role: "user", content: "this is blocked" }] }),
+    });
+
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error.type, "invalid_request_error");
+    assert.ok(body.error.message.includes("test"));
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /v1/chat/completions returns 503 in OpenAI's error envelope when no node serves the model", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "tinyllama-1.1b", messages: [{ role: "user", content: "hi" }] }),
+    });
+
+    assert.equal(res.status, 503);
+    const body = await res.json();
+    assert.equal(body.error.type, "invalid_request_error");
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /v1/chat/completions with stream:true relays real incremental OpenAI-shaped chunks ending in [DONE]", async () => {
+  const stub = await startStreamingStubNodeAgent(["Paris", " is", " nice"]);
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "tinyllama-1.1b",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "text/event-stream");
+    const text = await res.text();
+    const dataLines = text.split("\n\n").filter(f => f.startsWith("data: ")).map(f => f.slice("data: ".length));
+    assert.equal(dataLines[dataLines.length - 1], "[DONE]");
+    const chunks = dataLines.slice(0, -1).map(line => JSON.parse(line));
+    assert.deepEqual(chunks[0].choices[0].delta, { role: "assistant" });
+    assert.equal(chunks[0].object, "chat.completion.chunk");
+    const contentPieces = chunks.slice(1, -1).map(c => c.choices[0].delta.content);
+    assert.deepEqual(contentPieces, ["Paris", " is", " nice"]);
+    const lastChunk = chunks[chunks.length - 1];
+    assert.deepEqual(lastChunk.choices[0].delta, {});
+    assert.equal(lastChunk.choices[0].finish_reason, "stop");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /v1/chat/completions with stream:true returns a clean JSON 502 when the node answers JSON instead of a stream", async () => {
+  // The first of the three streaming failure shapes: the node fails BEFORE
+  // this route has committed any response headers, so a real
+  // OpenAI-enveloped JSON error is still possible (unlike a mid-stream
+  // failure, which can only end the connection). A node that ignores
+  // stream:true answers 200 application/json; relaying that under a
+  // text/event-stream content-type would look to an OpenAI client like a
+  // well-formed stream that produced nothing -- /generate's own whole-branch
+  // review found exactly that bug, so this route must not reintroduce it.
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "I am a pre-Phase-D node." } }));
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "tinyllama-1.1b",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get("content-type"), "application/json");
+    const body = await res.json();
+    assert.equal(body.error.type, "invalid_request_error");
+    assert.equal(typeof body.error.message, "string");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /v1/chat/completions with stream:true consumes the node's usage frame instead of relaying it as content", async () => {
+  // Task 2 gave the node agent an opt-in "event: usage" trailing frame; this
+  // route is its only consumer. That frame must never surface to the caller
+  // as a content delta (it is not generated text), and the numbers it
+  // carries are what make the streaming finish_reason real rather than a
+  // hardcoded "stop" -- both are exercised here, along with the
+  // stream_options.include_usage trailing chunk documented in openapi.json.
+  let capturedNodeRequest: Record<string, unknown> = {};
+  const usageStub = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    capturedNodeRequest = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: Par\n\n");
+    res.write("data: is\n\n");
+    res.write('event: usage\ndata: {"prompt_tokens":7,"completion_tokens":2,"finish_reason":"length"}\n\n');
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise<void>(resolve => usageStub.listen(0, resolve));
+  const stubAddress = usageStub.address();
+  if (stubAddress === null || typeof stubAddress === "string") {
+    throw new Error("expected usage stub to bind a port");
+  }
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        endpoint: `http://127.0.0.1:${stubAddress.port}`,
+        deviceTier: "desktop",
+        servesModel: "tinyllama-1.1b",
+      }),
+    });
+
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "tinyllama-1.1b",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+        stream_options: { include_usage: true },
+      }),
+    });
+
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    // The coordinator must actually ASK for the usage frame -- the node only
+    // emits one when includeUsage is set.
+    assert.equal(capturedNodeRequest.includeUsage, true);
+    assert.equal(capturedNodeRequest.stream, true);
+
+    const dataLines = text.split("\n\n").filter(f => f.startsWith("data: ")).map(f => f.slice("data: ".length));
+    assert.equal(dataLines[dataLines.length - 1], "[DONE]");
+    const chunks = dataLines.slice(0, -1).map(line => JSON.parse(line));
+
+    // role chunk, two content chunks, the finish chunk, then the usage chunk.
+    assert.deepEqual(chunks[0].choices[0].delta, { role: "assistant" });
+    assert.deepEqual(chunks.slice(1, 3).map(c => c.choices[0].delta.content), ["Par", "is"]);
+    assert.equal(chunks.length, 5, `expected exactly 5 chunks (the usage frame must not become a 6th content chunk), got ${chunks.length}`);
+
+    const finishChunk = chunks[3];
+    assert.deepEqual(finishChunk.choices[0].delta, {});
+    assert.equal(finishChunk.choices[0].finish_reason, "length");
+
+    const usageChunk = chunks[4];
+    assert.deepEqual(usageChunk.choices, []);
+    assert.deepEqual(usageChunk.usage, { prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 });
+  } finally {
+    server.close();
+    usageStub.close();
+  }
+});
+
+test("POST /v1/chat/completions with stream:true omits the trailing usage chunk unless stream_options.include_usage is set", async () => {
+  const usageStub = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: Par\n\n");
+    res.write('event: usage\ndata: {"prompt_tokens":7,"completion_tokens":1,"finish_reason":"stop"}\n\n');
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise<void>(resolve => usageStub.listen(0, resolve));
+  const stubAddress = usageStub.address();
+  if (stubAddress === null || typeof stubAddress === "string") {
+    throw new Error("expected usage stub to bind a port");
+  }
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        endpoint: `http://127.0.0.1:${stubAddress.port}`,
+        deviceTier: "desktop",
+        servesModel: "tinyllama-1.1b",
+      }),
+    });
+
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "tinyllama-1.1b",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+
+    const text = await res.text();
+    const dataLines = text.split("\n\n").filter(f => f.startsWith("data: ")).map(f => f.slice("data: ".length));
+    const chunks = dataLines.slice(0, -1).map(line => JSON.parse(line));
+    assert.equal(chunks.length, 3, "expected role + one content + finish chunk, with no usage chunk");
+    for (const chunk of chunks) {
+      assert.equal(chunk.usage, undefined);
+    }
+  } finally {
+    server.close();
+    usageStub.close();
+  }
+});
+
+test("POST /v1/chat/completions with stream:true relays a node's mid-stream error as an OpenAI-shaped error frame", async () => {
+  // The third distinct streaming failure shape (alongside a pre-commitment
+  // node failure, which is a clean JSON 502, and a truncated connection,
+  // which just ends): the node reports a real mid-generation failure with
+  // an "event: error" frame. readSseFrames() treats that as a legitimate
+  // terminal signal and does NOT throw, so this branch must relay it -- and
+  // must translate the node's own {error: "<string>"} body into OpenAI's
+  // {error: {message, type, code}} envelope rather than passing it through
+  // raw, since an OpenAI client parses that shape.
+  const erroringStub = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: Par\n\n");
+    res.write('event: error\ndata: {"error":"the model exploded"}\n\n');
+    res.end();
+  });
+  await new Promise<void>(resolve => erroringStub.listen(0, resolve));
+  const stubAddress = erroringStub.address();
+  if (stubAddress === null || typeof stubAddress === "string") {
+    throw new Error("expected erroring stub to bind a port");
+  }
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        endpoint: `http://127.0.0.1:${stubAddress.port}`,
+        deviceTier: "desktop",
+        servesModel: "tinyllama-1.1b",
+      }),
+    });
+
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "tinyllama-1.1b",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.ok(!text.includes("[DONE]"), `an error frame and [DONE] are mutually exclusive, got: ${JSON.stringify(text)}`);
+    const frames = text.split("\n\n").filter(f => f.length > 0);
+    const errorFrame = frames[frames.length - 1];
+    assert.ok(errorFrame.startsWith("event: error\ndata: "), `expected a terminal error frame, got: ${JSON.stringify(errorFrame)}`);
+    const payload = JSON.parse(errorFrame.slice("event: error\ndata: ".length));
+    assert.equal(payload.error.message, "the model exploded");
+    assert.equal(payload.error.type, "invalid_request_error");
+    assert.equal(payload.error.code, null);
+
+    const stillAlive = await authFetch(`${baseUrl}/v1/models`);
+    assert.equal(stillAlive.status, 200);
+  } finally {
+    server.close();
+    erroringStub.close();
+  }
+});
+
+test("POST /v1/chat/completions with stream:true ends the connection without [DONE] when the node's stream is truncated", async () => {
+  // A node process that dies mid-generation sends neither a [DONE] sentinel
+  // nor an "event: error" frame -- readSseFrames() detects exactly that and
+  // throws from INSIDE the for-await loop, after the coordinator has already
+  // committed 200 text/event-stream headers and written real chunks. The
+  // only correct recovery at that point is to end the connection (a fresh
+  // JSON 502 is impossible once headers are sent), leaving the caller with a
+  // [DONE]-less stream -- the same truncation signal SwarmClient's own
+  // generateStream() already treats as an error. This is a distinct failure
+  // shape from the mid-stream "event: error" frame, which is relayed as an
+  // OpenAI-shaped error frame instead.
+  const truncatingStub = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: Par\n\n");
+    res.write("data: is\n\n");
+    res.end();  // no [DONE], no error frame -- the stream just stops
+  });
+  await new Promise<void>(resolve => truncatingStub.listen(0, resolve));
+  const stubAddress = truncatingStub.address();
+  if (stubAddress === null || typeof stubAddress === "string") {
+    throw new Error("expected truncating stub to bind a port");
+  }
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        endpoint: `http://127.0.0.1:${stubAddress.port}`,
+        deviceTier: "desktop",
+        servesModel: "tinyllama-1.1b",
+      }),
+    });
+
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "tinyllama-1.1b",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "text/event-stream");
+    const text = await res.text();
+    assert.ok(!text.includes("[DONE]"), `expected no [DONE] terminator on a truncated stream, got: ${JSON.stringify(text)}`);
+    const dataLines = text.split("\n\n").filter(f => f.startsWith("data: ")).map(f => f.slice("data: ".length));
+    const chunks = dataLines.map(line => JSON.parse(line));
+    // The role chunk plus whatever content arrived before truncation -- and
+    // crucially NOT a synthesized final finish_reason chunk, which would
+    // misreport a died-mid-generation reply as a completed one.
+    assert.deepEqual(chunks[0].choices[0].delta, { role: "assistant" });
+    assert.deepEqual(chunks.slice(1).map(c => c.choices[0].delta.content), ["Par", "is"]);
+    for (const chunk of chunks) {
+      assert.equal(chunk.choices[0].finish_reason, null);
+    }
+
+    // The coordinator must survive the throw, not be left in a broken state.
+    const stillAlive = await authFetch(`${baseUrl}/v1/models`);
+    assert.equal(stillAlive.status, 200);
+  } finally {
+    server.close();
+    truncatingStub.close();
+  }
+});
+
+test("GET /v1/models lists the catalog in OpenAI's list shape and requires auth", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const unauth = await fetch(`${baseUrl}/v1/models`);
+    assert.equal(unauth.status, 401);
+
+    const res = await authFetch(`${baseUrl}/v1/models`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.object, "list");
+    assert.ok(Array.isArray(body.data));
+    assert.ok(body.data.length > 0);
+    const tinyllama = body.data.find((m: { id: string }) => m.id === "tinyllama-1.1b");
+    assert.ok(tinyllama);
+    assert.equal(tinyllama.object, "model");
+    assert.equal(tinyllama.owned_by, "swarm-llm");
+    assert.equal(typeof tinyllama.created, "number");
+    assert.equal(tinyllama.available, undefined);
+    assert.equal(tinyllama.minActiveNodes, undefined);
+  } finally {
+    server.close();
+  }
+});

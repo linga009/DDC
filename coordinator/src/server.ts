@@ -1,5 +1,5 @@
 import { createServer as createHttpServer, IncomingMessage, ServerResponse } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
@@ -9,6 +9,8 @@ import { PeerRegistry } from "./peer_registry.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
 import { openApiDocument } from "./openapi.ts";
+import { buildPromptFromMessages, type ChatMessage } from "./chat_prompt.ts";
+import { readSseFrames } from "./sse_frames.ts";
 
 const VALID_DEVICE_TIERS: readonly DeviceTier[] = ["desktop", "android", "ios"];
 
@@ -576,6 +578,222 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         } catch (err) {
           console.warn(`failed to forward /generate to node ${node.endpoint}:`, err);
           sendJson(res, 502, { error: "failed to reach the selected node" });
+        }
+        return;
+      }
+
+      if (method === "GET" && parts[0] === "v1" && parts[1] === "models" && parts.length === 2) {
+        const activeNodeCount = await federatedActiveNodeCount(registry, peers, reputation, authToken);
+        const data = catalog.availability(activeNodeCount).map(entry => ({
+          id: entry.id,
+          object: "model" as const,
+          created: 0,
+          owned_by: "swarm-llm",
+        }));
+        sendJson(res, 200, { object: "list", data });
+        return;
+      }
+
+      if (method === "POST" && parts[0] === "v1" && parts[1] === "chat" && parts[2] === "completions" && parts.length === 3) {
+        const body = await readJsonBody(req);
+        if (typeof body !== "object" || body === null) {
+          sendJson(res, 400, { error: { message: "request body must be a JSON object", type: "invalid_request_error", code: null } });
+          return;
+        }
+        const candidate = body as Record<string, unknown>;
+
+        if (typeof candidate.model !== "string" || !catalog.hasModel(candidate.model)) {
+          sendJson(res, 400, { error: { message: `The model '${String(candidate.model)}' does not exist.`, type: "invalid_request_error", code: "model_not_found" } });
+          return;
+        }
+        if (!Array.isArray(candidate.messages) || candidate.messages.length === 0) {
+          sendJson(res, 400, { error: { message: "messages must be a non-empty array", type: "invalid_request_error", code: null } });
+          return;
+        }
+        const messages: ChatMessage[] = [];
+        for (const m of candidate.messages) {
+          if (typeof m !== "object" || m === null) {
+            sendJson(res, 400, { error: { message: "each message must be an object", type: "invalid_request_error", code: null } });
+            return;
+          }
+          const mc = m as Record<string, unknown>;
+          if (mc.role !== "system" && mc.role !== "user" && mc.role !== "assistant") {
+            sendJson(res, 400, { error: { message: "each message's role must be one of: system, user, assistant", type: "invalid_request_error", code: null } });
+            return;
+          }
+          if (typeof mc.content !== "string") {
+            sendJson(res, 400, { error: { message: "each message's content must be a string", type: "invalid_request_error", code: null } });
+            return;
+          }
+          messages.push({ role: mc.role, content: mc.content });
+        }
+        let maxTokens = DEFAULT_N_PREDICT;
+        if (candidate.max_tokens !== undefined) {
+          if (
+            typeof candidate.max_tokens !== "number" ||
+            !Number.isInteger(candidate.max_tokens) ||
+            candidate.max_tokens < 1 ||
+            candidate.max_tokens > MAX_N_PREDICT
+          ) {
+            sendJson(res, 400, { error: { message: `max_tokens must be an integer between 1 and ${MAX_N_PREDICT}`, type: "invalid_request_error", code: null } });
+            return;
+          }
+          maxTokens = candidate.max_tokens;
+        }
+        const stream = candidate.stream === true;
+        const includeUsageInStream =
+          stream &&
+          typeof candidate.stream_options === "object" &&
+          candidate.stream_options !== null &&
+          (candidate.stream_options as Record<string, unknown>).include_usage === true;
+
+        const prompt = buildPromptFromMessages(messages);
+
+        try {
+          const result = await withTimeout(classifier.classify(prompt), CLASSIFY_TIMEOUT_MS);
+          const safe = result?.safe;
+          const categories = result?.categories;
+          if (typeof safe !== "boolean" || !Array.isArray(categories)) {
+            throw new Error("classifier returned a malformed result");
+          }
+          if (!safe) {
+            const categoryList = uniqueCategories(categories);
+            sendJson(res, 400, {
+              error: {
+                message: `Prompt blocked by safety filter (categories: ${categoryList.length > 0 ? categoryList.join(", ") : "unspecified"}).`,
+                type: "invalid_request_error",
+                code: null,
+              },
+            });
+            return;
+          }
+        } catch {
+          sendJson(res, 400, {
+            error: { message: "Prompt blocked: the safety classifier failed or timed out.", type: "invalid_request_error", code: null },
+          });
+          return;
+        }
+
+        const node = selectNode(registry.listActive(reputation), reputation, candidate.model, random);
+        if (!node) {
+          sendJson(res, 503, {
+            error: { message: `No active node currently serves model '${candidate.model}'.`, type: "invalid_request_error", code: null },
+          });
+          return;
+        }
+
+        const chatCompletionId = "chatcmpl-" + randomUUID();
+        const createdAt = Math.floor(Date.now() / 1000);
+
+        if (!stream) {
+          try {
+            const nodeRes = await fetch(`${node.endpoint}/complete`, {
+              method: "POST",
+              headers: { "content-type": "application/json", "authorization": `Bearer ${authToken}` },
+              body: JSON.stringify({ prompt, n_predict: maxTokens }),
+              signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
+            });
+            if (!nodeRes.ok) {
+              sendJson(res, 502, { error: { message: `node returned status ${nodeRes.status}`, type: "invalid_request_error", code: null } });
+              return;
+            }
+            const nodeBody = await nodeRes.json();
+            if (typeof nodeBody.text !== "string") {
+              sendJson(res, 502, { error: { message: "node returned a malformed response", type: "invalid_request_error", code: null } });
+              return;
+            }
+            const promptTokens = typeof nodeBody.prompt_tokens === "number" ? nodeBody.prompt_tokens : 0;
+            const completionTokens = typeof nodeBody.completion_tokens === "number" ? nodeBody.completion_tokens : 0;
+            const finishReason = nodeBody.finish_reason === "length" ? "length" : "stop";
+            sendJson(res, 200, {
+              id: chatCompletionId,
+              object: "chat.completion",
+              created: createdAt,
+              model: candidate.model,
+              choices: [{ index: 0, message: { role: "assistant", content: nodeBody.text }, finish_reason: finishReason }],
+              usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
+            });
+          } catch (err) {
+            console.warn(`failed to forward /v1/chat/completions to node ${node.endpoint}:`, err);
+            sendJson(res, 502, { error: { message: "failed to reach the selected node", type: "invalid_request_error", code: null } });
+          }
+          return;
+        }
+
+        try {
+          const nodeRes = await fetch(`${node.endpoint}/complete`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "authorization": `Bearer ${authToken}` },
+            body: JSON.stringify({ prompt, n_predict: maxTokens, stream: true, includeUsage: true }),
+            signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
+          });
+          const nodeContentType = (nodeRes.headers.get("content-type") ?? "").toLowerCase();
+          if (!nodeRes.ok || !nodeRes.body || !nodeContentType.startsWith("text/event-stream")) {
+            sendJson(res, 502, { error: { message: `node returned status ${nodeRes.status}`, type: "invalid_request_error", code: null } });
+            return;
+          }
+
+          res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+          const baseChunk = { id: chatCompletionId, object: "chat.completion.chunk", created: createdAt, model: candidate.model };
+          res.write(`data: ${JSON.stringify({ ...baseChunk, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
+
+          let finishReason: "stop" | "length" = "stop";
+          let promptTokens = 0;
+          let completionTokens = 0;
+          const reader = nodeRes.body.getReader();
+          // readSseFrames() throws if the node's stream ends without a
+          // [DONE] sentinel or an error frame -- i.e. it can throw from
+          // INSIDE this loop, after headers and real chunks have already
+          // gone out. That case is deliberately not handled here: it falls
+          // through to the catch below, which ends the connection without a
+          // [DONE], so a caller sees the same truncation signal the node's
+          // own wire protocol gives (see SwarmClient.generateStream()).
+          // Synthesizing the trailing finish_reason chunk here anyway would
+          // report a died-mid-generation reply as a completed one.
+          for await (const frame of readSseFrames(reader)) {
+            if (frame.event === "error") {
+              const message = (() => {
+                try {
+                  return JSON.parse(frame.data).error ?? "generation failed mid-stream";
+                } catch {
+                  return "generation failed mid-stream";
+                }
+              })();
+              res.write(`event: error\ndata: ${JSON.stringify({ error: { message, type: "invalid_request_error", code: null } })}\n\n`);
+              res.end();
+              return;
+            }
+            if (frame.event === "usage") {
+              const usage = JSON.parse(frame.data);
+              promptTokens = typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : 0;
+              completionTokens = typeof usage.completion_tokens === "number" ? usage.completion_tokens : 0;
+              finishReason = usage.finish_reason === "length" ? "length" : "stop";
+              continue;
+            }
+            res.write(`data: ${JSON.stringify({ ...baseChunk, choices: [{ index: 0, delta: { content: frame.data }, finish_reason: null }] })}\n\n`);
+          }
+
+          res.write(`data: ${JSON.stringify({ ...baseChunk, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })}\n\n`);
+          if (includeUsageInStream) {
+            res.write(`data: ${JSON.stringify({ ...baseChunk, choices: [], usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens } })}\n\n`);
+          }
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } catch (err) {
+          // Three distinct failures land here: an unreachable/timed-out node
+          // (nothing sent yet -- a real 502 is still possible), a node whose
+          // stream was truncated mid-generation (readSseFrames throws, but
+          // headers are already committed), and any write failure after the
+          // response began. Once headersSent is true the status line and
+          // content-type are on the wire and cannot be revised, so ending
+          // the connection is the only honest signal available -- identical
+          // to POST /generate's own streaming branch.
+          console.warn(`failed to forward streaming /v1/chat/completions to node ${node.endpoint}:`, err);
+          if (!res.headersSent) {
+            sendJson(res, 502, { error: { message: "failed to reach the selected node", type: "invalid_request_error", code: null } });
+          } else {
+            res.end();
+          }
         }
         return;
       }
