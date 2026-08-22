@@ -20,12 +20,29 @@ export interface SseFrame {
 // multi-line data: payload (multiple consecutive "data: " lines in one
 // frame, per the SSE spec's own multi-line convention) is joined with "\n"
 // into SseFrame.data.
+//
+// Throws if the underlying stream ends WITHOUT ever seeing a [DONE]
+// sentinel or an "event: error" frame -- mirroring the exact safety check
+// client.ts's own generateStream() already has. The underlying HTTP
+// response has no Content-Length (it's SSE, connection-delimited), so a
+// node process dying mid-generation and a genuinely finished stream both
+// report `done: true` from the reader with no other signal; without this
+// check a truncated reply would be silently indistinguishable from a
+// successfully completed one. An "event: error" frame counts as a
+// legitimate terminal signal on its own -- core/src/http_server.cpp's
+// ResponseWriter never sends [DONE] after an error frame (the two are
+// code-enforced as mutually exclusive on the wire) -- so a stream ending
+// right after one does NOT throw.
 export async function* readSseFrames(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<SseFrame> {
   const decoder = new TextDecoder();
   let buffer = "";
+  let sawTerminalSignal = false;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) {
+      if (!sawTerminalSignal) {
+        throw new Error("readSseFrames: stream ended without a [DONE] terminator or an error frame -- the connection was likely lost mid-stream");
+      }
       break;
     }
     buffer += decoder.decode(value, { stream: true });
@@ -41,7 +58,11 @@ export async function* readSseFrames(reader: ReadableStreamDefaultReader<Uint8Ar
       }
       const data = dataLines.map(line => line.slice("data: ".length)).join("\n");
       if (data === "[DONE]") {
+        sawTerminalSignal = true;
         return;
+      }
+      if (event === "error") {
+        sawTerminalSignal = true;
       }
       yield { event, data };
     }
