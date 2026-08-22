@@ -2095,6 +2095,29 @@ test("POST /v1/chat/completions returns 400 in OpenAI's error envelope for an un
   }
 });
 
+test("POST /v1/chat/completions returns 400 in OpenAI's error envelope for a malformed JSON body", async () => {
+  // Regression test: readJsonBody() throwing must not fall through to the
+  // shared outer handler's {error: string} shape -- every 400 this route
+  // produces must keep openapi.json's documented {error: {message, type,
+  // code}} envelope, matching every other error path on this route.
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not valid json",
+    });
+
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(typeof body.error, "object");
+    assert.equal(body.error.type, "invalid_request_error");
+    assert.equal(typeof body.error.message, "string");
+  } finally {
+    server.close();
+  }
+});
+
 test("POST /v1/chat/completions classifies before contacting any node and reports the block in error.message", async () => {
   const classifier = new KeywordSafetyClassifier([{ category: "test", pattern: /blocked/i }]);
   const { server, baseUrl } = await startTestServer(undefined, undefined, classifier);
@@ -2279,6 +2302,66 @@ test("POST /v1/chat/completions with stream:true consumes the node's usage frame
     const usageChunk = chunks[4];
     assert.deepEqual(usageChunk.choices, []);
     assert.deepEqual(usageChunk.usage, { prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 });
+  } finally {
+    server.close();
+    usageStub.close();
+  }
+});
+
+test("POST /v1/chat/completions with stream:true survives a malformed usage frame instead of crashing the relay", async () => {
+  // Regression test: the usage frame's JSON.parse must be guarded the same
+  // way the error frame's already is -- a node emitting invalid JSON there
+  // (buggy or hostile agent build) must not throw uncaught inside the relay
+  // loop and truncate an otherwise-complete stream.
+  const usageStub = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: Par\n\n");
+    res.write("event: usage\ndata: {not valid json\n\n");
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise<void>(resolve => usageStub.listen(0, resolve));
+  const stubAddress = usageStub.address();
+  if (stubAddress === null || typeof stubAddress === "string") {
+    throw new Error("expected usage stub to bind a port");
+  }
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        endpoint: `http://127.0.0.1:${stubAddress.port}`,
+        deviceTier: "desktop",
+        servesModel: "tinyllama-1.1b",
+      }),
+    });
+
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "tinyllama-1.1b",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    const dataLines = text.split("\n\n").filter(f => f.startsWith("data: ")).map(f => f.slice("data: ".length));
+    // The malformed frame falls back to an empty {} rather than throwing --
+    // so the [DONE]-terminated stream still completes normally, just with
+    // fallback usage numbers, instead of being reported as truncated.
+    assert.equal(dataLines[dataLines.length - 1], "[DONE]");
+    const chunks = dataLines.slice(0, -1).map(line => JSON.parse(line));
+    const finishChunk = chunks[chunks.length - 1];
+    assert.equal(finishChunk.choices[0].finish_reason, "stop");
+
+    // The coordinator itself must still be responsive afterward.
+    const follow = await authFetch(`${baseUrl}/v1/models`);
+    assert.equal(follow.status, 200);
   } finally {
     server.close();
     usageStub.close();

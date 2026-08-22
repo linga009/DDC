@@ -595,7 +595,18 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
       }
 
       if (method === "POST" && parts[0] === "v1" && parts[1] === "chat" && parts[2] === "completions" && parts.length === 3) {
-        const body = await readJsonBody(req);
+        let body: unknown;
+        try {
+          body = await readJsonBody(req);
+        } catch {
+          // A malformed body would otherwise fall through to the shared
+          // outer catch below, which answers {error: string} -- breaking
+          // this route's own documented "always OpenAI's {error: {message,
+          // type, code}} envelope" contract in openapi.ts. Guarded locally
+          // so every 400 this route can produce keeps the same shape.
+          sendJson(res, 400, { error: { message: "request body is not valid JSON", type: "invalid_request_error", code: null } });
+          return;
+        }
         if (typeof body !== "object" || body === null) {
           sendJson(res, 400, { error: { message: "request body must be a JSON object", type: "invalid_request_error", code: null } });
           return;
@@ -764,7 +775,15 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
               return;
             }
             if (frame.event === "usage") {
-              const usage = JSON.parse(frame.data);
+              // Same untrusted-source treatment as the error frame above --
+              // a malformed usage frame must not crash the relay loop.
+              const usage = (() => {
+                try {
+                  return JSON.parse(frame.data);
+                } catch {
+                  return {};
+                }
+              })();
               promptTokens = typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : 0;
               completionTokens = typeof usage.completion_tokens === "number" ? usage.completion_tokens : 0;
               finishReason = usage.finish_reason === "length" ? "length" : "stop";
