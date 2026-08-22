@@ -466,6 +466,33 @@ TEST_F(HttpServerFixture, RegularRoutesStillWorkAlongsideAStreamingRoute) {
     EXPECT_NE(response.find(R"({"status":"ready"})"), std::string::npos);
     EXPECT_EQ(response.find("text/event-stream"), std::string::npos);
 }
+
+// Pins the ACTUAL cross-table precedence rule, because it is not the
+// "first registration wins" one might assume: run() scans streamingRoutes_
+// before routes_, so registering the same (method, path) via route() FIRST
+// and routeStreaming() second still dispatches to the streaming handler.
+// Neither registration call rejects or overrides the other -- the loser is
+// simply unreachable. This test exists so the header comment documenting
+// that rule is backed by observed behavior rather than assumption.
+TEST_F(HttpServerFixture, AStreamingRouteTakesPrecedenceOverASameKeyRegularRouteRegisteredFirst) {
+    swarm::HttpServer server(kTestPort + 15);
+    bool regularHandlerRan = false;
+    server.route("POST", "/both", [&regularHandlerRan](const swarm::HttpRequest&) {
+        regularHandlerRan = true;
+        return swarm::HttpResponse{200, R"({"from":"regular"})"};
+    });
+    server.routeStreaming("POST", "/both", [](const swarm::HttpRequest&, swarm::ResponseWriter& writer) {
+        writer.writeChunk("from streaming");
+    });
+    startServer(server);
+
+    std::string response = sendRawRequest(kTestPort + 15, "POST /both HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    EXPECT_NE(response.find("text/event-stream"), std::string::npos);
+    EXPECT_NE(response.find("data: from streaming\n\n"), std::string::npos);
+    EXPECT_EQ(response.find(R"({"from":"regular"})"), std::string::npos);
+    EXPECT_FALSE(regularHandlerRan);
+}
 ```
 
 - [ ] **Step 2: Confirm the tests fail to compile**
@@ -574,15 +601,21 @@ public:
     explicit HttpServer(int port);
 
     // Registers a handler for an exact (method, path) pair. Must be called
-    // before run(). A (method, path) already registered via route() or
-    // routeStreaming() cannot be registered again via either -- first
-    // registration wins, checked across both tables together.
+    // before run(). Registering the same (method, path) more than once is
+    // not rejected -- the losing registration is simply never reached.
+    // Within this table the first match wins. Across the two tables, it is
+    // NOT registration order that decides: run() scans the
+    // routeStreaming() table BEFORE this one, so a (method, path) present
+    // in both is always served by the streaming handler, even if the
+    // route() call came first.
     void route(const std::string& method, const std::string& path, HttpHandler handler);
 
     // Registers a handler that decides, per request, whether to respond
     // with one complete response (ResponseWriter::writeJsonResponse) or an
-    // SSE stream (writeChunk()/writeError()). Same first-match-wins
-    // contract as route(), checked jointly with it.
+    // SSE stream (writeChunk()/writeError()). Same first-match-wins rule
+    // within this table as route() has within its own; this table is the
+    // one run() consults first, so a (method, path) registered in both
+    // tables resolves here regardless of registration order.
     void routeStreaming(const std::string& method, const std::string& path, StreamingHttpHandler handler);
 
     // Binds the port on 127.0.0.1 and blocks forever, accepting one
