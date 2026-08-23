@@ -892,6 +892,178 @@ test("POST /generate assembles a fresh pipeline via a registered launcher when n
   }
 });
 
+test("POST /generate for a warm pipeline with an active driver never calls a registered launcher, even when one exists for the same model", async () => {
+  // Distinguishes "the warm-check ran and correctly found the driver still
+  // active, so it skipped reassembly" from "the warm-check code was deleted
+  // and the function fell through to selectNode() by coincidence" -- unlike
+  // the older "warm tracked pipeline routes to it directly" test above, a
+  // launcher IS registered here, so if ensurePipelineReady's warm-check were
+  // ever removed or broken, this test would catch it calling the launcher
+  // when it must not.
+  const driverStub = await startStubNodeAgent(() => ({ status: 200, body: { text: "from the warm driver" } }));
+  let launcherCallCount = 0;
+  const launcherStub = await startStubNodeAgent(() => {
+    launcherCallCount++;
+    return { status: 200, body: { status: "ready" } };
+  });
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
+  const { server, baseUrl, registry, pipelineTracker, launcherRegistry } = await startTestServer(bigCatalog);
+  try {
+    const driverNodeId = registry.register(driverStub.endpoint, "desktop", undefined, "big-model");
+    pipelineTracker.markWarm("big-model", driverNodeId, []);
+    // A second, unrelated active node so selectPipeline()'s own
+    // requiredNodeCount(2)-candidates gate (pipeline_selector.ts) can't be
+    // the reason the launcher goes uncalled -- without this, the warm-check
+    // could be deleted entirely and this test would still pass by
+    // coincidence, since selectPipeline() would bail out on too few active
+    // nodes before ever reaching the launcher fetch. (Verified live: see
+    // this test's mutation-check note in the task report.)
+    registry.register("http://127.0.0.1:1", "desktop");
+
+    const launcherPort = Number(new URL(launcherStub.endpoint).port);
+    launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherPort);
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { text: "from the warm driver" });
+    assert.equal(launcherCallCount, 0, "a healthy warm driver must never trigger a launcher call");
+  } finally {
+    server.close();
+    driverStub.server.close();
+    launcherStub.server.close();
+  }
+});
+
+test("POST /generate for a requiredNodeCount>1 model with a stale tracked pipeline calls the registered launcher exactly once", async () => {
+  // Companion to the "falls back to manual registration" test above, but
+  // for the case where a launcher IS registered: staleness must trigger
+  // exactly one reassembly call to the launcher's /pipeline endpoint, not
+  // zero (which would mean the staleness check never fired) and not more
+  // than one (which would mean something is looping or double-assembling).
+  let launcherCallCount = 0;
+  const stub = await startStubNodeAgent((body) => {
+    const candidate = body as Record<string, unknown>;
+    if (candidate.model !== undefined) {
+      launcherCallCount++;
+      return { status: 200, body: { status: "ready" } };
+    }
+    return { status: 200, body: { text: "from the freshly assembled driver" } };
+  });
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
+  const { server, baseUrl, registry, launcherRegistry, pipelineTracker } = await startTestServer(bigCatalog);
+  try {
+    // A tracked pipeline pointing at a driver that was never actually
+    // registered -- matches the existing "stale tracked pipeline... falls
+    // back to manual registration" test's own staleness setup above.
+    pipelineTracker.markWarm("big-model", "some-driver-id-not-in-the-registry", []);
+
+    // selectPipeline() needs requiredNodeCount candidates already in the
+    // active pool before it will pick anything -- see the "assembles a
+    // fresh pipeline" test's own comment above for why two generic nodes
+    // are registered here.
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+
+    const launcherPort = Number(new URL(stub.endpoint).port);
+    launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { text: "from the freshly assembled driver" });
+    assert.equal(launcherCallCount, 1, "a stale tracked pipeline must trigger exactly one launcher call");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /generate for a warm pipeline heartbeats the driver, keeping it alive past its original 30s registration window", async () => {
+  // Finding 1 regression test: ensurePipelineReady's warm-check must call
+  // registry.heartbeat() on the driver every time it confirms the driver is
+  // still active, not just read its state -- otherwise a launcher-spawned
+  // driver (which never self-registers/self-heartbeats the way an
+  // operator-run swarm-node-agent can) silently ages out of listActive()
+  // exactly registry.ts's 30s timeoutMs after its one-time registration,
+  // even though it's still alive and healthy, forcing an unnecessary
+  // teardown/respawn/model-reload cycle. Uses NodeRegistry/LauncherRegistry's
+  // injectable clock (built directly here rather than via startTestServer,
+  // which owns its own internal, non-injectable registry -- see the
+  // "forwards the shared auth token" test above for the same pattern) to
+  // prove this deterministically instead of relying on real wall-clock
+  // sleeps.
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "from the warm driver" } }));
+  let launcherCallCount = 0;
+  const launcherStub = await startStubNodeAgent(() => {
+    launcherCallCount++;
+    return { status: 200, body: { status: "ready" } };
+  });
+
+  let now = 0;
+  const clock = () => now;
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
+  const registry = new NodeRegistry(clock);
+  const catalog = new ModelCatalog(bigCatalog);
+  const launcherRegistry = new LauncherRegistry(clock);
+  const pipelineTracker = new PipelineTracker();
+  const server = createServer(registry, catalog, new PeerRegistry(), new KeywordSafetyClassifier([]), new ReputationTracker(), TEST_AUTH_TOKEN, Math.random, launcherRegistry, pipelineTracker);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected server to bind a real port");
+  }
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const driverNodeId = registry.register(stub.endpoint, "desktop", undefined, "big-model");
+    pipelineTracker.markWarm("big-model", driverNodeId, []);
+    const launcherPort = Number(new URL(launcherStub.endpoint).port);
+    launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherPort);
+
+    // Advance just under 30s and make a request. The driver is still
+    // active by its original registration timestamp, so this should route
+    // warm and (per the fix) heartbeat it, resetting its 30s window from
+    // this point rather than from the original registration.
+    now += 25000;
+    const res1 = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+    assert.equal(res1.status, 200);
+    assert.deepEqual(await res1.json(), { text: "from the warm driver" });
+
+    // Advance another 25s: 50s total since the ORIGINAL registration
+    // (past its original 30s window, so a version of this code without
+    // Finding 1's fix would have let the driver age out and reassemble via
+    // the launcher by now), but only 25s since the heartbeat issued above
+    // -- still within the 30s window from there.
+    now += 25000;
+    const res2 = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+    assert.equal(res2.status, 200);
+    assert.deepEqual(await res2.json(), { text: "from the warm driver" });
+
+    assert.equal(launcherCallCount, 0, "the heartbeat must keep the driver warm past its original 30s window, so the launcher is never called");
+  } finally {
+    server.close();
+    stub.server.close();
+    launcherStub.server.close();
+  }
+});
+
 test("GET /catalog aggregates a live peer's reported capacity with local capacity", async () => {
   // Two real, independent coordinator instances. Instance B has enough
   // local nodes to unlock a model on its own; instance A has none, but

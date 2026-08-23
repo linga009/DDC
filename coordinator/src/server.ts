@@ -224,6 +224,22 @@ async function ensurePipelineReady(
   if (tracked?.state === "warm" && tracked.driverNodeId) {
     const driverStillActive = registry.listActive(reputation).some(n => n.nodeId === tracked.driverNodeId);
     if (driverStillActive) {
+      // A launcher-spawned driver never self-registers/self-heartbeats
+      // with the coordinator the way an operator-run swarm-node-agent can
+      // (nothing external pings it), and /generate's own forwarding call
+      // below doesn't touch NodeRegistry either -- so without this, a
+      // perfectly healthy driver ages out of listActive() exactly
+      // registry.ts's 30s timeoutMs after its one-time registration call
+      // in the try block below, forcing a full, unnecessary teardown/
+      // respawn/model-reload cycle on whatever request happens to land
+      // just after that timer fires. Heartbeating here, on every request
+      // that finds the driver still warm, keeps a genuinely healthy
+      // pipeline alive indefinitely. This can't mask a real failure: if
+      // the underlying agent process actually died, the /complete fetch
+      // below (via the caller's own selectNode/forward step) still fails
+      // with the existing 502 handling regardless of what this heartbeat
+      // just did to its bookkeeping.
+      registry.heartbeat(tracked.driverNodeId);
       return;
     }
   }
