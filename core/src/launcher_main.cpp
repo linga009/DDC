@@ -19,7 +19,10 @@
 using socket_t = SOCKET;
 #else
 #include <arpa/inet.h>
+#include <cerrno>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 using socket_t = int;
@@ -94,7 +97,86 @@ bool pollHealthOnce(int port, const std::string& authToken) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(static_cast<uint16_t>(port));
-    if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+
+    // Bound the connect() itself to a short, fixed timeout instead of
+    // trusting the OS's own connection-refused detection: live-measured on
+    // this project's actual Windows/MSYS2 target platform, a blocking
+    // connect() to a port nothing is listening on (the exact case that
+    // matters here -- an unhealthy or crashed spawn) takes ~2.2s to fail,
+    // not the near-instant failure the surrounding waitForAgentHealthy()'s
+    // 500ms-sleep-per-attempt design assumes. Left unbounded, 60 poll
+    // attempts * ~2.2s each pushed the real unhealthy-spawn detection
+    // ceiling to ~2m42s despite the intended ~30s one -- and because this
+    // launcher's HttpServer is single-threaded, the entire launcher is
+    // unresponsive to any other POST /pipeline request for that whole
+    // window, not just the one failing request.
+    //
+    // Standard technique for a bounded-timeout connect on a blocking socket:
+    // switch to non-blocking mode, attempt connect() (which for an
+    // in-progress TCP handshake returns immediately with
+    // EWOULDBLOCK/EINPROGRESS rather than blocking), then select() on the
+    // write-set with a short timeout to wait for either completion or the
+    // deadline. select() returning writable does NOT by itself mean the
+    // connection succeeded -- SO_ERROR via getsockopt() afterward is what
+    // actually distinguishes "connected" from "refused."
+#ifdef _WIN32
+    u_long nonBlockingMode = 1;
+    ioctlsocket(s, FIONBIO, &nonBlockingMode);
+#else
+    int originalFlags = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, originalFlags | O_NONBLOCK);
+#endif
+
+    int connectResult = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    bool connected = (connectResult == 0);  // rare, but a loopback connect can complete synchronously
+    if (!connected) {
+#ifdef _WIN32
+        bool inProgress = (WSAGetLastError() == WSAEWOULDBLOCK);
+#else
+        bool inProgress = (errno == EINPROGRESS);
+#endif
+        if (inProgress) {
+            fd_set writeSet;
+            FD_ZERO(&writeSet);
+            FD_SET(s, &writeSet);
+            timeval timeout{};
+            // 250ms, not the naive-seeming 1s: live-measured, a 1s bound
+            // still yielded a ~91s worst-case ceiling (60 * (1s + 500ms
+            // sleep)), because this platform's true refusal-detection delay
+            // (~2.2s) exceeds even a full 1s budget, so EVERY unhealthy
+            // attempt was consuming the entire timeout rather than
+            // returning early. 250ms keeps the same ceiling math down near
+            // the originally-intended ~30-45s window (60 * (250ms + 500ms)
+            // = 45s) while staying enormously generous for the healthy
+            // path, where a real listening loopback socket completes the
+            // TCP handshake in low single-digit milliseconds, not hundreds.
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 250000;
+#ifdef _WIN32
+            // Windows' select() ignores its first argument entirely (unlike
+            // POSIX, where it must be the highest fd + 1) -- 0 is the
+            // conventional value to pass here.
+            int selectResult = select(0, nullptr, &writeSet, nullptr, &timeout);
+#else
+            int selectResult = select(s + 1, nullptr, &writeSet, nullptr, &timeout);
+#endif
+            if (selectResult > 0 && FD_ISSET(s, &writeSet)) {
+                int soError = 0;
+                socklen_t soErrorLen = sizeof(soError);
+                if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soError), &soErrorLen) == 0 &&
+                    soError == 0) {
+                    connected = true;
+                }
+            }
+            // selectResult <= 0 (timeout or select() error) or a non-zero
+            // SO_ERROR both mean "not connected" -- `connected` stays false.
+        }
+        // Any other connect() failure (e.g. a synchronous refusal some
+        // platforms can return immediately even in non-blocking mode) also
+        // just means "not connected" -- `connected` stays false.
+    }
+
+    if (!connected) {
 #ifdef _WIN32
         closesocket(s);
 #else
@@ -102,6 +184,17 @@ bool pollHealthOnce(int port, const std::string& authToken) {
 #endif
         return false;
     }
+
+    // Restore blocking mode -- the rest of this function does a plain
+    // blocking send()/recv() round-trip against a now-established
+    // connection, unchanged from before this fix.
+#ifdef _WIN32
+    u_long blockingMode = 0;
+    ioctlsocket(s, FIONBIO, &blockingMode);
+#else
+    fcntl(s, F_SETFL, originalFlags);
+#endif
+
     std::string request = "GET /health HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + authToken + "\r\n\r\n";
     send(s, request.data(), static_cast<int>(request.size()), 0);
     std::string response;

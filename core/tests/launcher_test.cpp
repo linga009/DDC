@@ -168,6 +168,31 @@ int countRunningAgents() {
 #endif
 }
 
+// Spawns a real swarm-launcher process listening on `launcherPort`, backed
+// by `nodeAgentPath` as the executable it will invoke for every /pipeline
+// call. Factored out of LauncherFixture::SetUp() so a test can point
+// --node-agent-path somewhere other than the real swarm-node-agent (see
+// PipelineEndpointFailsPromptlyWhenTheSpawnedAgentNeverBecomesHealthy below,
+// which needs a spawned "agent" that starts and exits without ever
+// listening on --agent-port -- a case LauncherFixture's own SetUp() can't
+// produce, since it always wires up the real agent binary).
+void startLauncherProcess(int launcherPort, int agentPort, const std::string& nodeAgentPath) {
+    std::string cmd;
+#ifdef _WIN32
+    cmd = "start /B \"\" \"" SWARM_LAUNCHER_PATH "\" --port " + std::to_string(launcherPort) +
+          " --agent-port " + std::to_string(agentPort) +
+          " --models-dir \"" SWARM_TEST_MODEL_DIR "\""
+          " --node-agent-path \"" + nodeAgentPath + "\" > NUL 2>&1";
+#else
+    cmd = "\"" SWARM_LAUNCHER_PATH "\" --port " + std::to_string(launcherPort) +
+          " --agent-port " + std::to_string(agentPort) +
+          " --models-dir \"" SWARM_TEST_MODEL_DIR "\""
+          " --node-agent-path \"" + nodeAgentPath + "\" > /dev/null 2>&1 &";
+#endif
+    std::system(cmd.c_str());
+    waitForLauncherUp(launcherPort);
+}
+
 class LauncherFixture : public ::testing::Test {
 protected:
     static constexpr int kLauncherPort = 50110;
@@ -176,21 +201,7 @@ protected:
     void SetUp() override {
         setTestAuthTokenEnv();
         killAnyRunningLauncher();
-
-        std::string cmd;
-#ifdef _WIN32
-        cmd = "start /B \"\" \"" SWARM_LAUNCHER_PATH "\" --port " + std::to_string(kLauncherPort) +
-              " --agent-port " + std::to_string(kAgentPort) +
-              " --models-dir \"" SWARM_TEST_MODEL_DIR "\""
-              " --node-agent-path \"" SWARM_NODE_AGENT_PATH "\" > NUL 2>&1";
-#else
-        cmd = "\"" SWARM_LAUNCHER_PATH "\" --port " + std::to_string(kLauncherPort) +
-              " --agent-port " + std::to_string(kAgentPort) +
-              " --models-dir \"" SWARM_TEST_MODEL_DIR "\""
-              " --node-agent-path \"" SWARM_NODE_AGENT_PATH "\" > /dev/null 2>&1 &";
-#endif
-        std::system(cmd.c_str());
-        waitForLauncherUp(kLauncherPort);
+        startLauncherProcess(kLauncherPort, kAgentPort, SWARM_NODE_AGENT_PATH);
     }
 
     void TearDown() override {
@@ -336,4 +347,70 @@ TEST_F(LauncherFixture, ReassemblingKillsThePreviousAgentBeforeSpawningTheNewOne
         kAgentPort,
         "GET /health HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n");
     EXPECT_NE(healthResponse.find("HTTP/1.1 200"), std::string::npos);
+}
+
+// Regression test for a whole-branch-review finding: pollHealthOnce() in
+// launcher_main.cpp used a plain blocking connect() to poll a just-spawned
+// agent's health port, and on this project's actual Windows/MSYS2 target
+// platform a blocking connect() to a port nothing is listening on was
+// live-measured to take ~2.2s to fail -- not the near-instant failure the
+// surrounding 60-attempts/500ms-sleep polling loop assumed. That pushed the
+// real unhealthy-spawn detection ceiling to ~2m42s (60 * (~2.2s + 0.5s))
+// instead of the intended ~30s, and because the launcher's HttpServer is
+// single-threaded, the ENTIRE launcher was unresponsive to any other POST
+// /pipeline request for that whole window.
+//
+// This test doesn't use LauncherFixture, because that fixture's SetUp()
+// always wires --node-agent-path to the real swarm-node-agent binary, which
+// (given a real model file, as every other test in this file uses) becomes
+// genuinely healthy within seconds -- the opposite of what this test needs.
+// Instead it points --node-agent-path at argv_echo (already built for
+// spawned_process_test.cpp's argv-quoting tests): given the launcher's own
+// argv layout ({nodeAgentPath, "--model", modelFile, "--port", agentPort}),
+// argv_echo receives "--model" as its own required output-file argument,
+// writes the remaining args to a file named literally "--model", and exits
+// almost immediately -- WITHOUT ever binding to --agent-port. That
+// reproduces exactly the "spawned agent starts but never becomes healthy"
+// case pollHealthOnce exists to detect, unlike
+// PipelineEndpointRejectsAnUnknownModelWithAClearError above (which fails
+// fast, before any spawn is even attempted).
+TEST(LauncherUnhealthySpawnTiming, PipelineEndpointFailsPromptlyWhenTheSpawnedAgentNeverBecomesHealthy) {
+    constexpr int kLauncherPort = 50112;
+    constexpr int kAgentPort = 50113;
+
+    setTestAuthTokenEnv();
+    killAnyRunningLauncher();
+    startLauncherProcess(kLauncherPort, kAgentPort, SWARM_ARGV_ECHO_PATH);
+
+    std::string body = R"({"model":"tinyllama-1.1b-chat-v1.0.Q4_K_M","remoteEndpoints":"","layerPlacements":""})";
+    std::string request = "POST /pipeline HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nContent-Type: application/json\r\n\r\n" + body;
+
+    const auto start = std::chrono::steady_clock::now();
+    std::string response = sendRawRequest(kLauncherPort, request);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const double elapsedSeconds = std::chrono::duration_cast<std::chrono::duration<double>>(elapsed).count();
+
+    killAnyRunningLauncher();
+    // argv_echo writes its output file relative to its own cwd (inherited
+    // from the spawned-process chain, ultimately this test binary's own
+    // working directory) -- clean up the "--model" file it produces from
+    // receiving the launcher's own "--model" argv entry as its required
+    // output-path argument, so repeated ctest runs don't litter the repo.
+    std::remove("--model");
+
+    EXPECT_EQ(response.find("HTTP/1.1 200"), std::string::npos);
+    EXPECT_NE(response.find("did not become healthy in time"), std::string::npos);
+
+    // Generous upper bound, not an exact number, to avoid flakiness (this
+    // file's own established timing-test convention -- see
+    // ReassemblingKillsThePreviousAgentBeforeSpawningTheNewOne's peak-agent
+    // sampling above for the same "assert the qualitative claim with
+    // margin" style). 60s is well above the fix's intended ~30-45s ceiling
+    // but nowhere near the pre-fix ~2m42s one -- this bound alone is enough
+    // to catch a regression back to the unbounded blocking connect().
+    EXPECT_LT(elapsedSeconds, 60.0)
+        << "unhealthy-spawn detection took " << elapsedSeconds
+        << "s -- expected close to the intended ~30-45s ceiling now that connect() itself is bounded, "
+           "not the pre-fix ~2m42s one";
 }
