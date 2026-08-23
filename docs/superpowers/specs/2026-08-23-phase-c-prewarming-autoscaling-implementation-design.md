@@ -261,11 +261,15 @@ if (pool.length > 0) {
 }
 ```
 
-Round-robin (not least-recently-used) is the selection policy: simplest
-mechanism that spreads load, and since `swarm-node-agent` serves one
-request at a time anyway (documented, unchanged limitation), round-robin
-and LRU produce near-identical practical behavior for this project's
-actual bottleneck — LRU's extra bookkeeping isn't justified yet. `getPool()`
+**Corrected during plan-writing** (this doc originally specified
+round-robin here; the plan implements least-recently-used instead, for a
+concrete reason worth recording): least-recently-used is the selection
+policy, using the same `lastUsedAt` field #4's scale-down step already has
+to track for its own idle-grace-period check — a genuinely simpler
+implementation than a separate round-robin counter per model, not a
+weaker one. Since `swarm-node-agent` serves one request at a time anyway
+(documented, unchanged limitation), LRU and round-robin spread load just
+as evenly for this project's actual bottleneck. `getPool()`
 on `PipelineTracker` returns only entries the reconciliation loop's own
 health check (#4.1) has already confirmed live as of the last tick — a
 pool entry whose node died between reconciliation ticks still gets a
