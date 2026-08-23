@@ -7,7 +7,7 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-add_executable(inference_engine_test inference_engine_test.cpp speculative_test.cpp http_server_test.cpp json_utils_test.cpp node_agent_test.cpp spawned_process_test.cpp)
+add_executable(inference_engine_test inference_engine_test.cpp speculative_test.cpp http_server_test.cpp json_utils_test.cpp node_agent_test.cpp spawned_process_test.cpp launcher_test.cpp)
 target_link_libraries(inference_engine_test PRIVATE inference_engine GTest::gtest_main)
 target_compile_definitions(inference_engine_test PRIVATE
     SWARM_TEST_MODEL_DIR="${CMAKE_SOURCE_DIR}/models"
@@ -25,6 +25,10 @@ target_compile_definitions(inference_engine_test PRIVATE
     SWARM_NODE_AGENT_PATH="$<TARGET_FILE:swarm-node-agent>"
 )
 add_dependencies(inference_engine_test swarm-node-agent)
+target_compile_definitions(inference_engine_test PRIVATE
+    SWARM_LAUNCHER_PATH="$<TARGET_FILE:swarm-launcher>"
+)
+add_dependencies(inference_engine_test swarm-launcher)
 
 # Test-only helper that reports the argv it actually received. SpawnedProcess's
 # Windows quoting can only be verified by a real second process, because what
