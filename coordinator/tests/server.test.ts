@@ -6,6 +6,7 @@ import { createServer, selectNode } from "../src/server.ts";
 import { NodeRegistry, type NodeInfo } from "../src/registry.ts";
 import { ModelCatalog, type CatalogEntry } from "../src/catalog.ts";
 import { PeerRegistry } from "../src/peer_registry.ts";
+import { LauncherRegistry } from "../src/launcher_registry.ts";
 import { KeywordSafetyClassifier, type SafetyClassifier } from "../src/safety_classifier.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
 import { openApiDocument } from "../src/openapi.ts";
@@ -24,10 +25,11 @@ async function startTestServer(
   reputation: ReputationTracker = new ReputationTracker(),
   authToken: string = TEST_AUTH_TOKEN,
   random: () => number = Math.random,
+  launcherRegistry: LauncherRegistry = new LauncherRegistry(),
 ) {
   const registry = new NodeRegistry();
   const catalog = new ModelCatalog(catalogEntries);
-  const server = createServer(registry, catalog, peers, classifier, reputation, authToken, random);
+  const server = createServer(registry, catalog, peers, classifier, reputation, authToken, random, launcherRegistry);
 
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -35,7 +37,7 @@ async function startTestServer(
     throw new Error("expected server to bind a real port");
   }
   const baseUrl = `http://127.0.0.1:${address.port}`;
-  return { server, baseUrl, registry, peers, authToken };
+  return { server, baseUrl, registry, peers, reputation, authToken, launcherRegistry };
 }
 
 // Every existing test in this file that calls bare `fetch(...)` is being
@@ -598,6 +600,94 @@ test("POST /peers/:peerId/heartbeat returns 404 for an unknown peer", async () =
   try {
     const res = await authFetch(`${baseUrl}/peers/not-a-real-id/heartbeat`, { method: "POST" });
     assert.equal(res.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /launchers/register returns a launcherId and requires auth", async () => {
+  const launcherRegistry = new LauncherRegistry();
+  const { server, baseUrl } = await startTestServer(undefined, undefined, undefined, undefined, undefined, undefined, launcherRegistry);
+  try {
+    const unauth = await fetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:9000", servesModels: ["mixtral-8x7b"], agentPort: 8090 }),
+    });
+    assert.equal(unauth.status, 401);
+
+    const res = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:9000", servesModels: ["mixtral-8x7b"], agentPort: 8090 }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(typeof body.launcherId, "string");
+    assert.equal(launcherRegistry.findForModel("mixtral-8x7b")?.endpoint, "http://127.0.0.1:9000");
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /launchers/register rejects a missing or invalid endpoint", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ servesModels: ["mixtral-8x7b"], agentPort: 8090 }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /launchers/register rejects a non-array servesModels", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:9000", servesModels: "mixtral-8x7b", agentPort: 8090 }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /launchers/register rejects a non-integer agentPort", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:9000", servesModels: ["mixtral-8x7b"], agentPort: "not-a-number" }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /launchers/:launcherId/heartbeat returns 204 for a known launcher and 404 otherwise", async () => {
+  const launcherRegistry = new LauncherRegistry();
+  const { server, baseUrl } = await startTestServer(undefined, undefined, undefined, undefined, undefined, undefined, launcherRegistry);
+  try {
+    const registerRes = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:9000", servesModels: ["mixtral-8x7b"], agentPort: 8090 }),
+    });
+    const { launcherId } = await registerRes.json();
+
+    const ok = await authFetch(`${baseUrl}/launchers/${launcherId}/heartbeat`, { method: "POST" });
+    assert.equal(ok.status, 204);
+
+    const notFound = await authFetch(`${baseUrl}/launchers/nonexistent/heartbeat`, { method: "POST" });
+    assert.equal(notFound.status, 404);
   } finally {
     server.close();
   }

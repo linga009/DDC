@@ -6,6 +6,7 @@ import { join, dirname } from "node:path";
 import { NodeRegistry, type DeviceTier, type NodeInfo } from "./registry.ts";
 import { ModelCatalog } from "./catalog.ts";
 import { PeerRegistry } from "./peer_registry.ts";
+import { LauncherRegistry } from "./launcher_registry.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
 import { openApiDocument } from "./openapi.ts";
@@ -190,7 +191,7 @@ export function selectNode(nodes: NodeInfo[], reputation: ReputationTracker, mod
   return best.length === 1 ? best[0] : best[Math.floor(random() * best.length)];
 }
 
-export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier, reputation: ReputationTracker, authToken: string, random: () => number = Math.random) {
+export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier, reputation: ReputationTracker, authToken: string, random: () => number = Math.random, launcherRegistry: LauncherRegistry = new LauncherRegistry()) {
   return createHttpServer(async (req, res) => {
     try {
       const method = req.method ?? "GET";
@@ -374,6 +375,42 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         const normalizedEndpoint = parsedEndpoint.href.replace(/\/$/, "");
         const peerId = peers.register(normalizedEndpoint);
         sendJson(res, 200, { peerId });
+        return;
+      }
+
+      if (method === "POST" && parts[0] === "launchers" && parts.length === 2 && parts[1] === "register") {
+        const body = await readJsonBody(req);
+        if (typeof body !== "object" || body === null) {
+          sendJson(res, 400, { error: "request body must be a JSON object" });
+          return;
+        }
+        const candidate = body as Record<string, unknown>;
+        if (typeof candidate.endpoint !== "string" || candidate.endpoint.length === 0) {
+          sendJson(res, 400, { error: "endpoint must be a non-empty string" });
+          return;
+        }
+        if (!Array.isArray(candidate.servesModels) || !candidate.servesModels.every(m => typeof m === "string")) {
+          sendJson(res, 400, { error: "servesModels must be an array of strings" });
+          return;
+        }
+        if (typeof candidate.agentPort !== "number" || !Number.isInteger(candidate.agentPort) || candidate.agentPort < 1) {
+          sendJson(res, 400, { error: "agentPort must be a positive integer" });
+          return;
+        }
+        const launcherId = launcherRegistry.register(candidate.endpoint, candidate.servesModels as string[], candidate.agentPort);
+        sendJson(res, 200, { launcherId });
+        return;
+      }
+
+      if (method === "POST" && parts[0] === "launchers" && parts.length === 3 && parts[2] === "heartbeat") {
+        const ok = launcherRegistry.heartbeat(parts[1]);
+        if (!ok) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.writeHead(204);
+        res.end();
         return;
       }
 
