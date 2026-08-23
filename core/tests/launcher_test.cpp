@@ -244,6 +244,31 @@ TEST_F(LauncherFixture, PipelineEndpointRejectsAnUnknownModelWithAClearError) {
     EXPECT_NE(response.find("\"error\""), std::string::npos);
 }
 
+// Path-traversal regression test (Important finding from task review of
+// this file's launcher_main.cpp: `model` was concatenated straight into
+// "<modelsDir>/<model>.gguf" with only an emptiness check, so a value like
+// this test's -- which contains both "/" and ".." -- let a caller smuggle
+// path-traversal syntax through the launcher's own filesystem lookup. In
+// this fixture, --models-dir is this repo's real (absolute-path) models/
+// directory, and "../models/<name>" happens to normalize right back to a
+// real file inside it (parent-then-same-sibling-name), so unfixed code
+// would resolve this straight to a real .gguf and return 200 -- proving a
+// caller can smuggle traversal syntax through even when it doesn't escape
+// to a different tree in this particular layout. The fix rejects any
+// '/', '\', ':', or ".." in `model` outright, before any filesystem access,
+// so this must never reach 200 regardless of what happens to live at the
+// normalized path.
+TEST_F(LauncherFixture, PipelineEndpointRejectsAModelContainingPathTraversalSyntax) {
+    std::string body =
+        R"({"model":"../models/tinyllama-1.1b-chat-v1.0.Q4_K_M","remoteEndpoints":"","layerPlacements":""})";
+    std::string request = "POST /pipeline HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nContent-Type: application/json\r\n\r\n" + body;
+    std::string response = sendRawRequest(kLauncherPort, request);
+
+    EXPECT_EQ(response.find("HTTP/1.1 200"), std::string::npos);
+    EXPECT_NE(response.find("\"error\""), std::string::npos);
+}
+
 TEST_F(LauncherFixture, ReassemblingKillsThePreviousAgentBeforeSpawningTheNewOne) {
     std::string body = R"({"model":"tinyllama-1.1b-chat-v1.0.Q4_K_M","remoteEndpoints":"","layerPlacements":""})";
     std::string request = "POST /pipeline HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +

@@ -47,6 +47,21 @@ bool fileExists(const std::string& path) {
     return f.good();
 }
 
+// True if `model` contains any character/sequence that could let it escape
+// the operator-configured --models-dir when concatenated into
+// "<modelsDir>/<model>.gguf" below: a path separator (either slash --
+// forward for POSIX-style traversal, backward for Windows-style), a colon
+// (Windows drive-letter absolute paths like "C:\..." and NTFS
+// alternate-data-stream syntax like "file.gguf:hidden"), or a literal ".."
+// (parent-directory traversal). Every real model id in this project's
+// actual catalog/fixtures (e.g. "tinyllama-1.1b-chat-v1.0.Q4_K_M") is just
+// letters, digits, single dots, hyphens, and underscores, so this cannot
+// reject a legitimate model id.
+bool containsPathTraversalChars(const std::string& model) {
+    return model.find('/') != std::string::npos || model.find('\\') != std::string::npos ||
+           model.find(':') != std::string::npos || model.find("..") != std::string::npos;
+}
+
 // True if `token` contains a CR/LF anywhere, or leading/trailing spaces or
 // tabs -- identical check to swarm-node-agent's own (core/src/node_agent_main.cpp),
 // duplicated here rather than shared, matching this project's existing
@@ -181,6 +196,10 @@ int main(int argc, char** argv) {
         std::string model;
         if (!swarm::extractJsonString(req.body, "model", model) || model.empty()) {
             return swarm::HttpResponse{400, R"({"error":"model must be a non-empty JSON string field"})"};
+        }
+        if (containsPathTraversalChars(model)) {
+            return swarm::HttpResponse{
+                400, R"({"error":"model must not contain '/', '\\', ':', or '..' -- path traversal is not allowed"})"};
         }
         std::string remoteEndpointsRaw;
         swarm::extractJsonString(req.body, "remoteEndpoints", remoteEndpointsRaw);  // optional -- "" if absent
