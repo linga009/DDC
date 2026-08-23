@@ -26,5 +26,15 @@ target_compile_definitions(inference_engine_test PRIVATE
 )
 add_dependencies(inference_engine_test swarm-node-agent)
 
+# Test-only helper that reports the argv it actually received. SpawnedProcess's
+# Windows quoting can only be verified by a real second process, because what
+# is being tested is how the C runtime re-splits CreateProcess's single
+# command-line string back into argv.
+add_executable(argv_echo argv_echo_main.cpp)
+target_compile_definitions(inference_engine_test PRIVATE
+    SWARM_ARGV_ECHO_PATH="$<TARGET_FILE:argv_echo>"
+)
+add_dependencies(inference_engine_test argv_echo)
+
 include(GoogleTest)
 gtest_discover_tests(inference_engine_test)

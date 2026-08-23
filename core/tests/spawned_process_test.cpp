@@ -3,7 +3,11 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdio>
+#include <fstream>
+#include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -38,6 +42,64 @@ std::vector<std::string> longRunningCommand() {
 #else
     return {"sleep", "30"};
 #endif
+}
+
+#ifndef SWARM_ARGV_ECHO_PATH
+#define SWARM_ARGV_ECHO_PATH "argv_echo"
+#endif
+
+constexpr const char* kArgvEchoSentinel = "##ARGV_ECHO_END##";
+
+// Spawns the argv_echo helper with `args` and returns the argv it actually
+// received. This is the only way to observe what SpawnedProcess's quoting
+// really does: CreateProcess takes one flat command-line string, and the
+// child's C runtime re-splits it. A same-toolchain child is exactly
+// representative, since the real caller (Task 3) spawns swarm-node-agent,
+// built by this same toolchain.
+//
+// Returns an empty vector if the helper never completed.
+std::vector<std::string> echoedArgv(const std::string& outPath, const std::vector<std::string>& args) {
+    std::remove(outPath.c_str());
+
+    std::vector<std::string> argv{SWARM_ARGV_ECHO_PATH, outPath};
+    for (const auto& a : args) {
+        argv.push_back(a);
+    }
+
+    std::vector<std::string> lines;
+    {
+        swarm::SpawnedProcess proc(argv);
+        // Wait for the sentinel rather than for the file merely to exist:
+        // the destructor below kills the child, so stopping early could
+        // observe a partially-written file and turn a quoting bug into a
+        // flaky test instead of a failing one.
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            std::ifstream in(outPath, std::ios::binary);
+            if (!in) {
+                continue;
+            }
+            std::vector<std::string> current;
+            std::string line;
+            bool complete = false;
+            while (std::getline(in, line)) {
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                if (line == kArgvEchoSentinel) {
+                    complete = true;
+                    break;
+                }
+                current.push_back(line);
+            }
+            if (complete) {
+                lines = current;
+                break;
+            }
+        }
+    }
+    std::remove(outPath.c_str());
+    return lines;
 }
 
 }  // namespace
@@ -101,4 +163,56 @@ TEST(SpawnedProcess, DestructorTerminatesAStillRunningProcessWithoutHanging) {
     // margin that still fails loudly if the destructor is actually
     // blocking on the process's natural exit instead of killing it.
     EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 10);
+}
+
+// --- Argument-boundary integrity -------------------------------------------
+//
+// SpawnedProcess exists so a network-triggered caller can spawn an agent
+// safely. Using an argv array instead of a shell already rules out command
+// injection (no ";"/"&&" can start a second process). But on Windows the
+// argv array still has to survive a round trip through CreateProcess's
+// single flat command-line string, and getting that quoting wrong lets one
+// argument's *value* split into additional arguments -- which, for a child
+// that accepts flags like --remote, is flag injection into the spawned
+// process. These tests pin that boundary with a real spawned child.
+
+TEST(SpawnedProcess, PassesAnArgumentContainingSpacesAsOneArgument) {
+    auto received = echoedArgv("argv_echo_spaces.txt", {"hello world", "second"});
+    ASSERT_EQ(received.size(), 2u);
+    EXPECT_EQ(received[0], "hello world");
+    EXPECT_EQ(received[1], "second");
+}
+
+TEST(SpawnedProcess, PassesAnArgumentContainingAQuoteWithoutSplittingIt) {
+    auto received = echoedArgv("argv_echo_quote.txt", {"say \"hi\" now", "second"});
+    ASSERT_EQ(received.size(), 2u);
+    EXPECT_EQ(received[0], "say \"hi\" now");
+    EXPECT_EQ(received[1], "second");
+}
+
+// A Windows path ending in a backslash is completely ordinary (a directory
+// path), and it is the plain-correctness half of the same bug: naive
+// quoting emits "C:\models\" whose trailing \" reads as an *escaped* quote,
+// so the argument never closes and silently swallows everything after it.
+TEST(SpawnedProcess, PassesAPathEndingInABackslashWithoutSwallowingLaterArguments) {
+    auto received = echoedArgv("argv_echo_backslash.txt", {"C:\\models\\", "--port", "8080"});
+    ASSERT_EQ(received.size(), 3u);
+    EXPECT_EQ(received[0], "C:\\models\\");
+    EXPECT_EQ(received[1], "--port");
+    EXPECT_EQ(received[2], "8080");
+}
+
+// The security case: a single attacker-controlled value must never become
+// more than one argument, no matter what it contains. With naive quoting
+// the value below emits ...\\" -- an even backslash run followed by a
+// delimiter quote, which *closes* quoted mode, so the following space
+// starts a brand-new argument and "--injected" arrives as its own flag.
+TEST(SpawnedProcess, DoesNotLetAnArgumentValueInjectAnAdditionalArgument) {
+    const std::string hostile = "a\\\" --injected x";
+    auto received = echoedArgv("argv_echo_injection.txt", {hostile});
+    ASSERT_EQ(received.size(), 1u);
+    EXPECT_EQ(received[0], hostile);
+    for (const auto& arg : received) {
+        EXPECT_NE(arg, "--injected");
+    }
 }

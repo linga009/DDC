@@ -22,16 +22,54 @@ namespace {
 // still needs quoting so a value containing a space or a literal '"'
 // becomes one argument rather than splitting into extra ones or breaking
 // the quoting itself.
+//
+// Getting this exactly right matters more than it looks. The child re-splits
+// this flat string using the standard CommandLineToArgvW/C-runtime rules,
+// where backslashes and quotes interact:
+//
+//   * 2n backslashes followed by '"'  -> n backslashes, and the quote is a
+//                                        DELIMITER (it toggles quoted mode)
+//   * 2n+1 backslashes followed by '"' -> n backslashes, and the quote is a
+//                                        LITERAL character
+//   * backslashes not followed by '"' -> literal backslashes
+//
+// So escaping only the quotes (and leaving backslashes alone) is not enough:
+// a value containing \" would emit an even backslash run before a quote,
+// which CLOSES quoted mode and lets the following space start an additional
+// argument -- flag injection into the spawned child, which accepts flags
+// like --remote. A value merely ENDING in a backslash (an ordinary Windows
+// directory path) is the same bug in benign clothing: it would escape the
+// closing quote and swallow every argument after it.
+//
+// Both cases are covered by spawned_process_test.cpp, which asserts against
+// the argv a real spawned child actually received.
 std::string quoteWindowsArg(const std::string& arg) {
     std::string quoted = "\"";
+    size_t pendingBackslashes = 0;
     for (char c : arg) {
+        if (c == '\\') {
+            // Undecided until we see what follows: how these must be
+            // emitted depends on whether a '"' comes next.
+            ++pendingBackslashes;
+            continue;
+        }
         if (c == '"') {
-            quoted += "\\\"";
+            // Double the run so it survives as literal backslashes, then
+            // add one more to make this quote literal rather than a
+            // delimiter.
+            quoted.append(pendingBackslashes * 2 + 1, '\\');
+            quoted += '"';
         } else {
+            // Not before a quote: these stay as-is.
+            quoted.append(pendingBackslashes, '\\');
             quoted += c;
         }
+        pendingBackslashes = 0;
     }
-    quoted += "\"";
+    // A trailing run sits immediately before our closing quote, so it must
+    // be doubled or it would escape that quote.
+    quoted.append(pendingBackslashes * 2, '\\');
+    quoted += '"';
     return quoted;
 }
 
