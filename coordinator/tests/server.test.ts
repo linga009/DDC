@@ -7,6 +7,7 @@ import { NodeRegistry, type NodeInfo } from "../src/registry.ts";
 import { ModelCatalog, type CatalogEntry } from "../src/catalog.ts";
 import { PeerRegistry } from "../src/peer_registry.ts";
 import { LauncherRegistry } from "../src/launcher_registry.ts";
+import { PipelineTracker } from "../src/pipeline_tracker.ts";
 import { KeywordSafetyClassifier, type SafetyClassifier } from "../src/safety_classifier.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
 import { openApiDocument } from "../src/openapi.ts";
@@ -26,10 +27,11 @@ async function startTestServer(
   authToken: string = TEST_AUTH_TOKEN,
   random: () => number = Math.random,
   launcherRegistry: LauncherRegistry = new LauncherRegistry(),
+  pipelineTracker: PipelineTracker = new PipelineTracker(),
 ) {
   const registry = new NodeRegistry();
   const catalog = new ModelCatalog(catalogEntries);
-  const server = createServer(registry, catalog, peers, classifier, reputation, authToken, random, launcherRegistry);
+  const server = createServer(registry, catalog, peers, classifier, reputation, authToken, random, launcherRegistry, pipelineTracker);
 
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -37,7 +39,7 @@ async function startTestServer(
     throw new Error("expected server to bind a real port");
   }
   const baseUrl = `http://127.0.0.1:${address.port}`;
-  return { server, baseUrl, registry, peers, reputation, authToken, launcherRegistry };
+  return { server, baseUrl, registry, peers, reputation, authToken, launcherRegistry, pipelineTracker };
 }
 
 // Every existing test in this file that calls bare `fetch(...)` is being
@@ -738,6 +740,155 @@ test("POST /launchers/:launcherId/heartbeat returns 204 for a known launcher and
     assert.equal(notFound.status, 404);
   } finally {
     server.close();
+  }
+});
+
+test("POST /generate for a requiredNodeCount:1 model behaves exactly as before, ignoring the launcher machinery entirely", async () => {
+  // Regression test: the vast majority of this plan's own new code must
+  // never engage for any model that doesn't declare requiredNodeCount > 1
+  // -- which is every model in today's real catalog.
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "Paris." } }));
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { text: "Paris." });
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /generate for a requiredNodeCount>1 model with a warm tracked pipeline routes to it directly", async () => {
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "from the warm driver" } }));
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
+  const { server, baseUrl, registry, pipelineTracker } = await startTestServer(bigCatalog);
+  try {
+    const driverNodeId = registry.register(stub.endpoint, "desktop", undefined, "big-model");
+    pipelineTracker.markWarm("big-model", driverNodeId, []);
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { text: "from the warm driver" });
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /generate for a requiredNodeCount>1 model with no tracked pipeline and no registered launcher falls back to 503", async () => {
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
+  const { server, baseUrl } = await startTestServer(bigCatalog);
+  try {
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+    // No launcher registered, nothing manually registered either -- same
+    // 503 a requiredNodeCount:1 model with no active node already gives.
+    assert.equal(res.status, 503);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /generate for a requiredNodeCount>1 model with a stale tracked pipeline and no launcher falls back to manual registration", async () => {
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "from the manually registered node" } }));
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
+  const { server, baseUrl, registry, pipelineTracker } = await startTestServer(bigCatalog);
+  try {
+    // A tracked pipeline pointing at a driver that was never actually
+    // registered (or has since aged out) -- listActive() won't contain it,
+    // so the staleness check must trigger and, finding no launcher either,
+    // fall through to whatever's manually registered.
+    pipelineTracker.markWarm("big-model", "some-driver-id-not-in-the-registry", []);
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "big-model" }),
+    });
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { text: "from the manually registered node" });
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /generate assembles a fresh pipeline via a registered launcher when none is warm", async () => {
+  // pipeline_selector.ts's selectPipeline() needs requiredNodeCount
+  // candidates already in the active pool before it picks anything (see
+  // pipeline_selector.ts's own module comment) -- these two generic nodes
+  // stand in for machines that already run their own manually-started
+  // swarm-rpc-server and self-registered their capability, but have no
+  // servesModel (they don't run inference themselves). The launcher's
+  // POST /pipeline body and the freshly-spawned driver's POST /complete
+  // both land on this same stub server (see the comment below on why one
+  // stub is enough); this handler distinguishes the two by body shape,
+  // since a /pipeline request has a "model" field and a /complete request
+  // doesn't.
+  let capturedLauncherRequest: Record<string, unknown> | undefined;
+  const stub = await startStubNodeAgent((body) => {
+    const candidate = body as Record<string, unknown>;
+    if (candidate.model !== undefined) {
+      capturedLauncherRequest = candidate;
+      return { status: 200, body: { status: "ready" } };
+    }
+    return { status: 200, body: { text: "from the freshly assembled driver" } };
+  });
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
+  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(bigCatalog);
+  try {
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+
+    const launcherPort = Number(new URL(stub.endpoint).port);
+    // A real launcher and its freshly-spawned driver are different
+    // processes/ports in production (ensurePipelineReady constructs the
+    // driver's endpoint from the launcher's own host + its registered
+    // agentPort, per the design doc) -- registering this stub's own port
+    // as the launcher's agentPort means both the POST /pipeline call and
+    // the subsequent POST /complete call land on the one stub, which is
+    // enough to prove the coordinator called the right two things with
+    // the right data without needing two real processes.
+    launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+
+    assert.equal(capturedLauncherRequest?.model, "big-model");
+    assert.equal(typeof capturedLauncherRequest?.remoteEndpoints, "string");
+    assert.equal(typeof capturedLauncherRequest?.layerPlacements, "string");
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { text: "from the freshly assembled driver" });
+    const active = registry.listActive();
+    assert.ok(active.some(n => n.servesModel === "big-model"));
+  } finally {
+    server.close();
+    stub.server.close();
   }
 });
 

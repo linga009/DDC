@@ -7,6 +7,8 @@ import { NodeRegistry, type DeviceTier, type NodeInfo } from "./registry.ts";
 import { ModelCatalog } from "./catalog.ts";
 import { PeerRegistry } from "./peer_registry.ts";
 import { LauncherRegistry } from "./launcher_registry.ts";
+import { PipelineTracker } from "./pipeline_tracker.ts";
+import { selectPipeline } from "./pipeline_selector.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
 import { openApiDocument } from "./openapi.ts";
@@ -191,7 +193,106 @@ export function selectNode(nodes: NodeInfo[], reputation: ReputationTracker, mod
   return best.length === 1 ? best[0] : best[Math.floor(random() * best.length)];
 }
 
-export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier, reputation: ReputationTracker, authToken: string, random: () => number = Math.random, launcherRegistry: LauncherRegistry = new LauncherRegistry()) {
+const PIPELINE_ASSEMBLY_TIMEOUT_MS = 60000;
+
+// Ensures a warm, HTTP-reachable pipeline exists for `modelId` before
+// /generate's existing selectNode() step runs, for any model whose
+// catalog entry declares requiredNodeCount > 1. A no-op for every other
+// model -- returns immediately without touching PipelineTracker/
+// LauncherRegistry/pipeline_selector.ts at all, so /generate's existing
+// behavior for every model in today's real catalog (all requiredNodeCount
+// 1, whether by explicit value or the default) is completely unaffected.
+// Never throws -- any failure just means selectNode() below finds nothing
+// new, falling back to whatever's already manually registered, exactly
+// like today's Phase A behavior.
+async function ensurePipelineReady(
+  modelId: string,
+  catalog: ModelCatalog,
+  registry: NodeRegistry,
+  reputation: ReputationTracker,
+  launcherRegistry: LauncherRegistry,
+  pipelineTracker: PipelineTracker,
+  authToken: string,
+  random: () => number,
+): Promise<void> {
+  const requiredNodeCount = catalog.requiredNodeCount(modelId);
+  if (requiredNodeCount <= 1) {
+    return;
+  }
+
+  const tracked = pipelineTracker.get(modelId);
+  if (tracked?.state === "warm" && tracked.driverNodeId) {
+    const driverStillActive = registry.listActive(reputation).some(n => n.nodeId === tracked.driverNodeId);
+    if (driverStillActive) {
+      return;
+    }
+  }
+
+  const launcher = launcherRegistry.findForModel(modelId);
+  if (!launcher) {
+    return;
+  }
+
+  // selectPipeline requires requiredNodeCount total candidates already in
+  // the active pool (see pipeline_selector.ts) -- this is a readiness gate
+  // ("does the swarm have enough already-registered capacity to justify
+  // spawning a driver at all"), not a literal reservation of a specific
+  // node to become that driver. The driver itself doesn't come from this
+  // selection: it's whichever fresh swarm-node-agent the launcher spawns,
+  // reachable at (launcher's own host, launcher's registered agentPort).
+  // selection.driver is deliberately unused below for that reason --
+  // only selection.computeContributors (the machines the freshly-spawned
+  // driver will shard across via --remote) feeds into the launcher call.
+  const selection = selectPipeline(registry.listActive(reputation), reputation, requiredNodeCount, random);
+  if (!selection) {
+    return;
+  }
+
+  try {
+    // swarm-node-agent's --remote takes host:port, not a full URL --
+    // strip any scheme the registered endpoint carries.
+    const toHostPort = (endpoint: string) => endpoint.replace(/^https?:\/\//, "");
+    const remoteEndpoints = selection.computeContributors.map(n => toHostPort(n.endpoint)).join(",");
+    // This plan doesn't need to know the model's real layer count: passing
+    // zero --layer-placement flags (an empty string here) is already
+    // valid -- InferenceEngine's existing automatic placement takes over,
+    // exactly as it already does for every manually-configured multi-node
+    // pipeline today. Explicit per-layer placement is left to a future
+    // refinement, not required for this plan's own goal of proving
+    // dynamic assembly works.
+    const layerPlacements = "";
+
+    const launcherRes = await fetch(`${launcher.endpoint}/pipeline`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: modelId, remoteEndpoints, layerPlacements }),
+      signal: AbortSignal.timeout(PIPELINE_ASSEMBLY_TIMEOUT_MS),
+    });
+    if (!launcherRes.ok) {
+      pipelineTracker.markFailed(modelId);
+      return;
+    }
+
+    // The launcher's own machine is the driver's machine -- constructed
+    // from the launcher's registered host and its fixed --agent-port,
+    // never from anything in `selection` (see the comment above). A
+    // launcher is inherently a process-spawning, non-mobile machine, so
+    // "desktop" is the correct deviceTier for the driver it just spawned
+    // regardless of what deviceTier any candidate in `selection` reported
+    // for itself; the launcher doesn't advertise a localityGroup of its
+    // own (LauncherInfo has none), so the fresh driver registers without
+    // one too.
+    const launcherUrl = new URL(launcher.endpoint);
+    const driverEndpoint = `${launcherUrl.protocol}//${launcherUrl.hostname}:${launcher.agentPort}`;
+    const driverNodeId = registry.register(driverEndpoint, "desktop", undefined, modelId);
+    pipelineTracker.markWarm(modelId, driverNodeId, selection.computeContributors.map(n => n.nodeId));
+  } catch (err) {
+    console.warn(`failed to assemble pipeline for model ${modelId} via launcher ${launcher.endpoint}:`, err);
+    pipelineTracker.markFailed(modelId);
+  }
+}
+
+export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier, reputation: ReputationTracker, authToken: string, random: () => number = Math.random, launcherRegistry: LauncherRegistry = new LauncherRegistry(), pipelineTracker: PipelineTracker = new PipelineTracker()) {
   return createHttpServer(async (req, res) => {
     try {
       const method = req.method ?? "GET";
@@ -554,6 +655,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           return;
         }
 
+        await ensurePipelineReady(candidate.modelId, catalog, registry, reputation, launcherRegistry, pipelineTracker, authToken, random);
         const node = selectNode(registry.listActive(reputation), reputation, candidate.modelId, random);
         if (!node) {
           sendJson(res, 503, { error: `no active node currently serves model "${candidate.modelId}"` });
