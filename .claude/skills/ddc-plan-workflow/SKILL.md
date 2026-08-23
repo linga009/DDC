@@ -37,6 +37,34 @@ resume / review] this plan."
    done in a "Scope correction" or "What this plan does not do" section.
    This is correct scoping, not a shortfall to apologize for.
 
+## Resuming a Written-But-Unexecuted Plan
+
+A plan can be fully written, self-reviewed, and pushed with zero
+implementation tasks started — the session ended (or the user paused
+deliberately) between "plan approved" and "worktree created." Check
+`CLAUDE.md`'s Plan Roadmap table for a status like "plan written,
+implementation paused" before assuming a plan needs scoping from scratch.
+
+- **Do not re-scope or rewrite the plan** just because time has passed —
+  the plan doc is the authority on what to build; re-read it, don't
+  second-guess it, unless re-grounding (next bullet) reveals it's actually
+  gone stale against the code.
+- **Re-ground against current file state before dispatching Task 1's
+  implementer**, even though the plan was written against "current" state
+  recently — other work may have landed on `master` since, and this
+  project's own history (see Common Mistakes below) is full of plans that
+  drifted from the files they described within the same session, let alone
+  across a gap. If a "Find" block in the plan's first task no longer
+  matches the real file, that's a signal to re-verify the rest of the plan
+  before proceeding, not just patch that one spot.
+- **No worktree exists yet for an unexecuted plan** — create it fresh per
+  `using-git-worktrees`/the Task Dispatch Defaults below, don't look for
+  one left over from the planning session.
+- Proceed straight into `subagent-driven-development` at the plan's first
+  task — a written-and-approved plan does not need another round of user
+  sign-off to begin execution, unless the user's own pause instruction said
+  otherwise.
+
 ## Task Dispatch Defaults for This Repo
 
 - **Worktree location:** `.worktrees/<plan-name>`, branch name matches.
