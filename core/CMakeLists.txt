@@ -3,6 +3,7 @@ add_library(inference_engine
     src/speculative.cpp
     src/http_server.cpp
     src/json_utils.cpp
+    src/spawned_process.cpp
 )
 target_include_directories(inference_engine PUBLIC include)
 target_link_libraries(inference_engine PUBLIC llama)
