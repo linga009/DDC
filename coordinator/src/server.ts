@@ -392,7 +392,15 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           }
           servesModel = candidate.servesModel;
         }
-        const nodeId = registry.register(normalizedNodeEndpoint, candidate.deviceTier as DeviceTier, localityGroup, servesModel);
+        let availableMemoryMb: number | undefined;
+        if (candidate.availableMemoryMb !== undefined) {
+          if (typeof candidate.availableMemoryMb !== "number" || !Number.isFinite(candidate.availableMemoryMb) || candidate.availableMemoryMb < 0) {
+            sendJson(res, 400, { error: "availableMemoryMb must be a non-negative number when provided" });
+            return;
+          }
+          availableMemoryMb = candidate.availableMemoryMb;
+        }
+        const nodeId = registry.register(normalizedNodeEndpoint, candidate.deviceTier as DeviceTier, localityGroup, servesModel, availableMemoryMb);
         sendJson(res, 200, { nodeId });
         return;
       }

@@ -448,6 +448,64 @@ test("POST /nodes/register with a JSON body of literal null returns 400, not 500
   }
 });
 
+test("POST /nodes/register accepts availableMemoryMb and it is visible via GET /nodes", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", availableMemoryMb: 16000 }),
+    });
+    assert.equal(res.status, 200);
+
+    const nodes = await (await authFetch(`${baseUrl}/nodes`)).json();
+    assert.equal(nodes.length, 1);
+    assert.equal(nodes[0].availableMemoryMb, 16000);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /nodes/register rejects a negative availableMemoryMb with 400", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", availableMemoryMb: -1 }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(typeof body.error, "string");
+
+    // Confirm nothing was actually registered.
+    const nodesRes = await authFetch(`${baseUrl}/nodes`);
+    assert.equal((await nodesRes.json()).length, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /nodes/register rejects a non-number availableMemoryMb with 400", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:50052", deviceTier: "desktop", availableMemoryMb: "16000" }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(typeof body.error, "string");
+
+    // Confirm nothing was actually registered.
+    const nodesRes = await authFetch(`${baseUrl}/nodes`);
+    assert.equal((await nodesRes.json()).length, 0);
+  } finally {
+    server.close();
+  }
+});
+
 test("GET /catalog with zero active nodes only shows the zero-threshold model available", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
