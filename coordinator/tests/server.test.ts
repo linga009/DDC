@@ -1064,6 +1064,99 @@ test("POST /generate for a warm pipeline heartbeats the driver, keeping it alive
   }
 });
 
+test("POST /generate marks a tracked pipeline failed when its driver's /complete forward fails, so the next request reassembles fresh via the launcher", async () => {
+  // Re-review finding on top of the heartbeat fix above: that fix made
+  // ensurePipelineReady heartbeat a warm driver unconditionally on its
+  // presence in listActive() -- but listActive() only reflects
+  // registration recency, never liveness. If the driver process has
+  // actually died, /generate's own forward to it fails (a real 502, this
+  // test's first assertion), but nothing previously told PipelineTracker
+  // that happened -- so a second request would find the SAME tracked
+  // "warm" entry, heartbeat the same dead driver again, and route back to
+  // it again, forever, as long as requests keep arriving inside the 30s
+  // window. This test proves the fix: after the first request's forward
+  // fails, the tracked pipeline must be marked failed, so a second
+  // request for the same model falls through to the registered launcher
+  // and reassembles -- exactly once, not zero times (which would mean
+  // the pipeline never got invalidated) and not more than once.
+  //
+  // A deterministic `random` is required here (unlike the "exactly once"
+  // test above, whose stale driver was never actually registered): this
+  // test's dead driver stays genuinely registered/active in NodeRegistry
+  // even after it fails (a bad HTTP status doesn't expire a node), so by
+  // the second request there are two real candidates serving "big-model"
+  // -- the original dead driver and the freshly reassembled one -- tied
+  // at the same neutral, untested reputation score. Both selectNode's and
+  // pipeline_selector's tie-breaks pick via `Math.floor(random() *
+  // group.length)`; since NodeRegistry is a Map and re-registering an
+  // existing key doesn't change its position, the dead driver (registered
+  // first) always sorts before the freshly-assembled one (registered
+  // second) in every tied group here. A constant random() just under 1
+  // reliably selects the LAST (most-recently-inserted) member of any such
+  // tied group, i.e. the fresh driver, making the second request's
+  // outcome deterministic instead of a coin flip.
+  const random = () => 0.9;
+  let launcherCallCount = 0;
+  const driverStub = await startStubNodeAgent(() => ({ status: 500, body: { error: "the driver process died" } }));
+  const launcherStub = await startStubNodeAgent((body) => {
+    const candidate = body as Record<string, unknown>;
+    if (candidate.model !== undefined) {
+      launcherCallCount++;
+      return { status: 200, body: { status: "ready" } };
+    }
+    return { status: 200, body: { text: "from the freshly assembled driver" } };
+  });
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
+  const { server, baseUrl, registry, launcherRegistry, pipelineTracker } = await startTestServer(bigCatalog, undefined, undefined, undefined, undefined, random);
+  try {
+    const driverNodeId = registry.register(driverStub.endpoint, "desktop", undefined, "big-model");
+    pipelineTracker.markWarm("big-model", driverNodeId, []);
+
+    // selectPipeline requires requiredNodeCount candidates already active
+    // before it will attempt reassembly -- two generic filler nodes,
+    // matching the "stale tracked pipeline... exactly once" test's own
+    // setup above (the dead driver above already counts as a third).
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+
+    const launcherPort = Number(new URL(launcherStub.endpoint).port);
+    launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherPort);
+
+    // First request: the tracked pipeline is warm and the driver is still
+    // registered/active, so ensurePipelineReady routes straight to it --
+    // but the driver process itself has died, so its /complete answers
+    // 500. The caller must see the existing 502 handling, unchanged.
+    const res1 = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+    assert.equal(res1.status, 502);
+
+    // Second request: without the fix, the tracked pipeline is still
+    // "warm" (nothing invalidated it after the first request's forward
+    // failure), so ensurePipelineReady's driverStillActive check finds
+    // the same dead driver still present in listActive(), heartbeats it
+    // again, and routes back to it again -- launcherCallCount would stay
+    // 0. With the fix, the first request's failed forward already marked
+    // the pipeline failed, so this second request falls through to the
+    // launcher and reassembles fresh, exactly once.
+    const res2 = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+
+    assert.equal(launcherCallCount, 1, "a driver that failed its /complete forward must be marked failed, triggering exactly one fresh reassembly via the launcher on the next request");
+    assert.equal(res2.status, 200);
+    assert.deepEqual(await res2.json(), { text: "from the freshly assembled driver" });
+  } finally {
+    server.close();
+    driverStub.server.close();
+    launcherStub.server.close();
+  }
+});
+
 test("GET /catalog aggregates a live peer's reported capacity with local capacity", async () => {
   // Two real, independent coordinator instances. Instance B has enough
   // local nodes to unlock a model on its own; instance A has none, but

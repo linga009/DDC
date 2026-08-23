@@ -234,11 +234,24 @@ async function ensurePipelineReady(
       // respawn/model-reload cycle on whatever request happens to land
       // just after that timer fires. Heartbeating here, on every request
       // that finds the driver still warm, keeps a genuinely healthy
-      // pipeline alive indefinitely. This can't mask a real failure: if
-      // the underlying agent process actually died, the /complete fetch
-      // below (via the caller's own selectNode/forward step) still fails
-      // with the existing 502 handling regardless of what this heartbeat
-      // just did to its bookkeeping.
+      // pipeline alive indefinitely.
+      //
+      // This heartbeat is unconditional on presence in listActive(), not
+      // on the driver actually completing anything -- listActive() only
+      // reflects registration recency, never liveness. If the underlying
+      // agent process has actually died, this line still fires (the
+      // driver is still "active" by timestamp), and this request's own
+      // /complete fetch further down still correctly answers the caller
+      // with the existing 502 handling -- but that alone would leave the
+      // tracked pipeline "warm" regardless, so the NEXT request for this
+      // model would find the same dead driver here again, heartbeat it
+      // again, and route back to it again, forever, as long as requests
+      // keep arriving faster than the 30s timeout. That gap is closed
+      // below, not here: /generate's own forwarding logic calls
+      // pipelineTracker.markFailed(modelId) whenever a forward to this
+      // tracked driver fails, which is what actually evicts a dead
+      // driver from "warm" so the next request reassembles through the
+      // launcher instead of retrying the same corpse.
       registry.heartbeat(tracked.driverNodeId);
       return;
     }
@@ -678,6 +691,25 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           return;
         }
 
+        // A forward to `node` below can fail several different ways (a
+        // non-2xx status, a non-SSE content-type when stream:true was
+        // requested, a malformed JSON body, or the fetch itself throwing)
+        // across the streaming and non-streaming branches that follow.
+        // Whenever the failing `node` is the pipeline driver
+        // ensurePipelineReady is currently tracking as "warm" for this
+        // model, that tracked entry must be invalidated here -- otherwise
+        // the NEXT request for this model finds the same dead driver
+        // still "active" (ensurePipelineReady's heartbeat only checks
+        // registry presence, never liveness) and routes back to it again,
+        // forever. This is a side effect only: it never changes what this
+        // request sends back to the caller, which every call site below
+        // still does exactly as it did before.
+        const markDriverFailedIfTracked = () => {
+          if (pipelineTracker.get(candidate.modelId)?.driverNodeId === node.nodeId) {
+            pipelineTracker.markFailed(candidate.modelId);
+          }
+        };
+
         if (stream) {
           try {
             const nodeRes = await fetch(`${node.endpoint}/complete`, {
@@ -687,6 +719,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
               signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
             });
             if (!nodeRes.ok || !nodeRes.body) {
+              markDriverFailedIfTracked();
               sendJson(res, 502, { error: `node returned status ${nodeRes.status}` });
               return;
             }
@@ -699,6 +732,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
               // well-formed-looking response that silently yields zero
               // pieces to every consumer -- fail loudly instead, before
               // committing to any response headers.
+              markDriverFailedIfTracked();
               sendJson(res, 502, { error: "node did not return a streaming response" });
               return;
             }
@@ -718,6 +752,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
             res.end();
           } catch (err) {
             console.warn(`failed to forward streaming /generate to node ${node.endpoint}:`, err);
+            markDriverFailedIfTracked();
             // If SSE headers haven't gone out yet, a normal error response
             // is still possible; once they have, the only safe recovery is
             // to close the connection -- a fresh 502 can't be layered onto
@@ -739,17 +774,20 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
             signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
           });
           if (!nodeRes.ok) {
+            markDriverFailedIfTracked();
             sendJson(res, 502, { error: `node returned status ${nodeRes.status}` });
             return;
           }
           const nodeBody = await nodeRes.json();
           if (typeof nodeBody.text !== "string") {
+            markDriverFailedIfTracked();
             sendJson(res, 502, { error: "node returned a malformed response" });
             return;
           }
           sendJson(res, 200, { text: nodeBody.text });
         } catch (err) {
           console.warn(`failed to forward /generate to node ${node.endpoint}:`, err);
+          markDriverFailedIfTracked();
           sendJson(res, 502, { error: "failed to reach the selected node" });
         }
         return;
