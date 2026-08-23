@@ -36,18 +36,21 @@ dashboard, developer API) exists to eventually route real requests to a
 swarm of these engines instead of one.
 
 **Current status:** 11 of the project's implementation plans are complete,
-and Phase A of the request-routing initiative that follows them is done too
-— see [`CLAUDE.md`](CLAUDE.md)'s Plan Roadmap for exactly what's built
-versus what's still ahead. In short: the compute engine, a federated
+and Phases A, B, and D of the request-routing initiative that follows them
+are done too — see [`CLAUDE.md`](CLAUDE.md)'s Plan Roadmap for exactly what's
+built versus what's still ahead. In short: the compute engine, a federated
 coordinator service, a browser client, a working end-to-end request-routing
 path (`POST /generate`, routing a prompt through the safety gate to a real
 `swarm-node-agent` and back), real token streaming (`"stream": true`, Phase
-D), and an OpenAI-compatible `POST /v1/chat/completions` + `GET /v1/models`
-(so an unmodified OpenAI SDK, or any tool built against the real OpenAI API,
-can use this swarm as a drop-in model provider) all work and are tested.
-What's still missing is dynamic node selection instead of manual
-registration (Phase B) and background pre-warming/autoscaling of warm
-pipelines (Phase C). That's the natural next place to contribute.
+D), dynamic multi-device pipeline assembly (a coordinator-run launcher that
+spawns and shards a fresh pipeline across live-registered compute on demand,
+Phase B), and an OpenAI-compatible `POST /v1/chat/completions` +
+`GET /v1/models` (so an unmodified OpenAI SDK, or any tool built against the
+real OpenAI API, can use this swarm as a drop-in model provider) all work and
+are tested. What's still missing is background pre-warming/autoscaling of
+warm pipelines ahead of demand (Phase C) — Phase B assembles a pipeline
+synchronously, on the first request that needs one. That's the natural next
+place to contribute.
 
 ## Get involved
 
@@ -55,12 +58,18 @@ This is early, real infrastructure — not a finished product — and it's
 built in the open specifically so people can pick up a piece of it. Useful
 ways to help right now:
 
-- **Dynamic pipeline assembly and pre-warming** — Phases B and C of the
-  request-routing initiative (see above); manual, single-node routing
-  (Phase A) and token streaming (Phase D) are both done, but nothing
-  dynamic or demand-driven exists yet. Every existing piece (capacity
-  tracking, safety gate, reputation, locality) is groundwork waiting for
-  this.
+- **Pre-warming and autoscaling** — Phase C of the request-routing
+  initiative (see above); manual single-node routing (Phase A), token
+  streaming (Phase D), and dynamic multi-device pipeline assembly (Phase B)
+  are all done, but pipelines are still only assembled synchronously, on
+  the first request that needs one — nothing proactive or demand-driven
+  exists yet.
+- **Closing one of Phase B's disclosed residual gaps** — see the Dynamic
+  pipeline assembly section below for the current list (a still-registered
+  dead driver can occasionally be re-selected before it ages out, no
+  `GET /launchers` introspection route, `availableMemoryMb` isn't yet
+  exposed through the OpenAPI doc or typed client, hard-killing a launcher
+  orphans its spawned agent). Each is independently scoped and small.
 - **Client apps** — this repo currently ships a browser dashboard only
   (native mobile/desktop apps were deliberately deferred — see
   [`CLAUDE.md`](CLAUDE.md)'s Plan 10 note for why).
@@ -272,6 +281,91 @@ path — it runs until killed (see the Authentication warning above for its
 caller of this agent's `POST /complete` endpoint — the first thing in this
 repo to actually route a request to `InferenceEngine` over HTTP end to end.
 
+## Launcher
+
+`swarm-launcher` (`core/src/launcher_main.cpp`) is a long-lived, localhost-only
+HTTP server that spawns and supervises a real `swarm-node-agent` child
+process on command — the mechanism behind Phase B's dynamic pipeline
+assembly (see the Coordinator service section below for how the coordinator
+drives it):
+
+```bash
+./build/core/swarm-launcher.exe --port 8090 --agent-port 8091 \
+  --models-dir models --node-agent-path ./build/core/swarm-node-agent.exe
+```
+
+CLI flags (all required, all operator-supplied at the launcher's own
+startup — never derived from a network request):
+
+- `--port N` — the launcher's own port.
+- `--agent-port N` — fixed for the launcher's whole lifetime; every agent it
+  ever spawns listens on this same port. Fixed rather than chosen per
+  request because both the launcher and its spawned agents are
+  loopback-only (see below), so an operator tunneling this machine's ports
+  needs to set up port-forwarding exactly once, for two known ports, rather
+  than redoing it on every reassembly.
+- `--models-dir <path>` — expects `<models-dir>/<model>.gguf` to exist for
+  any model this launcher can serve; resolving a model name to a real local
+  path is the launcher's own job (different driver machines store models at
+  different paths, so the coordinator cannot supply one).
+- `--node-agent-path <path>` — the `swarm-node-agent` executable to spawn.
+
+It exposes one HTTP endpoint:
+
+- `POST /pipeline` — body `{"model": string, "remoteEndpoints": string,
+  "layerPlacements": string}` (`remoteEndpoints`/`layerPlacements` are
+  comma-separated strings, not JSON arrays — `core/include/swarm/json_utils.h`
+  is a deliberately scalar-only extractor). Kills any previously-spawned
+  agent (if reassembling), spawns a fresh `swarm-node-agent --model
+  <models-dir>/<model>.gguf --port <agent-port> [--remote ...] [--layer-placement
+  ...]` via an explicit argv array — **never through a shell**, so no
+  request-derived value (a model name, a `--remote` endpoint) can inject a
+  second command — polls its `/health` until ready, and responds `200
+  {"status":"ready"}`, or a real error status/body if the model file is
+  missing (rejected before any spawn is attempted, with a guard rejecting
+  `/`, `\`, `:`, and `..` in `model` specifically — a real, live-verified
+  path-traversal bug was found and fixed here during development, see
+  `CLAUDE.md`), the spawn fails, or the health-poll times out.
+
+> [!WARNING]
+> **`POST /pipeline` requires no authentication of its own — this is
+> deliberate, not an oversight.** Trust is structural: `HttpServer` (the
+> exact same class `swarm-node-agent` runs on) binds `127.0.0.1` only,
+> unconditionally, for every server built on it — confirmed live-refused
+> from this machine's real LAN IP during this feature's own whole-branch
+> review. A remote coordinator reaches a launcher on a different machine
+> only through a channel the driver's operator explicitly sets up (an SSH
+> tunnel or WireGuard), mirroring `swarm-rpc-server`'s own established
+> "insecure, trusted-LAN/same-host only, tunnel it" posture for a
+> comparably dangerous surface — reusing `SWARM_AUTH_TOKEN` here was
+> considered and rejected, since it would escalate that token's blast
+> radius from "misroute prompts" to "arbitrary code execution" for every
+> existing token-holder. **Named cost of this decision**: a volunteer who
+> wants to contribute a driver machine cannot join purely by running the
+> launcher and sharing a secret — a tunnel has to be set up first. The
+> launcher does still hold `SWARM_AUTH_TOKEN` in its own environment, but
+> only to authenticate its own *outbound* `/health` poll against the agent
+> it just spawned, not to authenticate anything incoming.
+
+**Known, disclosed limitations:** hard-killing the launcher process runs no
+destructors, so a spawned agent survives, still holding a full model in
+RAM, with nothing to clean it up (a Windows Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` would fix this; not implemented).
+`POST /pipeline` blocks the launcher for the whole spawn-and-health-poll
+cycle — `HttpServer` is single-connection-at-a-time, so a concurrent
+`/pipeline` call queues rather than running in parallel. The spawned
+child's stdout/stderr are discarded, so a model that exists but fails to
+load surfaces only as a generic health-poll-timeout error, not a specific
+reason. On this project's actual Windows/MSYS2 target platform, detecting
+a spawn that never becomes healthy takes up to ~47 seconds (a real,
+live-measured, non-blocking-connect-with-timeout implementation — an
+earlier version of this code assumed connection-refused failed near
+instantly and took up to ~2m42s instead, discovered and fixed during this
+feature's whole-branch review). Killing only the direct child (no Job
+Object association) also means an agent that itself spawns helper
+processes would orphan those too — not a concern for `swarm-node-agent`
+today, which spawns nothing of its own.
+
 ## Coordinator service
 
 `coordinator/` is a small HTTP service that tracks which nodes are alive and
@@ -374,7 +468,14 @@ Endpoints:
   member — can register an endpoint claiming to serve a given model and
   start receiving real `/generate` traffic for it — see the known gaming
   vectors below for the sharper version of this involving reputation
-  ejection.
+  ejection. Also accepts an optional `availableMemoryMb` number field
+  (rejected with `400` if negative or non-numeric) — like every other
+  self-reported field here, unverified, and used only as a soft tiebreak
+  (higher preferred, absent treated as `0`) when Phase B's dynamic
+  assembly picks a driver among several equally-reputable candidates, never
+  as a hard per-model memory gate (this project has no honest basis for a
+  real per-model memory requirement across a catalog spanning TinyLlama
+  1.1B through Mixtral 8x22B).
 - `POST /nodes/:nodeId/heartbeat` — refresh a node's liveness
 - `GET /nodes` — list currently active nodes
 - `GET /nodes/locality` — active nodes bucketed by their self-reported
@@ -433,8 +534,13 @@ Endpoints:
   two are mutually exclusive — a stream never carries both). Classifies the
   prompt first (fails closed on an unsafe prompt or a classifier error,
   same posture as `/classify`, and gates identically whether or not
-  `stream` is set), finds an active node whose self-reported `servesModel`
-  matches `modelId`, forwards the request to that node's `swarm-node-agent`
+  `stream` is set); for a model whose catalog entry declares
+  `requiredNodeCount > 1` (see Dynamic pipeline assembly below — every
+  model in the real default catalog is `1`, so this step is a no-op for all
+  of them today), first ensures a pipeline is warm, assembling one via a
+  registered launcher if needed; then finds an active node whose
+  self-reported `servesModel` matches `modelId`, forwards the request to
+  that node's `swarm-node-agent`
   `POST /complete` endpoint, and returns its generated text — streamed via
   raw byte-for-byte SSE passthrough when `stream` is set, no decode/re-encode
   in between. Returns `400` if the request is invalid or the prompt was
@@ -463,6 +569,21 @@ Endpoints:
   spot-check computation (204, or 404 if `nodeId` is unknown)
 - `GET /nodes/:nodeId/reputation` — report a node's reputation stats:
   `{ agreements: number, disagreements: number, trusted: boolean }`
+- `POST /launchers/register` — register a `swarm-launcher` instance (see the
+  Launcher section above), returns a `launcherId`. Body:
+  `{"endpoint": string, "servesModels": string[], "agentPort": number}`.
+  `endpoint` gets the same URL-parse/protocol-check/trailing-slash
+  normalization as `POST /nodes/register` and `POST /peers/register` (a real
+  gap where this route initially lacked that validation was found and fixed
+  during whole-branch review — see `CLAUDE.md`). `servesModels` declares
+  which models this launcher has local `.gguf` files for, so dynamic
+  assembly (see below) can find a launcher that actually has the requested
+  model instead of trying every registered one in turn. Re-registering the
+  same `endpoint` refreshes the entry (same overwrite-on-register semantics
+  as `POST /nodes/register`) rather than duplicating it.
+- `POST /launchers/:launcherId/heartbeat` — refresh a launcher's liveness
+  (204, or 404 if `launcherId` is unknown), same 30-second timeout as every
+  other registry in this service.
 - `GET /` — serves the web dashboard (see Web client section below)
 - `GET /app.js` — serves the web dashboard's client-side JavaScript (see Web
   client section below)
@@ -493,18 +614,89 @@ agent section above) to be running and registered via `POST
 must also keep sending `POST /nodes/:nodeId/heartbeat` periodically (the
 same 30-second liveness timeout every other endpoint relies on) — once it
 ages out of the registry from a missed heartbeat, `/generate` stops finding
-it and returns `503` again, exactly as if it had never registered. This is
-still only Phase A (plus Phase D's streaming) of the request-routing
-initiative: node selection is reputation-ranked as of Security Hardening
-Phase 4 (see below) rather than a raw first-match scan, but is still not
-locality-aware or a general load balancer, and there is no background
-pre-warming of pipelines ahead of demand. See
+it and returns `503` again, exactly as if it had never registered — this is
+still true for every model in the real default catalog, since none of them
+declare `requiredNodeCount > 1`. For a model that does, `/generate`
+additionally consults Phase B's dynamic pipeline assembly first (see the
+Dynamic pipeline assembly section below) — node selection itself is
+reputation-ranked as of Security Hardening Phase 4 (see below) rather than
+a raw first-match scan, but is still not locality-aware or a general load
+balancer. See
 [`docs/superpowers/specs/2026-08-16-request-routing-design.md`](docs/superpowers/specs/2026-08-16-request-routing-design.md)
-for Phases B (dynamic, coordinator-driven pipeline assembly) and C
-(pre-warming and demand-based autoscaling) — neither of which is
-implemented yet. Phase D (token streaming,
+for the original Phase B/C roadmap this initiative followed — Phase B
+(dynamic, coordinator-driven pipeline assembly) is done (see below); Phase C
+(background pre-warming and demand-based autoscaling ahead of a request
+arriving) remains design-only. Phase D (token streaming,
 [`docs/superpowers/plans/2026-08-22-phase-d-token-streaming.md`](docs/superpowers/plans/2026-08-22-phase-d-token-streaming.md))
 is done — see the `stream` field on `POST /generate` above.
+
+**Dynamic pipeline assembly (Phase B) is done, live on `master`.** A
+catalog entry can declare `requiredNodeCount` (default `1` — every model in
+the real default catalog is `1`, so this whole mechanism is dormant in
+production today, exercised only by a test-constructed catalog). For such a
+model, `POST /generate` calls a new `ensurePipelineReady()` step before its
+existing node-selection logic: if a tracked pipeline is already warm and its
+driver is still active, it heartbeats the driver (so a healthy pipeline
+under continuous traffic never needlessly expires) and routes normally; if
+the tracked pipeline is stale, failed, or missing, it looks up a registered
+`swarm-launcher` (see the Launcher section above) for the model via
+`POST /launchers/register`'s `servesModels`, picks a driver (highest
+reputation score, then `availableMemoryMb` as a tiebreak) and
+`requiredNodeCount - 1` compute contributors (locality-preferred, then
+score-ranked) from the live, reputation-filtered active-node pool, and calls
+the launcher's `POST /pipeline` to spawn a fresh driver sharded across those
+contributors — registering the new driver and marking the pipeline warm on
+success. If no launcher is registered for the model, or assembly fails, it
+falls through unchanged to today's Phase A behavior (whatever's already
+manually registered for that `servesModel`). **Live-verified end to end**
+during this feature's whole-branch review: a real coordinator selected a
+real compute contributor (a `swarm-rpc-server` process), called a real
+launcher, which spawned a real `swarm-node-agent --remote`-sharded across
+that contributor, and returned real generated text through the entire
+chain.
+
+**Known, disclosed limitations:**
+- A driver that's genuinely dead (not just idle) still gets one final
+  chance to be re-selected by `/generate`'s existing random tie-break
+  before it naturally ages out of the registry, since `ensurePipelineReady`
+  marks a pipeline failed only when *its own* forward to the tracked driver
+  fails, not when some other, separately-registered node with the same
+  `servesModel` fails — live-verified as self-limiting (bounded to the
+  registry's 30-second timeout, doesn't corrupt tracked state, doesn't
+  loop), not a correctness bug, but a caller may see a handful of extra
+  502s during that window under an unlucky tie-break.
+- No deduplication on concurrent pipeline assembly: several `/generate`
+  calls arriving at once for a model with no warm pipeline each
+  independently call the launcher, and each new spawn kills whatever the
+  previous call just started — live-verified as safe (no crash, no
+  corrupted state, clean self-recovery once one attempt wins) but wasteful
+  under a cold-start burst. Deduplicating this is real, scoped follow-on
+  work, not attempted here.
+- `availableMemoryMb`'s only real client-facing path is the raw
+  `POST /nodes/register` HTTP call documented above — it is not yet in
+  `GET /openapi.json`'s request schema or `SwarmClient.registerNode()`'s
+  signature, so a developer using this project's own documented/typed
+  surface has no way to set it (a real gap found during whole-branch
+  review at the `NodeRegistry`/`pipeline_selector.ts` level and fixed for
+  the HTTP route itself, but not yet carried through to these two
+  higher-level surfaces).
+- Compute-contributor `endpoint`s are expected to be reachable
+  `swarm-rpc-server` ports, not `swarm-node-agent` HTTP endpoints — the
+  same `endpoint` field means two different things depending on whether a
+  registered node is a driver candidate or a compute-contributor candidate,
+  since neither the coordinator nor the registry itself distinguishes the
+  two roles. A node intending to contribute raw compute registers itself
+  with capability data (`deviceTier`, `availableMemoryMb`,
+  `localityGroup`) and no `servesModel`, while actually running its own
+  manually-started `swarm-rpc-server` at that same registered address —
+  this is a convention, not something the coordinator verifies.
+- No `GET /launchers` route exists to introspect currently-registered
+  launchers, unlike the symmetric `GET /nodes`/`GET /peers`.
+- See the Launcher section above for the launcher-process-level
+  limitations (orphaned agents on a hard kill, single-threaded
+  `/pipeline` handling, discarded child stdout/stderr, the ~47-second
+  unhealthy-spawn detection ceiling on this project's actual target
+  platform).
 
 **`POST /v1/chat/completions` and `GET /v1/models` let an unmodified
 OpenAI-API-compatible client (the official Python/Node SDKs, `deepseek-harness`,
@@ -853,9 +1045,14 @@ For programmatic access to the coordinator, two things exist:
 one inference-request path that exists today** — both the OpenAPI document
 and `SwarmClient` describe/wrap it the same way as every other route. See
 the Coordinator service section above for what it requires (a running,
-registered `swarm-node-agent` with a matching `servesModel`) and what it
-still doesn't do (dynamic node selection or pre-warming — Phases B and C of
-the request-routing design; token streaming, Phase D, is done).
+registered `swarm-node-agent` with a matching `servesModel`, or, for a
+`requiredNodeCount > 1` model, a registered launcher — Phase B, done) and
+what it still doesn't do (background pre-warming ahead of demand — Phase C
+of the request-routing design, still design-only; token streaming, Phase D,
+is done). Note `availableMemoryMb` (a Phase B soft driver-selection
+tiebreak, documented above) is not yet in either `SwarmClient`'s or the
+OpenAPI document's `POST /nodes/register` shape — only the raw HTTP route
+itself accepts it today.
 
 ## Web client
 
