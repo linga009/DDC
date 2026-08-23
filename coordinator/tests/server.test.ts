@@ -644,6 +644,54 @@ test("POST /launchers/register rejects a missing or invalid endpoint", async () 
   }
 });
 
+test("POST /launchers/register rejects a scheme-less endpoint with 400", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "127.0.0.1:9000", servesModels: ["mixtral-8x7b"], agentPort: 8090 }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(typeof body.error, "string");
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /launchers/register rejects a non-http(s) scheme endpoint with 400", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "ftp://127.0.0.1:9000", servesModels: ["mixtral-8x7b"], agentPort: 8090 }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(typeof body.error, "string");
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /launchers/register normalizes away a trailing slash on endpoint", async () => {
+  const launcherRegistry = new LauncherRegistry();
+  const { server, baseUrl } = await startTestServer(undefined, undefined, undefined, undefined, undefined, undefined, launcherRegistry);
+  try {
+    const res = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:9000/", servesModels: ["mixtral-8x7b"], agentPort: 8090 }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(launcherRegistry.findForModel("mixtral-8x7b")?.endpoint, "http://127.0.0.1:9000");
+  } finally {
+    server.close();
+  }
+});
+
 test("POST /launchers/register rejects a non-array servesModels", async () => {
   const { server, baseUrl } = await startTestServer();
   try {

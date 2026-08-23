@@ -389,6 +389,24 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           sendJson(res, 400, { error: "endpoint must be a non-empty string" });
           return;
         }
+        let parsedLauncherEndpoint: URL;
+        try {
+          parsedLauncherEndpoint = new URL(candidate.endpoint);
+        } catch {
+          sendJson(res, 400, { error: "endpoint must be a valid URL" });
+          return;
+        }
+        if (parsedLauncherEndpoint.protocol !== "http:" && parsedLauncherEndpoint.protocol !== "https:") {
+          sendJson(res, 400, { error: "endpoint must use http or https" });
+          return;
+        }
+        // Normalize away a trailing slash, same reasoning as POST
+        // /nodes/register and POST /peers/register above: Task 7 will fetch
+        // this launcher's endpoint as `${launcher.endpoint}/pipeline`, and an
+        // unnormalized trailing slash would produce a malformed
+        // `...//pipeline` request that silently fails at pipeline-assembly
+        // time instead of being caught here at registration time.
+        const normalizedLauncherEndpoint = parsedLauncherEndpoint.href.replace(/\/$/, "");
         if (!Array.isArray(candidate.servesModels) || !candidate.servesModels.every(m => typeof m === "string")) {
           sendJson(res, 400, { error: "servesModels must be an array of strings" });
           return;
@@ -397,7 +415,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           sendJson(res, 400, { error: "agentPort must be a positive integer" });
           return;
         }
-        const launcherId = launcherRegistry.register(candidate.endpoint, candidate.servesModels as string[], candidate.agentPort);
+        const launcherId = launcherRegistry.register(normalizedLauncherEndpoint, candidate.servesModels as string[], candidate.agentPort);
         sendJson(res, 200, { launcherId });
         return;
       }
