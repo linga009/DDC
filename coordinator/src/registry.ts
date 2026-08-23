@@ -11,6 +11,12 @@ export interface NodeInfo {
   deviceTier: DeviceTier;
   localityGroup?: string;
   servesModel?: string;
+  // Self-reported, unverified -- exactly like deviceTier/localityGroup/
+  // servesModel above (this project's established posture: self-reported
+  // fields answer "who may talk to the service", never "is what they
+  // claim true"). Used only as a soft preference when picking a pipeline
+  // driver (coordinator/src/pipeline_selector.ts), never a hard gate.
+  availableMemoryMb?: number;
 }
 
 interface StoredNode extends NodeInfo {
@@ -39,9 +45,9 @@ export class NodeRegistry {
     this.timeoutMs = timeoutMs;
   }
 
-  register(endpoint: string, deviceTier: DeviceTier, localityGroup?: string, servesModel?: string): string {
+  register(endpoint: string, deviceTier: DeviceTier, localityGroup?: string, servesModel?: string, availableMemoryMb?: number): string {
     const nodeId = stableNodeId(endpoint);
-    this.nodes.set(nodeId, { nodeId, endpoint, deviceTier, localityGroup, servesModel, lastSeen: this.clock() });
+    this.nodes.set(nodeId, { nodeId, endpoint, deviceTier, localityGroup, servesModel, availableMemoryMb, lastSeen: this.clock() });
     return nodeId;
   }
 
@@ -73,7 +79,7 @@ export class NodeRegistry {
         if (reputation && !reputation.isTrusted(node.nodeId)) {
           continue;
         }
-        active.push({ nodeId: node.nodeId, endpoint: node.endpoint, deviceTier: node.deviceTier, localityGroup: node.localityGroup, servesModel: node.servesModel });
+        active.push({ nodeId: node.nodeId, endpoint: node.endpoint, deviceTier: node.deviceTier, localityGroup: node.localityGroup, servesModel: node.servesModel, availableMemoryMb: node.availableMemoryMb });
       } else {
         // Expired -- prune it here rather than just leaving it out of the
         // result, so long-running processes don't accumulate dead entries.

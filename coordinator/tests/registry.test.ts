@@ -303,3 +303,25 @@ test("a node's reputation survives an expire-then-re-register cycle at the same 
   assert.equal(reputation.isTrusted(secondId), false); // still untrusted -- history was never reset
   assert.deepEqual(reputation.getStats(secondId), { agreements: 0, disagreements: 3 });
 });
+
+test("register() accepts an optional availableMemoryMb and listActive() reports it", () => {
+  const registry = new NodeRegistry();
+  registry.register("http://127.0.0.1:8081", "desktop", undefined, "tinyllama-1.1b", 16000);
+  const [node] = registry.listActive();
+  assert.equal(node.availableMemoryMb, 16000);
+});
+
+test("register() without availableMemoryMb leaves it undefined", () => {
+  const registry = new NodeRegistry();
+  registry.register("http://127.0.0.1:8081", "desktop", undefined, "tinyllama-1.1b");
+  const [node] = registry.listActive();
+  assert.equal(node.availableMemoryMb, undefined);
+});
+
+test("re-registering the same endpoint updates availableMemoryMb", () => {
+  const registry = new NodeRegistry();
+  registry.register("http://127.0.0.1:8081", "desktop", undefined, "tinyllama-1.1b", 8000);
+  registry.register("http://127.0.0.1:8081", "desktop", undefined, "tinyllama-1.1b", 32000);
+  const [node] = registry.listActive();
+  assert.equal(node.availableMemoryMb, 32000);
+});
