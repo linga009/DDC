@@ -8,6 +8,7 @@ import { ModelCatalog, type CatalogEntry } from "../src/catalog.ts";
 import { PeerRegistry } from "../src/peer_registry.ts";
 import { LauncherRegistry } from "../src/launcher_registry.ts";
 import { PipelineTracker } from "../src/pipeline_tracker.ts";
+import { DemandTracker } from "../src/demand_tracker.ts";
 import { KeywordSafetyClassifier, type SafetyClassifier } from "../src/safety_classifier.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
 import { openApiDocument } from "../src/openapi.ts";
@@ -28,10 +29,11 @@ async function startTestServer(
   random: () => number = Math.random,
   launcherRegistry: LauncherRegistry = new LauncherRegistry(),
   pipelineTracker: PipelineTracker = new PipelineTracker(),
+  demandTracker: DemandTracker = new DemandTracker(),
 ) {
   const registry = new NodeRegistry();
   const catalog = new ModelCatalog(catalogEntries);
-  const server = createServer(registry, catalog, peers, classifier, reputation, authToken, random, launcherRegistry, pipelineTracker);
+  const server = createServer(registry, catalog, peers, classifier, reputation, authToken, random, launcherRegistry, pipelineTracker, demandTracker);
 
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -39,7 +41,7 @@ async function startTestServer(
     throw new Error("expected server to bind a real port");
   }
   const baseUrl = `http://127.0.0.1:${address.port}`;
-  return { server, baseUrl, registry, peers, reputation, authToken, launcherRegistry, pipelineTracker };
+  return { server, baseUrl, registry, peers, reputation, authToken, launcherRegistry, pipelineTracker, demandTracker };
 }
 
 // Every existing test in this file that calls bare `fetch(...)` is being
@@ -1254,6 +1256,376 @@ test("POST /generate marks a tracked pipeline failed when its driver's /complete
     server.close();
     driverStub.server.close();
     launcherStub.server.close();
+  }
+});
+
+test("POST /generate spreads requests across a warm pool with more than one entry (least-recently-used)", async () => {
+  const stubA = await startStubNodeAgent(() => ({ status: 200, body: { text: "from driver A" } }));
+  const stubB = await startStubNodeAgent(() => ({ status: 200, body: { text: "from driver B" } }));
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 1, maxPipelines: 2 }];
+  const { server, baseUrl, registry, pipelineTracker } = await startTestServer(bigCatalog);
+  try {
+    const driverA = registry.register(stubA.endpoint, "desktop", undefined, "big-model");
+    const driverB = registry.register(stubB.endpoint, "desktop", undefined, "big-model");
+    // Deliberately DISTINCT starting timestamps, not two bare Date.now()
+    // calls: two entries stamped in the same millisecond leave the LRU
+    // reduce with a genuine tie, which it resolves by keeping the first
+    // entry -- so a same-millisecond pair would let entry 1 win every
+    // round and this test would pass or fail on how fast the machine
+    // running it happens to be.
+    const now = Date.now();
+    pipelineTracker.addEntry("big-model", { pipelineId: "p1", driverNodeId: driverA, computeNodeIds: [], launcherId: "l1", state: "warm", lastUsedAt: now - 1000 });
+    pipelineTracker.addEntry("big-model", { pipelineId: "p2", driverNodeId: driverB, computeNodeIds: [], launcherId: "l2", state: "warm", lastUsedAt: now - 500 });
+
+    const texts: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const res = await authFetch(`${baseUrl}/generate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+      });
+      const body = await res.json();
+      texts.push(body.text);
+    }
+    // The first two picks are fully determined by the starting stamps
+    // above: p1 is the older of the two, so it goes first, which makes p2
+    // the older one next.
+    assert.deepEqual(texts.slice(0, 2), ["from driver A", "from driver B"]);
+    // ...and across all four, both entries must have carried traffic -- a
+    // one-entry-forever implementation fails here.
+    assert.deepEqual(new Set(texts), new Set(["from driver A", "from driver B"]));
+  } finally {
+    server.close();
+    stubA.server.close();
+    stubB.server.close();
+  }
+});
+
+test("POST /generate updates a pool entry's lastUsedAt when it's used", async () => {
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "hi" } }));
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 1, maxPipelines: 1 }];
+  const { server, baseUrl, registry, pipelineTracker } = await startTestServer(bigCatalog);
+  try {
+    const driverNodeId = registry.register(stub.endpoint, "desktop", undefined, "big-model");
+    pipelineTracker.addEntry("big-model", { pipelineId: "p1", driverNodeId, computeNodeIds: [], launcherId: "l1", state: "warm", lastUsedAt: 0 });
+
+    await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+
+    const entry = pipelineTracker.getPool("big-model").find(e => e.pipelineId === "p1");
+    assert.ok(entry && entry.lastUsedAt > 0);
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /generate with a non-empty pool never calls ensurePipelineReady's launcher-assembly path", async () => {
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "from the pool" } }));
+  let launcherCalls = 0;
+  const launcherStub = await startStubNodeAgent(() => {
+    launcherCalls++;
+    return { status: 200, body: { status: "ready" } };
+  });
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }];
+  const { server, baseUrl, registry, pipelineTracker, launcherRegistry } = await startTestServer(bigCatalog);
+  try {
+    const driverNodeId = registry.register(stub.endpoint, "desktop", undefined, "big-model");
+    pipelineTracker.addEntry("big-model", { pipelineId: "p1", driverNodeId, computeNodeIds: [], launcherId: "l1", state: "warm", lastUsedAt: Date.now() });
+    // Two generic filler nodes so selectPipeline's own
+    // requiredNodeCount(2)-candidates gate can never be the reason the
+    // launcher goes uncalled -- without them this test would still pass
+    // with the pool-first check deleted entirely.
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+    launcherRegistry.register(launcherStub.endpoint, ["big-model"], Number(new URL(launcherStub.endpoint).port));
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { text: "from the pool" });
+    assert.equal(launcherCalls, 0);
+  } finally {
+    server.close();
+    stub.server.close();
+    launcherStub.server.close();
+  }
+});
+
+test("POST /generate falls back to ensurePipelineReady's cold-start assembly when the pool is empty", async () => {
+  // This is the existing Phase B "assembles a fresh pipeline" behavior --
+  // confirming the new pool-first check doesn't disturb it when there's
+  // genuinely nothing in the pool yet.
+  let capturedLauncherRequest: Record<string, unknown> | undefined;
+  const stub = await startStubNodeAgent((body) => {
+    const payload = body as Record<string, unknown>;
+    if (payload.model !== undefined) {
+      capturedLauncherRequest = payload;
+      return { status: 200, body: { status: "ready" } };
+    }
+    return { status: 200, body: { text: "from the cold-start driver" } };
+  });
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }];
+  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(bigCatalog);
+  try {
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+    launcherRegistry.register(stub.endpoint, ["big-model"], Number(new URL(stub.endpoint).port));
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+
+    assert.equal(capturedLauncherRequest?.model, "big-model");
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { text: "from the cold-start driver" });
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /generate records demand for every request via the DemandTracker", async () => {
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "Paris." } }));
+  const { server, baseUrl, demandTracker } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+    await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
+    });
+    assert.equal(demandTracker.recentDemand("tinyllama-1.1b"), 1);
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /generate heartbeats whichever pool entry's driver it routes to, keeping a two-entry pool alive past the 30s registration window", async () => {
+  // The pool-first path replaces ensurePipelineReady's warm-check as the
+  // thing that actually serves a warm pipeline's traffic -- so it has to
+  // inherit that check's per-request registry.heartbeat() too. A
+  // launcher-spawned driver never self-registers/self-heartbeats the way
+  // an operator-run swarm-node-agent can, so without this every pool
+  // entry silently ages out of listActive() exactly registry.ts's 30s
+  // timeoutMs after it was registered, no matter how much traffic it is
+  // successfully serving, and a healthy pool tears itself down.
+  //
+  // Two entries, not one, precisely because ensurePipelineReady's own
+  // surviving heartbeat only ever looks at pool[0]: an implementation
+  // leaning on that would keep entry A alive and let entry B die.
+  const stubA = await startStubNodeAgent(() => ({ status: 200, body: { text: "from driver A" } }));
+  const stubB = await startStubNodeAgent(() => ({ status: 200, body: { text: "from driver B" } }));
+  let launcherCallCount = 0;
+  const launcherStub = await startStubNodeAgent(() => {
+    launcherCallCount++;
+    return { status: 200, body: { status: "ready" } };
+  });
+
+  let now = 0;
+  const clock = () => now;
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }];
+  const registry = new NodeRegistry(clock);
+  const catalog = new ModelCatalog(bigCatalog);
+  const launcherRegistry = new LauncherRegistry(clock);
+  const pipelineTracker = new PipelineTracker();
+  const server = createServer(registry, catalog, new PeerRegistry(), new KeywordSafetyClassifier([]), new ReputationTracker(), TEST_AUTH_TOKEN, Math.random, launcherRegistry, pipelineTracker);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected server to bind a real port");
+  }
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const generate = async () => {
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+    // A real (not faked) 2ms pause between requests. The registry's clock
+    // is injected and frozen here, but lastUsedAt is deliberately stamped
+    // from wall-clock Date.now() (it has to share an epoch with
+    // PipelinePoolManager's idle check), so without a real pause two
+    // consecutive requests can land in the same millisecond and leave the
+    // LRU pick tied.
+    await new Promise(resolve => setTimeout(resolve, 2));
+    return res;
+  };
+
+  try {
+    const driverA = registry.register(stubA.endpoint, "desktop", undefined, "big-model");
+    const driverB = registry.register(stubB.endpoint, "desktop", undefined, "big-model");
+    pipelineTracker.addEntry("big-model", { pipelineId: "pa", driverNodeId: driverA, computeNodeIds: [], launcherId: "la", state: "warm", lastUsedAt: 0 });
+    pipelineTracker.addEntry("big-model", { pipelineId: "pb", driverNodeId: driverB, computeNodeIds: [], launcherId: "lb", state: "warm", lastUsedAt: 10 });
+    // Filler nodes and a registered launcher so a broken pool path has a
+    // real cold-start route to fall into (and be caught doing so),
+    // instead of bailing out early on selectPipeline's candidate gate.
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+    launcherRegistry.register(launcherStub.endpoint, ["big-model"], Number(new URL(launcherStub.endpoint).port));
+
+    now = 20000;
+    const res1 = await generate();
+    assert.equal(res1.status, 200);
+    assert.deepEqual(await res1.json(), { text: "from driver A" });
+
+    now = 25000;
+    const res2 = await generate();
+    assert.equal(res2.status, 200);
+    assert.deepEqual(await res2.json(), { text: "from driver B" });
+
+    // 45s and 50s are both past the 30s window each driver's ORIGINAL
+    // registration at t=0 opened -- only the heartbeats issued at 20s and
+    // 25s above can keep them reachable here.
+    now = 45000;
+    const res3 = await generate();
+    assert.equal(res3.status, 200);
+    assert.deepEqual(await res3.json(), { text: "from driver A" });
+
+    now = 50000;
+    const res4 = await generate();
+    assert.equal(res4.status, 200);
+    assert.deepEqual(await res4.json(), { text: "from driver B" });
+
+    assert.equal(launcherCallCount, 0, "a pool whose drivers are being heartbeated must never trigger cold-start reassembly");
+  } finally {
+    server.close();
+    stubA.server.close();
+    stubB.server.close();
+    launcherStub.server.close();
+  }
+});
+
+test("POST /generate's cold-start assembly never claims a launcher already backing another model's pool entry", async () => {
+  // Cross-task bug found while building the pool manager: the
+  // synchronous cold-start path picked its launcher with
+  // launcherRegistry.findForModel(), which is "the first ACTIVE launcher
+  // serving this model" -- with no notion of whether that launcher is
+  // already busy hosting somebody else's live pipeline. A launcher hosts
+  // exactly one agent at a time, so claiming a busy one silently
+  // repurposes the victim model's machine, and a later teardown of the
+  // victim's pool entry would DELETE the thief's agent.
+  //
+  // The damage is concrete, not theoretical, and this test asserts it
+  // directly: both the launcher's POST /pipeline target and the driver
+  // endpoint the coordinator derives from it are (launcher host, launcher
+  // agentPort), so model-a's already-registered driver and the driver
+  // this call would register for model-b are the SAME endpoint -- and
+  // nodeId is sha256(endpoint), so re-registering it overwrites model-a's
+  // registry entry in place and flips its servesModel to model-b.
+  let launcherCallCount = 0;
+  const sharedLauncher = await startStubNodeAgent(() => {
+    launcherCallCount++;
+    return { status: 200, body: { status: "ready" } };
+  });
+  const bigCatalog = [
+    { id: "model-a", displayName: "A", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+    { id: "model-b", displayName: "B", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+  ];
+  const { server, baseUrl, registry, pipelineTracker, launcherRegistry } = await startTestServer(bigCatalog);
+  try {
+    // Enough active nodes that selectPipeline's readiness gate passes --
+    // so if the launcher goes uncalled below it is because it was
+    // correctly seen as claimed, not because assembly bailed out early.
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+
+    const agentPort = Number(new URL(sharedLauncher.endpoint).port);
+    const launcherId = launcherRegistry.register(sharedLauncher.endpoint, ["model-a", "model-b"], agentPort);
+    // model-a's live pipeline: its driver is the agent this launcher
+    // already spawned, at the launcher's own host and agentPort.
+    const driverA = registry.register(`http://127.0.0.1:${agentPort}`, "desktop", undefined, "model-a");
+    pipelineTracker.addEntry("model-a", { pipelineId: "pa", driverNodeId: driverA, computeNodeIds: [], launcherId, state: "warm", lastUsedAt: Date.now() });
+
+    // model-b has an empty pool, so this request takes the cold-start
+    // path. The only launcher serving model-b is the one model-a is
+    // already using, so there is nothing legitimate to claim.
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "model-b" }),
+    });
+
+    assert.equal(launcherCallCount, 0, "a launcher already backing another model's pool entry must never be claimed");
+    assert.equal(
+      registry.listActive().find(n => n.nodeId === driverA)?.servesModel,
+      "model-a",
+      "model-a's driver must not be silently repointed at model-b",
+    );
+    assert.deepEqual(pipelineTracker.getPool("model-a").map(e => e.pipelineId), ["pa"]);
+    assert.deepEqual(pipelineTracker.getPool("model-b"), []);
+    // Nothing serves model-b and nothing could be assembled for it -- the
+    // same 503 any model with no capacity already gets.
+    assert.equal(res.status, 503);
+  } finally {
+    server.close();
+    sharedLauncher.server.close();
+  }
+});
+
+test("POST /generate's cold-start assembly skips a claimed launcher and uses an unclaimed one serving the same model", async () => {
+  // Companion to the test above: proves the claimed-launcher filter
+  // narrows the choice rather than disabling cold-start assembly
+  // outright.
+  let claimedLauncherCalls = 0;
+  const claimedLauncher = await startStubNodeAgent(() => {
+    claimedLauncherCalls++;
+    return { status: 200, body: { status: "ready" } };
+  });
+  let freeLauncherCalls = 0;
+  const freeLauncher = await startStubNodeAgent((body) => {
+    const payload = body as Record<string, unknown>;
+    if (payload.model !== undefined) {
+      freeLauncherCalls++;
+      return { status: 200, body: { status: "ready" } };
+    }
+    return { status: 200, body: { text: "from the second launcher's driver" } };
+  });
+  const bigCatalog = [
+    { id: "model-a", displayName: "A", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+    { id: "model-b", displayName: "B", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+  ];
+  const { server, baseUrl, registry, pipelineTracker, launcherRegistry } = await startTestServer(bigCatalog);
+  try {
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+
+    // Registered FIRST, so findForModel's "first match" would pick it.
+    const claimedId = launcherRegistry.register(claimedLauncher.endpoint, ["model-a", "model-b"], Number(new URL(claimedLauncher.endpoint).port));
+    launcherRegistry.register(freeLauncher.endpoint, ["model-b"], Number(new URL(freeLauncher.endpoint).port));
+
+    const driverA = registry.register("http://127.0.0.1:3", "desktop", undefined, "model-a");
+    pipelineTracker.addEntry("model-a", { pipelineId: "pa", driverNodeId: driverA, computeNodeIds: [], launcherId: claimedId, state: "warm", lastUsedAt: Date.now() });
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "model-b" }),
+    });
+
+    assert.equal(claimedLauncherCalls, 0);
+    assert.equal(freeLauncherCalls, 1);
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { text: "from the second launcher's driver" });
+  } finally {
+    server.close();
+    claimedLauncher.server.close();
+    freeLauncher.server.close();
   }
 });
 

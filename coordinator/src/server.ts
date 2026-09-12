@@ -9,6 +9,8 @@ import { PeerRegistry } from "./peer_registry.ts";
 import { LauncherRegistry } from "./launcher_registry.ts";
 import { PipelineTracker } from "./pipeline_tracker.ts";
 import { selectPipeline } from "./pipeline_selector.ts";
+import { DemandTracker } from "./demand_tracker.ts";
+import { claimedLauncherIds } from "./pipeline_pool_manager.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
 import { openApiDocument } from "./openapi.ts";
@@ -264,7 +266,17 @@ async function ensurePipelineReady(
     }
   }
 
-  const launcher = launcherRegistry.findForModel(modelId);
+  // Not findForModel() ("the first active launcher serving this model"):
+  // that has no notion of whether the launcher it hands back is already
+  // hosting somebody else's live pipeline, and a swarm-launcher
+  // supervises exactly one agent at a time across the whole catalog. See
+  // claimedLauncherIds()'s own comment for what claiming a busy one
+  // actually destroys. `tracked` is excluded from the tally because it is
+  // precisely the dead entry this call is about to replace -- its
+  // launcher is genuinely free, and re-using it is what Phase B already
+  // did for a stale pipeline.
+  const claimed = claimedLauncherIds(catalog, pipelineTracker, tracked);
+  const launcher = launcherRegistry.listForModel(modelId).find(l => !claimed.has(l.launcherId));
   if (!launcher) {
     return;
   }
@@ -346,7 +358,7 @@ async function ensurePipelineReady(
   }
 }
 
-export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier, reputation: ReputationTracker, authToken: string, random: () => number = Math.random, launcherRegistry: LauncherRegistry = new LauncherRegistry(), pipelineTracker: PipelineTracker = new PipelineTracker()) {
+export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier, reputation: ReputationTracker, authToken: string, random: () => number = Math.random, launcherRegistry: LauncherRegistry = new LauncherRegistry(), pipelineTracker: PipelineTracker = new PipelineTracker(), demandTracker: DemandTracker = new DemandTracker()) {
   return createHttpServer(async (req, res) => {
     try {
       const method = req.method ?? "GET";
@@ -717,12 +729,69 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           return;
         }
 
-        await ensurePipelineReady(candidate.modelId, catalog, registry, reputation, launcherRegistry, pipelineTracker, authToken, random);
-        const node = selectNode(registry.listActive(reputation), reputation, candidate.modelId, random);
-        if (!node) {
+        // Recorded here, after the safety gate and every validation
+        // above, rather than at the top of the handler: demand exists to
+        // tell PipelinePoolManager how much pipeline capacity real
+        // traffic needs, and a request rejected for a bad modelId or a
+        // blocked prompt never reaches a pipeline at all. A malformed or
+        // hostile request stream must not be able to talk the pool into
+        // scaling up.
+        demandTracker.recordRequest(candidate.modelId);
+
+        let selected: NodeInfo | undefined;
+        // Warm entries only, and only ones whose driver is still active
+        // and trusted -- listActive(reputation) is the same choke point
+        // every other routing decision in this service reads through, so
+        // a reputation-ejected driver drops out of the pool's reach here
+        // for free, exactly as it does from selectNode() below.
+        const activeById = new Map(registry.listActive(reputation).map(n => [n.nodeId, n]));
+        const usable = pipelineTracker.getPool(candidate.modelId)
+          .filter(entry => entry.state === "warm" && activeById.has(entry.driverNodeId));
+        if (usable.length > 0) {
+          // Least-recently-used selection: whichever usable entry has gone
+          // longest without serving a request. Reuses the lastUsedAt field
+          // PipelinePoolManager's idle-grace-period check already needs,
+          // rather than adding a separate round-robin counter per model --
+          // swarm-node-agent serves one request at a time anyway
+          // (documented, unchanged limitation), so this spreads load just
+          // as evenly as a counter would, for less state. A tie (two
+          // entries stamped in the same millisecond) keeps the earlier
+          // entry, which is stable rather than arbitrary.
+          const entry = usable.reduce((oldest, e) => e.lastUsedAt < oldest.lastUsedAt ? e : oldest);
+          entry.lastUsedAt = Date.now();
+          // The same per-request heartbeat ensurePipelineReady's warm-check
+          // does, and for the same reason: a launcher-spawned driver never
+          // self-registers/self-heartbeats the way an operator-run
+          // swarm-node-agent can, so without this it ages out of
+          // listActive() exactly registry.ts's 30s timeoutMs after it was
+          // registered no matter how much traffic it is successfully
+          // serving, and a healthy pool tears itself down. Now that a warm
+          // pool entry is served from here instead of falling through to
+          // ensurePipelineReady, this line is the only thing keeping any
+          // pool entry past pool[0] alive between the pool manager's own
+          // 30s reconciliation ticks.
+          registry.heartbeat(entry.driverNodeId);
+          selected = activeById.get(entry.driverNodeId);
+        }
+        if (!selected) {
+          // Cold-start fallback: nothing usable in the pool (empty, every
+          // entry failed, or every entry's driver has dropped out of the
+          // registry -- the next reconciliation tick prunes those; this
+          // request doesn't wait for it). Assembles at most one pipeline
+          // synchronously, exactly as Phase B's existing behavior does,
+          // and is still a complete no-op for every requiredNodeCount:1
+          // model.
+          await ensurePipelineReady(candidate.modelId, catalog, registry, reputation, launcherRegistry, pipelineTracker, authToken, random);
+          selected = selectNode(registry.listActive(reputation), reputation, candidate.modelId, random);
+        }
+        if (!selected) {
           sendJson(res, 503, { error: `no active node currently serves model "${candidate.modelId}"` });
           return;
         }
+        // Rebound as a const so the markDriverFailedIfTracked closure
+        // below closes over a value that provably can't be undefined or
+        // reassigned, rather than over the mutable `selected` binding.
+        const node = selected;
 
         // A forward to `node` below can fail several different ways (a
         // non-2xx status, a non-SSE content-type when stream:true was

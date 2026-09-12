@@ -29,8 +29,14 @@ export const openApiDocument = {
       "request body, relays the node's generation as a real Server-Sent " +
       "Events stream (text/event-stream), one data: frame per token, " +
       "terminated by a data: [DONE] sentinel on success or an " +
-      "event: error frame on mid-stream failure. Dynamic node " +
-      "selection and pre-warming are not implemented yet.\n\n" +
+      "event: error frame on mid-stream failure. A model whose catalog " +
+      "entry declares requiredNodeCount > 1 is routed differently: the " +
+      "coordinator keeps a pool of pre-warmed, launcher-assembled " +
+      "pipelines for it and sends the request to the least-recently-used " +
+      "pooled pipeline's driver, ahead of reputation ranking, assembling " +
+      "one synchronously only when that pool is empty. No model in the " +
+      "default catalog declares requiredNodeCount > 1, so that machinery " +
+      "stays dormant unless an operator configures it.\n\n" +
       "Authentication: every endpoint described here requires a shared " +
       "secret, sent as `Authorization: Bearer <token>`. The operator sets it " +
       "on the coordinator as the SWARM_AUTH_TOKEN environment variable (the " +

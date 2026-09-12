@@ -5,6 +5,10 @@ import { PeerRegistry } from "./peer_registry.ts";
 import { KeywordSafetyClassifier, type KeywordRule } from "./safety_classifier.ts";
 import { ReputationTracker } from "./reputation_tracker.ts";
 import { loadSafetyRules, SafetyRulesError } from "./safety_rules_loader.ts";
+import { LauncherRegistry } from "./launcher_registry.ts";
+import { PipelineTracker } from "./pipeline_tracker.ts";
+import { DemandTracker } from "./demand_tracker.ts";
+import { PipelinePoolManager } from "./pipeline_pool_manager.ts";
 
 const port = Number(process.env.PORT ?? 8080);
 const host = process.env.HOST || "127.0.0.1";
@@ -53,7 +57,18 @@ try {
 const classifier = new KeywordSafetyClassifier(rules);
 const ruleCategoryCount = new Set(rules.map(r => r.category)).size;
 const reputation = new ReputationTracker();
-const server = createServer(registry, catalog, peers, classifier, reputation, authToken);
+// LauncherRegistry/PipelineTracker/DemandTracker were previously left to
+// createServer's own parameter defaults. They are constructed here now
+// because PipelinePoolManager below has to mutate the very SAME instances
+// the request path reads -- a default-constructed one inside createServer
+// would give the background loop its own private, invisible copy of the
+// pool. Behaviour is otherwise identical: same classes, same no-argument
+// construction.
+const launcherRegistry = new LauncherRegistry();
+const pipelineTracker = new PipelineTracker();
+const demandTracker = new DemandTracker();
+const server = createServer(registry, catalog, peers, classifier, reputation, authToken, Math.random, launcherRegistry, pipelineTracker, demandTracker);
+const poolManager = new PipelinePoolManager(catalog, registry, reputation, launcherRegistry, pipelineTracker, demandTracker);
 
 server.listen(port, host, () => {
   // The rule/category counts are a POSITIVE signal that the safety gate is
@@ -64,4 +79,11 @@ server.listen(port, host, () => {
     `coordinator listening on ${host}:${port} (authentication required -- see SWARM_AUTH_TOKEN; ` +
     `safety classifier armed with ${rules.length} rules across ${ruleCategoryCount} categories)`,
   );
+  // Started only once the listener is actually up, so a bind failure
+  // exits without having left a background timer running. Completely
+  // dormant for the real default catalog: every model in it declares
+  // requiredNodeCount 1 (by default), so multiPipelineModelIds() is empty
+  // and every tick returns immediately without touching a launcher --
+  // same posture as Phase B's own assembly machinery.
+  poolManager.start();
 });

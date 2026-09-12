@@ -42,3 +42,24 @@ test("recentDemand for a model whose requests all aged out returns 0, not stale 
   clock.now += 60001;
   assert.equal(tracker.recentDemand("model-a"), 0);
 });
+
+test("recordRequest prunes expired timestamps too, so a model nobody ever reads demand for stays bounded", () => {
+  // POST /generate records demand for every request it routes, including
+  // for requiredNodeCount:1 models -- which PipelinePoolManager never
+  // asks about, so recentDemand() is never called for them and a
+  // prune-on-read-only tracker would grow one timestamp per request for
+  // the life of the process. Reaching into the private field is
+  // deliberate: the whole point is that nothing observable is supposed to
+  // read this model's demand.
+  const clock = { now: 1000 };
+  const tracker = new DemandTracker(() => clock.now);
+  for (let i = 0; i < 5; i++) {
+    tracker.recordRequest("never-read-model");
+  }
+  clock.now += 60001;
+  for (let i = 0; i < 3; i++) {
+    tracker.recordRequest("never-read-model");
+  }
+  const stored = (tracker as unknown as { timestamps: Map<string, number[]> }).timestamps.get("never-read-model");
+  assert.equal(stored?.length, 3, "the five pre-window timestamps must have been pruned by the writes that followed them");
+});

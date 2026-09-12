@@ -13,11 +13,22 @@ export class DemandTracker {
   }
 
   recordRequest(modelId: string): void {
+    const now = this.clock();
     const list = this.timestamps.get(modelId);
     if (list) {
-      list.push(this.clock());
+      // Prune on write as well as on read. POST /generate records every
+      // request it routes, for EVERY model -- but recentDemand() is only
+      // ever read for models the pool manager tracks (requiredNodeCount >
+      // 1), which is none of them in the real default catalog. Without
+      // this line a single-node model's timestamp list is appended to on
+      // the hot path and never once read, so it grows for the life of the
+      // process. Costs nothing in the common case: the loop stops on the
+      // first unexpired entry and the splice is skipped entirely when
+      // nothing has aged out.
+      this.pruneExpired(list, now);
+      list.push(now);
     } else {
-      this.timestamps.set(modelId, [this.clock()]);
+      this.timestamps.set(modelId, [now]);
     }
   }
 
@@ -26,10 +37,16 @@ export class DemandTracker {
     if (!list) {
       return 0;
     }
-    const cutoff = this.clock() - WINDOW_MS;
-    // Prune in place (lazy, on read) -- same style as NodeRegistry's own
-    // prune-on-iterate pattern -- so a model with no recent traffic
-    // doesn't accumulate an unbounded timestamp list forever.
+    this.pruneExpired(list, this.clock());
+    return list.length;
+  }
+
+  // Drops every timestamp at or before the window cutoff. In place --
+  // same style as NodeRegistry's own prune-on-iterate pattern -- so no
+  // model accumulates an unbounded timestamp list. The list is appended
+  // to in clock order, so everything expired is a prefix.
+  private pruneExpired(list: number[], now: number): void {
+    const cutoff = now - WINDOW_MS;
     let firstLiveIndex = 0;
     while (firstLiveIndex < list.length && list[firstLiveIndex] <= cutoff) {
       firstLiveIndex++;
@@ -37,6 +54,5 @@ export class DemandTracker {
     if (firstLiveIndex > 0) {
       list.splice(0, firstLiveIndex);
     }
-    return list.length;
   }
 }

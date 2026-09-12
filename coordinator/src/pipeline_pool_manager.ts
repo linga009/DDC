@@ -112,6 +112,37 @@ export function planAllocations(
   return claims;
 }
 
+// PURE. Every launcherId currently backing a live pool entry, for any
+// model the pool is tracked for -- i.e. every launcher that is NOT free
+// to be claimed by anybody. A swarm-launcher supervises exactly one
+// swarm-node-agent child at a time, for the whole catalog, so handing a
+// claimed one to a second model doesn't add capacity: it silently kills
+// the first model's agent, leaves that model's pool entry pointing at a
+// machine now running different weights, and arms a later teardown of
+// that entry to DELETE the new claimant's agent.
+//
+// `exclude` drops exactly one entry from the tally: the caller about to
+// replace that specific dead entry with a fresh pipeline, which may
+// legitimately re-use the very launcher the dead one was on.
+//
+// Exported (rather than inlined where it's used) because it has two
+// callers that MUST agree on the answer: this module's own allocate()
+// and server.ts's synchronous cold-start ensurePipelineReady(). Two
+// independent copies of "which launchers are busy" is exactly how the
+// background loop and the request path end up fighting over one machine.
+export function claimedLauncherIds(
+  catalog: ModelCatalog,
+  pipelineTracker: PipelineTracker,
+  exclude?: PooledPipeline,
+): Set<string> {
+  return new Set(
+    catalog.multiPipelineModelIds()
+      .flatMap(modelId => pipelineTracker.getPool(modelId))
+      .filter(entry => entry !== exclude)
+      .map(entry => entry.launcherId),
+  );
+}
+
 // Background reconciliation loop: keeps each multi-node model's pool of
 // warm pipelines matched to recent demand, heals entries whose nodes have
 // died or been reputation-ejected, and tears down pipelines nobody has
@@ -312,14 +343,11 @@ export class PipelinePoolManager {
 
     // Claimed = the launcherId of any pool entry for any model, read fresh
     // after the health check above has already freed whatever it freed.
-    const claimedLauncherIds = new Set(
-      modelIds.flatMap(id => this.pipelineTracker.getPool(id).map(e => e.launcherId)),
-    );
-
+    // Nothing is excluded: every entry standing at this point is live.
     const claims = planAllocations(
       snapshots,
       modelId => this.launcherRegistry.listForModel(modelId),
-      claimedLauncherIds,
+      claimedLauncherIds(this.catalog, this.pipelineTracker),
     );
 
     // A model whose assembly fails is dropped for the rest of this tick
