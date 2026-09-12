@@ -1,0 +1,540 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createServer as createHttpServer } from "node:http";
+import { PipelinePoolManager, desiredPipelineCount, planAllocations } from "../src/pipeline_pool_manager.ts";
+import { PipelineTracker } from "../src/pipeline_tracker.ts";
+import { DemandTracker } from "../src/demand_tracker.ts";
+import { LauncherRegistry, type LauncherInfo } from "../src/launcher_registry.ts";
+import { NodeRegistry } from "../src/registry.ts";
+import { ReputationTracker } from "../src/reputation_tracker.ts";
+import { ModelCatalog } from "../src/catalog.ts";
+
+// A minimal stand-in for a swarm-launcher's HTTP interface: responds to
+// POST /pipeline with a canned success body and counts calls; responds to
+// DELETE /pipeline by counting the call and returning 204. Mirrors
+// coordinator/tests/server.test.ts's own startStubNodeAgent pattern.
+async function startStubLauncher() {
+  let pipelineCalls = 0;
+  let deleteCalls = 0;
+  const server = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    if (req.method === "DELETE") {
+      deleteCalls++;
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    pipelineCalls++;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "ready" }));
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected stub launcher to bind to a port");
+  }
+  return {
+    server,
+    endpoint: `http://127.0.0.1:${address.port}`,
+    port: address.port as number,
+    getPipelineCalls: () => pipelineCalls,
+    getDeleteCalls: () => deleteCalls,
+  };
+}
+
+function makeManager(overrides: {
+  catalog?: ModelCatalog;
+  registry?: NodeRegistry;
+  reputation?: ReputationTracker;
+  launcherRegistry?: LauncherRegistry;
+  pipelineTracker?: PipelineTracker;
+  demandTracker?: DemandTracker;
+  random?: () => number;
+  idleGraceMs?: number;
+  requestsPerPipeline?: number;
+}) {
+  return new PipelinePoolManager(
+    overrides.catalog ?? new ModelCatalog([]),
+    overrides.registry ?? new NodeRegistry(),
+    overrides.reputation ?? new ReputationTracker(),
+    overrides.launcherRegistry ?? new LauncherRegistry(),
+    overrides.pipelineTracker ?? new PipelineTracker(),
+    overrides.demandTracker ?? new DemandTracker(),
+    overrides.random ?? Math.random,
+    30000, // intervalMs -- irrelevant for direct runOnce() calls
+    overrides.idleGraceMs ?? 300000, // 5 minutes
+    overrides.requestsPerPipeline ?? 10,
+  );
+}
+
+function launcherFixture(launcherId: string, servesModels: string[]): LauncherInfo {
+  return { launcherId, endpoint: `http://127.0.0.1:9/${launcherId}`, servesModels, agentPort: 9000 };
+}
+
+// ---------------------------------------------------------------------------
+// The two pure decision functions the design doc's Testing Considerations
+// asks for by name -- inspectable with no network, no timers, no registries.
+// ---------------------------------------------------------------------------
+
+test("desiredPipelineCount is zero for a model that needs only one node", () => {
+  assert.equal(desiredPipelineCount(999, 4, 1, 10), 0);
+  assert.equal(desiredPipelineCount(0, 4, 1, 10), 0);
+});
+
+test("desiredPipelineCount floors at one warm pipeline even with zero demand", () => {
+  assert.equal(desiredPipelineCount(0, 4, 2, 10), 1);
+  assert.equal(desiredPipelineCount(1, 4, 2, 10), 1);
+  assert.equal(desiredPipelineCount(10, 4, 2, 10), 1);
+});
+
+test("desiredPipelineCount grows one pipeline per requestsPerPipeline of demand", () => {
+  assert.equal(desiredPipelineCount(11, 4, 2, 10), 2);
+  assert.equal(desiredPipelineCount(20, 4, 2, 10), 2);
+  assert.equal(desiredPipelineCount(21, 4, 2, 10), 3);
+  // requestsPerPipeline is a real tunable, not a baked-in 10.
+  assert.equal(desiredPipelineCount(6, 4, 2, 5), 2);
+});
+
+test("desiredPipelineCount never exceeds the catalog's maxPipelines cap", () => {
+  assert.equal(desiredPipelineCount(1000, 2, 2, 10), 2);
+  assert.equal(desiredPipelineCount(1000, 1, 2, 10), 1);
+});
+
+test("planAllocations gives a single contested launcher to the higher-demand model and never double-claims it", () => {
+  const launcher = launcherFixture("L1", ["low", "high"]);
+  const claims = planAllocations(
+    [
+      { modelId: "low", demand: 1, currentCount: 0, desiredCount: 1 },
+      { modelId: "high", demand: 9, currentCount: 0, desiredCount: 1 },
+    ],
+    () => [launcher],
+    new Set(),
+  );
+  assert.deepEqual(claims.map(c => ({ modelId: c.modelId, launcherId: c.launcher.launcherId })), [
+    { modelId: "high", launcherId: "L1" },
+  ]);
+});
+
+test("planAllocations never claims a launcher already backing a live pipeline", () => {
+  const claims = planAllocations(
+    [{ modelId: "a", demand: 50, currentCount: 0, desiredCount: 1 }],
+    () => [launcherFixture("L1", ["a"])],
+    new Set(["L1"]),
+  );
+  assert.deepEqual(claims, []);
+});
+
+test("planAllocations claims one launcher per missing pipeline, up to the model's deficit", () => {
+  const launchers = [launcherFixture("L1", ["a"]), launcherFixture("L2", ["a"]), launcherFixture("L3", ["a"])];
+  const claims = planAllocations(
+    [{ modelId: "a", demand: 30, currentCount: 1, desiredCount: 3 }],
+    () => launchers,
+    new Set(),
+  );
+  assert.deepEqual(claims.map(c => c.launcher.launcherId), ["L1", "L2"]);
+});
+
+test("planAllocations skips models that already have their desired count and does not mutate its inputs", () => {
+  const claimed = new Set(["L9"]);
+  const snapshots = [
+    { modelId: "satisfied", demand: 100, currentCount: 2, desiredCount: 2 },
+    { modelId: "hungry", demand: 1, currentCount: 0, desiredCount: 1 },
+  ];
+  const claims = planAllocations(snapshots, () => [launcherFixture("L1", ["satisfied", "hungry"])], claimed);
+  assert.deepEqual(claims.map(c => c.modelId), ["hungry"]);
+  assert.deepEqual([...claimed], ["L9"]);
+  assert.deepEqual(snapshots.map(s => s.currentCount), [2, 0]);
+});
+
+// ---------------------------------------------------------------------------
+// The reconciliation loop itself.
+// ---------------------------------------------------------------------------
+
+test("runOnce assembles a fresh pipeline for a model with demand, an idle launcher, and enough active nodes", async () => {
+  const launcherStub = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }]);
+    const registry = new NodeRegistry();
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+    const launcherRegistry = new LauncherRegistry();
+    launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
+    const demandTracker = new DemandTracker();
+    demandTracker.recordRequest("big-model");
+    const pipelineTracker = new PipelineTracker();
+
+    const manager = makeManager({ catalog, registry, launcherRegistry, demandTracker, pipelineTracker });
+    await manager.runOnce();
+
+    assert.equal(launcherStub.getPipelineCalls(), 1);
+    assert.equal(pipelineTracker.getPool("big-model").length, 1);
+    assert.equal(pipelineTracker.getPool("big-model")[0].state, "warm");
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
+test("runOnce does nothing for a model with requiredNodeCount 1", async () => {
+  const launcherStub = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([{ id: "small-model", displayName: "Small", minActiveNodes: 0 }]);
+    const launcherRegistry = new LauncherRegistry();
+    launcherRegistry.register(launcherStub.endpoint, ["small-model"], launcherStub.port);
+    const demandTracker = new DemandTracker();
+    demandTracker.recordRequest("small-model");
+
+    const manager = makeManager({ catalog, launcherRegistry, demandTracker });
+    await manager.runOnce();
+
+    assert.equal(launcherStub.getPipelineCalls(), 0);
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
+test("runOnce never claims a launcher already backing a live pool entry for a DIFFERENT model", async () => {
+  const launcherStub = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([
+      { id: "model-a", displayName: "A", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+      { id: "model-b", displayName: "B", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+    ]);
+    const launcherRegistry = new LauncherRegistry();
+    // The one launcher available declares it can serve BOTH models.
+    const launcherId = launcherRegistry.register(launcherStub.endpoint, ["model-a", "model-b"], launcherStub.port);
+    const registry = new NodeRegistry();
+    // NOTE: register() returns the sha256-derived nodeId, which is what a
+    // PooledPipeline's driverNodeId field holds -- NOT the raw endpoint.
+    // Putting an endpoint here instead would make the health check below
+    // treat this entry as dead and free the launcher, quietly turning this
+    // no-preemption test into a no-op that passes for the wrong reason.
+    const driverNodeId = registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+    const pipelineTracker = new PipelineTracker();
+    // Pre-populate model-a's pool with an entry already claiming this launcher.
+    pipelineTracker.addEntry("model-a", {
+      pipelineId: "existing",
+      driverNodeId,
+      computeNodeIds: [],
+      launcherId,
+      state: "warm",
+      lastUsedAt: Date.now(),
+    });
+    const demandTracker = new DemandTracker();
+    demandTracker.recordRequest("model-b");
+    demandTracker.recordRequest("model-b");
+
+    const manager = makeManager({ catalog, registry, launcherRegistry, demandTracker, pipelineTracker });
+    await manager.runOnce();
+
+    // model-b wanted a pipeline and had demand, but the only launcher
+    // serving it was already claimed by model-a -- must NOT be touched.
+    assert.equal(pipelineTracker.getPool("model-b").length, 0);
+    assert.equal(pipelineTracker.getPool("model-a").length, 1);
+    assert.equal(launcherStub.getPipelineCalls(), 0);
+    assert.equal(launcherStub.getDeleteCalls(), 0);
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
+test("runOnce marks a pool entry failed and removes it when one of its nodes is no longer active", async () => {
+  const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }]);
+  const registry = new NodeRegistry();
+  const pipelineTracker = new PipelineTracker();
+  pipelineTracker.addEntry("big-model", {
+    pipelineId: "dead-entry",
+    driverNodeId: "never-registered-node-id",
+    computeNodeIds: [],
+    launcherId: "some-launcher",
+    state: "warm",
+    lastUsedAt: Date.now(),
+  });
+
+  const manager = makeManager({ catalog, registry, pipelineTracker });
+  await manager.runOnce();
+
+  assert.equal(pipelineTracker.getPool("big-model").length, 0);
+});
+
+test("runOnce removes a pool entry another code path already marked failed, even though its nodes are still active", async () => {
+  const launcherStub = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
+    const registry = new NodeRegistry();
+    const driverNodeId = registry.register("http://127.0.0.1:1", "desktop", undefined, "big-model");
+    const launcherRegistry = new LauncherRegistry();
+    const launcherId = launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
+    const pipelineTracker = new PipelineTracker();
+    pipelineTracker.addEntry("big-model", {
+      pipelineId: "broken-entry",
+      driverNodeId,
+      computeNodeIds: [],
+      launcherId,
+      state: "warm",
+      lastUsedAt: Date.now(),
+    });
+    // /generate marks the entry failed when a forward to its driver fails;
+    // the driver is still "active" by registration timestamp, so the
+    // node-liveness check alone would never reap this entry and its
+    // launcher would stay claimed forever.
+    pipelineTracker.markEntryFailed("big-model", "broken-entry");
+
+    const manager = makeManager({ catalog, registry, launcherRegistry, pipelineTracker });
+    await manager.runOnce();
+
+    assert.equal(pipelineTracker.getPool("big-model").length, 0);
+    assert.equal(launcherStub.getDeleteCalls(), 1);
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
+test("runOnce scales down a pool entry idle past the grace period, calling DELETE on its launcher", async () => {
+  const launcherStub = await startStubLauncher();
+  try {
+    // requiredNodeCount MUST be > 1 for this model to be considered at all
+    // -- a requiredNodeCount:1 model is invisible to the pool manager, so
+    // with 1 here the scale-down step would never run and this test would
+    // fail for a reason that has nothing to do with idleness.
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
+    const registry = new NodeRegistry();
+    const driverEndpoint = "http://127.0.0.1:1";
+    const driverNodeId = registry.register(driverEndpoint, "desktop", undefined, "big-model");
+    const launcherRegistry = new LauncherRegistry();
+    const launcherId = launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
+    const pipelineTracker = new PipelineTracker();
+    // lastUsedAt is written by server.ts with a raw Date.now(), so the
+    // manager's idle comparison must be against that same wall clock. An
+    // injected/fake epoch on the manager's side would make this difference
+    // meaningless and this teardown would never fire.
+    const oldTimestamp = Date.now() - 400000; // well past a 300000ms (5 min) grace period
+    pipelineTracker.addEntry("big-model", {
+      pipelineId: "idle-entry",
+      driverNodeId,
+      computeNodeIds: [],
+      launcherId,
+      state: "warm",
+      lastUsedAt: oldTimestamp,
+    });
+    const demandTracker = new DemandTracker(); // zero recent demand
+
+    const manager = makeManager({ catalog, registry, launcherRegistry, pipelineTracker, demandTracker });
+    await manager.runOnce();
+
+    assert.equal(launcherStub.getDeleteCalls(), 1);
+    assert.equal(pipelineTracker.getPool("big-model").length, 0);
+    // Only one node is registered, so a 2-node pipeline can't be rebuilt
+    // this tick -- the torn-down entry must not immediately churn back.
+    assert.equal(launcherStub.getPipelineCalls(), 0);
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
+test("runOnce leaves a recently-used pool entry alone, and idleGraceMs is a real tunable", async () => {
+  const launcherStub = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
+    const registry = new NodeRegistry();
+    const driverNodeId = registry.register("http://127.0.0.1:1", "desktop", undefined, "big-model");
+    const launcherRegistry = new LauncherRegistry();
+    const launcherId = launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
+    const pipelineTracker = new PipelineTracker();
+    const addEntry = () => pipelineTracker.addEntry("big-model", {
+      pipelineId: "entry",
+      driverNodeId,
+      computeNodeIds: [],
+      launcherId,
+      state: "warm",
+      lastUsedAt: Date.now() - 5000,
+    });
+
+    addEntry();
+    await makeManager({ catalog, registry, launcherRegistry, pipelineTracker, idleGraceMs: 300000 }).runOnce();
+    assert.equal(pipelineTracker.getPool("big-model").length, 1, "5s idle is well inside a 5-minute grace period");
+    assert.equal(launcherStub.getDeleteCalls(), 0);
+
+    pipelineTracker.removeEntry("big-model", "entry");
+    addEntry();
+    await makeManager({ catalog, registry, launcherRegistry, pipelineTracker, idleGraceMs: 1000 }).runOnce();
+    assert.equal(pipelineTracker.getPool("big-model").length, 0, "5s idle is past a 1s grace period");
+    assert.equal(launcherStub.getDeleteCalls(), 1);
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
+test("runOnce heartbeats a healthy entry's launcher-spawned driver so it doesn't age out between ticks", async () => {
+  const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
+  let fakeNow = Date.now();
+  // 30000ms timeout == the reconciliation interval this manager runs at in
+  // production, which is exactly why the driver has to be heartbeated: a
+  // launcher-spawned driver is never pinged by anything else, so without
+  // this it ages out of listActive() between two consecutive ticks and a
+  // perfectly healthy warm pipeline gets torn down and rebuilt forever.
+  const registry = new NodeRegistry(() => fakeNow, 30000);
+  const driverNodeId = registry.register("http://127.0.0.1:1", "desktop", undefined, "big-model");
+  const contributorNodeId = registry.register("http://127.0.0.1:2", "desktop");
+  const pipelineTracker = new PipelineTracker();
+  pipelineTracker.addEntry("big-model", {
+    pipelineId: "warm-entry",
+    driverNodeId,
+    computeNodeIds: [contributorNodeId],
+    launcherId: "launcher-not-registered",
+    state: "warm",
+    lastUsedAt: Date.now(),
+  });
+
+  const manager = makeManager({ catalog, registry, pipelineTracker });
+
+  fakeNow += 25000;
+  registry.heartbeat(contributorNodeId); // a real operator-run node pings for itself
+  await manager.runOnce();
+
+  fakeNow += 25000; // 50s since the driver registered -- past the 30s timeout
+  registry.heartbeat(contributorNodeId);
+  await manager.runOnce();
+
+  assert.equal(pipelineTracker.getPool("big-model").length, 1);
+  assert.equal(registry.listActive().some(n => n.nodeId === driverNodeId), true);
+});
+
+test("runOnce allocates a single idle launcher to the higher-demand of two competing under-provisioned models", async () => {
+  const launcherStub = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([
+      { id: "model-low", displayName: "Low", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+      { id: "model-high", displayName: "High", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+    ]);
+    const registry = new NodeRegistry();
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+    const launcherRegistry = new LauncherRegistry();
+    // ONE launcher declares it can serve BOTH models -- only one of them
+    // can actually get it this tick.
+    launcherRegistry.register(launcherStub.endpoint, ["model-low", "model-high"], launcherStub.port);
+    const demandTracker = new DemandTracker();
+    demandTracker.recordRequest("model-low");
+    for (let i = 0; i < 5; i++) demandTracker.recordRequest("model-high");
+    const pipelineTracker = new PipelineTracker();
+
+    const manager = makeManager({ catalog, registry, launcherRegistry, demandTracker, pipelineTracker });
+    await manager.runOnce();
+
+    assert.equal(pipelineTracker.getPool("model-high").length, 1);
+    assert.equal(pipelineTracker.getPool("model-low").length, 0);
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
+test("runOnce scales one model up to several pipelines when demand justifies it, stopping at maxPipelines", async () => {
+  const stubs = [await startStubLauncher(), await startStubLauncher(), await startStubLauncher()];
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }]);
+    const registry = new NodeRegistry();
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+    const launcherRegistry = new LauncherRegistry();
+    for (const stub of stubs) launcherRegistry.register(stub.endpoint, ["big-model"], stub.port);
+    const demandTracker = new DemandTracker();
+    for (let i = 0; i < 15; i++) demandTracker.recordRequest("big-model"); // ceil(15/10) == 2
+    const pipelineTracker = new PipelineTracker();
+
+    const manager = makeManager({ catalog, registry, launcherRegistry, demandTracker, pipelineTracker });
+    await manager.runOnce();
+
+    const pool = pipelineTracker.getPool("big-model");
+    assert.equal(pool.length, 2);
+    assert.equal(new Set(pool.map(e => e.launcherId)).size, 2, "two pipelines must never share one launcher");
+    assert.deepEqual(stubs.map(s => s.getPipelineCalls()), [1, 1, 0]);
+
+    // A second tick with the pool already at its desired count must be a
+    // complete no-op -- no churn, no third launcher claimed.
+    await manager.runOnce();
+    assert.equal(pipelineTracker.getPool("big-model").length, 2);
+    assert.deepEqual(stubs.map(s => s.getPipelineCalls()), [1, 1, 0]);
+    assert.deepEqual(stubs.map(s => s.getDeleteCalls()), [0, 0, 0]);
+  } finally {
+    for (const stub of stubs) stub.server.close();
+  }
+});
+
+test("runOnce does not claim a launcher when the swarm has too few active nodes to form the pipeline", async () => {
+  const launcherStub = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 3, maxPipelines: 1 }]);
+    const registry = new NodeRegistry();
+    registry.register("http://127.0.0.1:1", "desktop"); // only 1 of the 3 needed
+    const launcherRegistry = new LauncherRegistry();
+    launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
+    const pipelineTracker = new PipelineTracker();
+
+    const manager = makeManager({ catalog, registry, launcherRegistry, pipelineTracker });
+    await manager.runOnce();
+
+    assert.equal(launcherStub.getPipelineCalls(), 0);
+    assert.equal(pipelineTracker.getPool("big-model").length, 0);
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
+test("runOnce tolerates a launcher that rejects the assembly request, leaving the pool empty and not throwing", async () => {
+  const server = createHttpServer(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "spawn failed" }));
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("expected a bound port");
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
+    const registry = new NodeRegistry();
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+    const launcherRegistry = new LauncherRegistry();
+    launcherRegistry.register(`http://127.0.0.1:${address.port}`, ["big-model"], address.port);
+    const pipelineTracker = new PipelineTracker();
+
+    const manager = makeManager({ catalog, registry, launcherRegistry, pipelineTracker });
+    await manager.runOnce();
+
+    assert.equal(pipelineTracker.getPool("big-model").length, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test("start() drives runOnce on its interval and stop() ends it", async () => {
+  const launcherStub = await startStubLauncher();
+  const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
+  const registry = new NodeRegistry();
+  registry.register("http://127.0.0.1:1", "desktop");
+  registry.register("http://127.0.0.1:2", "desktop");
+  const launcherRegistry = new LauncherRegistry();
+  launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
+  const pipelineTracker = new PipelineTracker();
+  const manager = new PipelinePoolManager(
+    catalog, registry, new ReputationTracker(), launcherRegistry, pipelineTracker,
+    new DemandTracker(), Math.random, 5, 300000, 10,
+  );
+  try {
+    manager.start();
+    const deadline = Date.now() + 3000;
+    while (pipelineTracker.getPool("big-model").length === 0 && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(pipelineTracker.getPool("big-model").length, 1);
+    manager.stop();
+    const callsAtStop = launcherStub.getPipelineCalls();
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.equal(launcherStub.getPipelineCalls(), callsAtStop, "no further reconciliation after stop()");
+  } finally {
+    manager.stop();
+    launcherStub.server.close();
+  }
+});

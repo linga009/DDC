@@ -82,3 +82,16 @@ test("maxPipelines returns 1 for an unknown model id", () => {
   const catalog = new ModelCatalog([{ id: "small", displayName: "Small", minActiveNodes: 0 }]);
   assert.equal(catalog.maxPipelines("nonexistent-model"), 1);
 });
+
+test("multiPipelineModelIds returns only entries with requiredNodeCount > 1", () => {
+  const catalog = new ModelCatalog([
+    { id: "small", displayName: "Small", minActiveNodes: 0 },
+    { id: "big", displayName: "Big", minActiveNodes: 5, requiredNodeCount: 3 },
+    { id: "also-small", displayName: "Also Small", minActiveNodes: 0, requiredNodeCount: 1 },
+  ]);
+  assert.deepEqual(catalog.multiPipelineModelIds(), ["big"]);
+});
+
+test("multiPipelineModelIds is empty for the real default catalog -- Phase C ships dormant", () => {
+  assert.deepEqual(new ModelCatalog().multiPipelineModelIds(), []);
+});

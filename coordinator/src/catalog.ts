@@ -59,4 +59,15 @@ export class ModelCatalog {
   maxPipelines(id: string): number {
     return this.entries.find(entry => entry.id === id)?.maxPipelines ?? 1;
   }
+
+  // Every catalog entry id whose requiredNodeCount is declared > 1 --
+  // the only models the pool manager (Phase C) ever considers, since a
+  // requiredNodeCount:1 model never needs launcher-backed pipeline
+  // assembly at all (Phase B's own guard, restated at the catalog level
+  // so the pool manager doesn't need its own copy of this filtering
+  // logic). Empty for the real default catalog above, which is why
+  // Phase C, like Phase B before it, ships dormant in production.
+  multiPipelineModelIds(): string[] {
+    return this.entries.filter(entry => (entry.requiredNodeCount ?? 1) > 1).map(entry => entry.id);
+  }
 }
