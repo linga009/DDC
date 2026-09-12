@@ -47,10 +47,13 @@ spawns and shards a fresh pipeline across live-registered compute on demand,
 Phase B), and an OpenAI-compatible `POST /v1/chat/completions` +
 `GET /v1/models` (so an unmodified OpenAI SDK, or any tool built against the
 real OpenAI API, can use this swarm as a drop-in model provider) all work and
-are tested. What's still missing is background pre-warming/autoscaling of
-warm pipelines ahead of demand (Phase C) — Phase B assembles a pipeline
-synchronously, on the first request that needs one. That's the natural next
-place to contribute.
+are tested. Background pre-warming/autoscaling of warm pipelines ahead of
+demand (Phase C) is now in too: a reconciliation loop keeps a per-model pool
+of warm pipelines matched to recent demand, so a pipeline no longer has to be
+assembled synchronously on the first request that needs one. Like Phase B's
+multi-node assembly, it ships **dormant in production** — no model in the
+default catalog declares `requiredNodeCount > 1`, so nothing engages it until
+an operator configures such a model.
 
 ## Get involved
 
@@ -58,12 +61,14 @@ This is early, real infrastructure — not a finished product — and it's
 built in the open specifically so people can pick up a piece of it. Useful
 ways to help right now:
 
-- **Pre-warming and autoscaling** — Phase C of the request-routing
-  initiative (see above); manual single-node routing (Phase A), token
-  streaming (Phase D), and dynamic multi-device pipeline assembly (Phase B)
-  are all done, but pipelines are still only assembled synchronously, on
-  the first request that needs one — nothing proactive or demand-driven
-  exists yet.
+- **Launcher identity** — Phase C's pool tracks which launcher is busy by
+  `launcherId` *and* endpoint string, but an endpoint string is not a
+  canonical machine identity: one launcher registered as both
+  `http://127.0.0.1:P` and `http://localhost:P` still looks like two idle
+  machines and can be double-claimed, which serves a caller another model's
+  weights. Same endpoint-aliasing class already disclosed for node identity
+  (see Known gaming vectors); closing it needs the proof-of-endpoint-possession
+  mechanism that has been out of scope since Security Phase 3.
 - **Closing one of Phase B's disclosed residual gaps** — see the Dynamic
   pipeline assembly section below for the current list (a still-registered
   dead driver can occasionally be re-selected before it ages out, no
@@ -626,7 +631,7 @@ balancer. See
 for the original Phase B/C roadmap this initiative followed — Phase B
 (dynamic, coordinator-driven pipeline assembly) is done (see below); Phase C
 (background pre-warming and demand-based autoscaling ahead of a request
-arriving) remains design-only. Phase D (token streaming,
+arriving) is done too (see below). Phase D (token streaming,
 [`docs/superpowers/plans/2026-08-22-phase-d-token-streaming.md`](docs/superpowers/plans/2026-08-22-phase-d-token-streaming.md))
 is done — see the `stream` field on `POST /generate` above.
 
@@ -697,6 +702,61 @@ chain.
   `/pipeline` handling, discarded child stdout/stderr, the ~47-second
   unhealthy-spawn detection ceiling on this project's actual target
   platform).
+
+**Background pre-warming and demand-based autoscaling (Phase C) is done,
+live on `master`.** A catalog entry can now also declare `maxPipelines`
+(default `1`), the ceiling on how many concurrent pipelines the coordinator
+will keep warm for that model. A `PipelinePoolManager` runs a reconciliation
+loop every 10 seconds that health-checks each pooled pipeline, tears down
+ones idle past a 5-minute grace period (via a new `DELETE /pipeline` on
+`swarm-launcher`, which stops the spawned agent and always returns `204`),
+computes each model's desired pipeline count from a deliberately naive
+demand function (`ceil(recentDemand / 10)`, from a sliding 60-second
+per-model request window), and allocates genuinely idle launchers to
+under-provisioned models in demand-sorted order. `POST /generate` tries the
+model's warm pool first (least-recently-used), falling back to Phase B's
+synchronous cold-start assembly only when nothing usable is pooled.
+
+**There is no preemption, by explicit design:** a launcher already backing a
+live pipeline is never killed to give it to a busier model — it becomes
+reallocatable only when its own model's scale-down or health-check frees it.
+Under sustained demand skew this means a low-demand model can hold capacity
+a high-demand one wants.
+
+Like Phase B, **this ships dormant in production** — the mechanism only
+engages for a `requiredNodeCount > 1` model, and no model in the real
+default catalog declares one.
+
+**Known, disclosed limitations:**
+
+- **A launcher's endpoint string is not a canonical machine identity.** The
+  pool marks a launcher busy by `launcherId` *and* endpoint, which survives
+  the `launcherId` rotation that happens when a lapsed registration
+  re-registers. But one physical launcher reachable as both
+  `http://127.0.0.1:P` and `http://localhost:P` registers twice and looks
+  like two idle machines, so it can be double-claimed — and since a launcher
+  supervises one agent at a time, a caller then receives another model's
+  weights with a `200`. This is the same endpoint-aliasing class already
+  disclosed for node identity (see Known gaming vectors); closing it needs
+  the proof-of-endpoint-possession mechanism ruled out of scope in Security
+  Phase 3.
+- **A hung launcher can cost an unrelated healthy model its pipeline.** The
+  reconciliation tick awaits launcher I/O sequentially with a 60-second
+  timeout — twice the registry's 30-second node timeout — and the driver
+  heartbeat pre-pass sits inside that same tick, whose overlapping runs are
+  dropped by a re-entrancy guard. One unresponsive launcher can therefore
+  starve a healthy model's driver of heartbeats until it ages out and its
+  pipeline is torn down and rebuilt.
+- Scale-down does not deregister the torn-down driver from `NodeRegistry`,
+  so it stays selectable for up to 30 seconds and can yield a `502`.
+- The demand-to-pipeline-count function and both constants (10s interval,
+  5-minute idle grace, 10 requests/minute per pipeline) are starting points
+  chosen without real load data, not tuned figures.
+- `POST /v1/chat/completions` records demand but does not consult the warm
+  pool — it still selects a single already-registered node, as it did before
+  this phase.
+- Pool state, like every other piece of coordinator state, is in-memory only
+  and does not survive a restart.
 
 **`POST /v1/chat/completions` and `GET /v1/models` let an unmodified
 OpenAI-API-compatible client (the official Python/Node SDKs, `deepseek-harness`,
@@ -1047,9 +1107,9 @@ and `SwarmClient` describe/wrap it the same way as every other route. See
 the Coordinator service section above for what it requires (a running,
 registered `swarm-node-agent` with a matching `servesModel`, or, for a
 `requiredNodeCount > 1` model, a registered launcher — Phase B, done) and
-what it still doesn't do (background pre-warming ahead of demand — Phase C
-of the request-routing design, still design-only; token streaming, Phase D,
-is done). Note `availableMemoryMb` (a Phase B soft driver-selection
+what it still doesn't do (nothing from the request-routing design remains
+unbuilt — background pre-warming ahead of demand is Phase C, done; token
+streaming is Phase D, done). Note `availableMemoryMb` (a Phase B soft driver-selection
 tiebreak, documented above) is not yet in either `SwarmClient`'s or the
 OpenAPI document's `POST /nodes/register` shape — only the raw HTTP route
 itself accepts it today.
