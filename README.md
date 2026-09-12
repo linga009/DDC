@@ -61,14 +61,15 @@ This is early, real infrastructure — not a finished product — and it's
 built in the open specifically so people can pick up a piece of it. Useful
 ways to help right now:
 
-- **Launcher identity** — Phase C's pool tracks which launcher is busy by
-  `launcherId` *and* endpoint string, but an endpoint string is not a
-  canonical machine identity: one launcher registered as both
-  `http://127.0.0.1:P` and `http://localhost:P` still looks like two idle
-  machines and can be double-claimed, which serves a caller another model's
-  weights. Same endpoint-aliasing class already disclosed for node identity
-  (see Known gaming vectors); closing it needs the proof-of-endpoint-possession
-  mechanism that has been out of scope since Security Phase 3.
+- **Endpoint identity** *(being scoped now — see below)* — an endpoint
+  *string* is not a canonical machine identity anywhere in this service. A
+  node re-registering as `http://localhost:P` instead of
+  `http://127.0.0.1:P` gets a brand-new `nodeId` and a clean reputation
+  record for free, and a launcher registered under two aliases looks like
+  two idle machines and can be double-claimed, serving a caller another
+  model's weights. This has been disclosed-but-unfixed since Security
+  Phase 3 and is the single highest-value gap left in the trust model;
+  it is now being scoped as its own phase rather than left open.
 - **Closing one of Phase B's disclosed residual gaps** — see the Dynamic
   pipeline assembly section below for the current list (a still-registered
   dead driver can occasionally be re-selected before it ages out, no
@@ -737,9 +738,9 @@ default catalog declares one.
   like two idle machines, so it can be double-claimed — and since a launcher
   supervises one agent at a time, a caller then receives another model's
   weights with a `200`. This is the same endpoint-aliasing class already
-  disclosed for node identity (see Known gaming vectors); closing it needs
-  the proof-of-endpoint-possession mechanism ruled out of scope in Security
-  Phase 3.
+  disclosed for node identity (see Known gaming vectors). A phase closing
+  the endpoint-aliasing class for both nodes and launchers is being scoped
+  now; nothing is implemented yet.
 - **A hung launcher can cost an unrelated healthy model its pipeline.** The
   reconciliation tick awaits launcher I/O sequentially with a 60-second
   timeout — twice the registry's 30-second node timeout — and the driver
@@ -996,10 +997,14 @@ the original. It does not let the attacker redirect traffic to themselves
 to lowercase before `stableNodeId()` ever sees it, so this overwrite can
 only clobber the record's other fields, never repoint where `/generate`
 actually sends the request — so it is a targeted denial/griefing primitive,
-not a token-capture one. No fix is scoped for any of this; closing the
-endpoint-aliasing and overwrite gaps both need the same
+not a token-capture one. **A fix for the endpoint-aliasing half of this is now being scoped as its
+own phase** (it was previously left open): aliasing is what makes both the
+reputation reset above and Phase C's launcher double-claim possible, and
+closing it — along with the overwrite gap — needs the same
 proof-of-endpoint-possession mechanism (e.g. node-supplied public-key
-identity) already rejected as out of scope for this phase. Separately, the
+identity) that was rejected as out of scope *for Security Phase 3*, not
+rejected permanently. Nothing is implemented yet; this paragraph will say
+what actually shipped once it has. Separately, the
 disagreement ratio is still all-time with no decay or windowing, so an established node
 with a long good history (e.g. 200 agreements) still needs 200
 *consecutive* disagreements to be ejected — the inverse of catching a node
