@@ -63,3 +63,27 @@ test("findForModel does not return an expired launcher", () => {
   clock.now += 40000;
   assert.equal(registry.findForModel("mixtral-8x7b"), undefined);
 });
+
+test("listForModel returns every active launcher declaring the model", () => {
+  const registry = new LauncherRegistry();
+  registry.register("http://127.0.0.1:9000", ["mixtral-8x7b"], 8090);
+  registry.register("http://127.0.0.1:9001", ["mixtral-8x7b"], 8091);
+  registry.register("http://127.0.0.1:9002", ["mixtral-8x22b"], 8092);
+  const found = registry.listForModel("mixtral-8x7b");
+  assert.equal(found.length, 2);
+  assert.deepEqual(found.map(l => l.endpoint).sort(), ["http://127.0.0.1:9000", "http://127.0.0.1:9001"]);
+});
+
+test("listForModel returns an empty array when no active launcher declares the model", () => {
+  const registry = new LauncherRegistry();
+  registry.register("http://127.0.0.1:9000", ["mixtral-8x7b"], 8090);
+  assert.deepEqual(registry.listForModel("mixtral-8x22b"), []);
+});
+
+test("listForModel excludes an expired launcher", () => {
+  const clock = { now: 1000 };
+  const registry = new LauncherRegistry(() => clock.now, 30000);
+  registry.register("http://127.0.0.1:9000", ["mixtral-8x7b"], 8090);
+  clock.now += 40000;
+  assert.deepEqual(registry.listForModel("mixtral-8x7b"), []);
+});

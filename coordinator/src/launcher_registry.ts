@@ -82,4 +82,8 @@ export class LauncherRegistry {
   findForModel(modelId: string): LauncherInfo | undefined {
     return this.listActive().find(launcher => launcher.servesModels.includes(modelId));
   }
+
+  listForModel(modelId: string): LauncherInfo[] {
+    return this.listActive().filter(launcher => launcher.servesModels.includes(modelId));
+  }
 }
