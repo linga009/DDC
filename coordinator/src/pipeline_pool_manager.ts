@@ -14,7 +14,18 @@ import { selectPipeline } from "./pipeline_selector.ts";
 // parameter below rather than something a future tuner has to go editing
 // module source to change.
 const DEFAULT_REQUESTS_PER_PIPELINE = 10;
-const DEFAULT_INTERVAL_MS = 30000;
+// Deliberately well under registry.ts's 30s node timeout, not equal to it.
+// A launcher-spawned driver's registration is refreshed only by this loop's
+// own heartbeat, so the gap between two consecutive ticks IS that driver's
+// heartbeat period. At 30000 it exactly tied the 30s timeout -- and since
+// setInterval only ever drifts late, the tie was lost in practice: a
+// healthy, merely-idle pipeline was judged dead, torn down and respawned
+// roughly every 60s with zero traffic. That is the precise opposite of what
+// pre-warming exists to do, and strictly worse than Phase B, which kept its
+// pipeline alive. The 3x headroom also means a tick SKIPPED by start()'s
+// re-entrancy guard (which drops ticks while a slow launcher call is in
+// flight) is survivable; at 30000 a single dropped tick was fatal.
+export const DEFAULT_INTERVAL_MS = 10000;
 const DEFAULT_IDLE_GRACE_MS = 300000;
 
 const PIPELINE_ASSEMBLY_TIMEOUT_MS = 60000;
@@ -242,6 +253,33 @@ export class PipelinePoolManager {
   // reallocation below, in the SAME tick they're freed -- allocate()
   // re-derives claimed state fresh from the tracker after this runs.
   private async healthCheckAndScaleDown(modelIds: string[]): Promise<void> {
+    // Heartbeat every pooled driver BEFORE the listActive() snapshot below,
+    // rather than once per entry at the bottom of the loop. A
+    // launcher-spawned driver never self-heartbeats -- nothing external
+    // pings it -- so this call is the only thing keeping it in the registry.
+    //
+    // Ordering alone is NOT what makes this correct, and it is worth being
+    // precise about why: registry.heartbeat() refuses to revive a node that
+    // is already past timeoutMs (see registry.ts -- "a node past its timeout
+    // cannot be revived by a heartbeat"), so once the gap between two ticks
+    // exceeds the timeout, no placement of this call can save the driver.
+    // The load-bearing fix is DEFAULT_INTERVAL_MS being comfortably UNDER
+    // registry.ts's timeout; see the constant's own comment.
+    //
+    // What hoisting buys on top of that is a tick's own duration: tearDown()
+    // and tryAssemble() below each await real HTTP calls with 60s timeouts,
+    // so a slow launcher could otherwise let a healthy driver age out
+    // between the snapshot at the top and a heartbeat at the bottom of the
+    // very same tick.
+    for (const modelId of modelIds) {
+      for (const entry of this.pipelineTracker.getPool(modelId)) {
+        // Only the driver: compute contributors are real registered nodes
+        // that ping for themselves, and pinging them here would mask their
+        // death instead of detecting it.
+        this.registry.heartbeat(entry.driverNodeId);
+      }
+    }
+
     const activeNodeIds = new Set(this.registry.listActive(this.reputation).map(n => n.nodeId));
     const now = Date.now();
 
@@ -270,26 +308,12 @@ export class PipelinePoolManager {
           continue;
         }
 
-        // A launcher-spawned driver never self-heartbeats the way an
-        // operator-run swarm-node-agent does -- nothing external pings it
-        // -- so without this it ages out of listActive() exactly
-        // registry.ts's 30s timeoutMs after it registered, which is the
-        // same order as this loop's own interval. A perfectly healthy,
-        // simply-idle pipeline would then be reaped by the check above
-        // within a tick or two, the idle grace period would be
-        // unreachable, and background pre-warming would defeat itself.
-        // Same reasoning, and the same one-line fix, as
-        // ensurePipelineReady()'s per-request heartbeat in server.ts.
-        //
-        // Like that one, this is unconditional on liveness, so a driver
-        // whose process actually died stays "active" here. Two things
-        // bound that: /generate marks the entry failed the moment a
-        // forward to it fails (reaped above, next tick), and with no
-        // traffic at all the idle grace period tears it down anyway.
-        // Only the driver is heartbeated -- the compute contributors are
-        // real registered nodes that ping for themselves, and pinging
-        // them here would mask their death instead of detecting it.
-        this.registry.heartbeat(entry.driverNodeId);
+        // The driver was already heartbeated in the pre-pass above. Like
+        // that pre-pass, it is unconditional on liveness, so a driver whose
+        // process actually died stays "active" here. Two things bound that:
+        // /generate marks the entry failed the moment a forward to it fails
+        // (reaped above, next tick), and with no traffic at all the idle
+        // grace period tears it down anyway.
       }
     }
   }

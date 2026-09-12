@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer as createHttpServer } from "node:http";
-import { PipelinePoolManager, desiredPipelineCount, planAllocations } from "../src/pipeline_pool_manager.ts";
+import { DEFAULT_INTERVAL_MS, PipelinePoolManager, desiredPipelineCount, planAllocations } from "../src/pipeline_pool_manager.ts";
 import { PipelineTracker } from "../src/pipeline_tracker.ts";
 import { DemandTracker } from "../src/demand_tracker.ts";
 import { LauncherRegistry, type LauncherInfo } from "../src/launcher_registry.ts";
@@ -389,16 +389,29 @@ test("runOnce heartbeats a healthy entry's launcher-spawned driver so it doesn't
 
   const manager = makeManager({ catalog, registry, pipelineTracker });
 
-  fakeNow += 25000;
-  registry.heartbeat(contributorNodeId); // a real operator-run node pings for itself
-  await manager.runOnce();
+  // Step by the cadence PRODUCTION actually runs at, not an arbitrary
+  // number. Nothing but this loop ever pings a launcher-spawned driver, so
+  // the gap between two consecutive ticks *is* that driver's heartbeat
+  // period -- which means DEFAULT_INTERVAL_MS must leave real headroom under
+  // the registry's 30s timeout. It previously equalled it exactly, and since
+  // setInterval only ever fires late, the tie was lost in practice: the
+  // driver aged out, the entry was judged dead, and a perfectly healthy idle
+  // pipeline was torn down and respawned in a ~60s loop with zero traffic.
+  //
+  // The +5% models that late drift. Ten ticks is ~100s of simulated idle
+  // time -- well past the point the old constant churned, and still short of
+  // the 5-minute idle grace period, so nothing here should be torn down.
+  const tickGap = Math.round(DEFAULT_INTERVAL_MS * 1.05);
+  assert.ok(tickGap < 30000, `reconciliation interval ${DEFAULT_INTERVAL_MS}ms leaves no headroom under the registry's 30s node timeout`);
 
-  fakeNow += 25000; // 50s since the driver registered -- past the 30s timeout
-  registry.heartbeat(contributorNodeId);
-  await manager.runOnce();
+  for (let tick = 0; tick < 10; tick++) {
+    fakeNow += tickGap;
+    registry.heartbeat(contributorNodeId); // a real operator-run node pings for itself
+    await manager.runOnce();
 
-  assert.equal(pipelineTracker.getPool("big-model").length, 1);
-  assert.equal(registry.listActive().some(n => n.nodeId === driverNodeId), true);
+    assert.equal(pipelineTracker.getPool("big-model").length, 1, `pipeline was torn down on tick ${tick + 1}`);
+    assert.equal(registry.listActive().some(n => n.nodeId === driverNodeId), true, `driver aged out of the registry on tick ${tick + 1}`);
+  }
 });
 
 test("runOnce allocates a single idle launcher to the higher-demand of two competing under-provisioned models", async () => {
