@@ -203,6 +203,7 @@ std::string readBody(socket_t s, std::string bodySoFar, size_t contentLength) {
 
 void writeResponse(socket_t s, const HttpResponse& response) {
     const char* statusText = response.status == 200 ? "OK"
+                              : response.status == 204 ? "No Content"
                               : response.status == 404 ? "Not Found"
                               : response.status == 400 ? "Bad Request"
                               : response.status == 401 ? "Unauthorized"
