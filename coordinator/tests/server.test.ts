@@ -3752,3 +3752,49 @@ test("concurrent POST /generate on a cold pool assembles exactly one pipeline, n
     stub.server.close();
   }
 });
+
+test("POST /v1/chat/completions records demand so OpenAI-API traffic can scale the pool", async () => {
+  // The OpenAI-compatible route was invisible to PipelinePoolManager: one
+  // of the two inference entry points recorded no demand at all, so traffic
+  // arriving over it could never scale the pipeline pool it needs.
+  const stub = await startStubNodeAgent(() => ({
+    status: 200,
+    body: { text: "hi", promptTokens: 1, completionTokens: 1, reachedTokenLimit: false },
+  }));
+  const { server, baseUrl, registry, demandTracker } = await startTestServer();
+  try {
+    registry.register(stub.endpoint, "desktop", undefined, "tinyllama-1.1b");
+    assert.equal(demandTracker.recentDemand("tinyllama-1.1b"), 0);
+
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "tinyllama-1.1b", messages: [{ role: "user", content: "hi" }] }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(demandTracker.recentDemand("tinyllama-1.1b"), 1, "a served /v1/chat/completions request must count as demand");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /v1/chat/completions does not record demand for a prompt the safety classifier blocks", async () => {
+  // Same ordering guarantee /generate already has: a blocked or malformed
+  // request stream must never be able to talk the pool into scaling up.
+  const blocking = new KeywordSafetyClassifier([{ category: "test_category", pattern: /forbidden/i }]);
+  const { server, baseUrl, demandTracker } = await startTestServer(DEFAULT_TEST_CATALOG, new PeerRegistry(), blocking);
+  try {
+    const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "tinyllama-1.1b", messages: [{ role: "user", content: "a forbidden thing" }] }),
+    });
+
+    assert.equal(res.status, 400);
+    assert.equal(demandTracker.recentDemand("tinyllama-1.1b"), 0, "a blocked prompt must not count as demand");
+  } finally {
+    server.close();
+  }
+});

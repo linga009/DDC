@@ -620,3 +620,40 @@ test("a launcher is claimed for the whole assembly window, not just after it suc
     server.close();
   }
 });
+
+test("tearing down an entry whose launcher registration has expired still stops its agent", async () => {
+  // A lapsed LauncherRegistry entry does NOT mean the agent stopped --
+  // registrations expire on their own heartbeat timeout. Teardown used to
+  // look the endpoint up by launcherId only, find nothing, and silently
+  // skip the DELETE, freeing the launcherId while an orphan agent kept
+  // holding the port and the model's weights.
+  const launcherStub = await startStubLauncher();
+  const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
+  let fakeNow = Date.now();
+  const registry = new NodeRegistry();
+  const launcherRegistry = new LauncherRegistry(() => fakeNow, 30000);
+  const launcherId = launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
+  const pipelineTracker = new PipelineTracker();
+  pipelineTracker.addEntry("big-model", {
+    pipelineId: "entry-with-expired-launcher",
+    driverNodeId: "driver-not-in-the-registry", // dead -> teardown path
+    computeNodeIds: [],
+    launcherId,
+    launcherEndpoint: launcherStub.endpoint,
+    state: "warm",
+    lastUsedAt: Date.now(),
+  });
+
+  const manager = makeManager({ catalog, registry, pipelineTracker, launcherRegistry });
+  try {
+    fakeNow += 60000; // the launcher's own registration lapses
+    assert.equal(launcherRegistry.listActive().length, 0, "precondition: the launcher registration has expired");
+
+    await manager.runOnce();
+
+    assert.equal(pipelineTracker.getPool("big-model").length, 0, "the dead entry should be torn down");
+    assert.equal(launcherStub.getDeleteCalls(), 1, "the agent must still be stopped even though its launcher registration lapsed");
+  } finally {
+    launcherStub.server.close();
+  }
+});

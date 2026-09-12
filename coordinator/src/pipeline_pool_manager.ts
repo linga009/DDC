@@ -166,20 +166,28 @@ export function claimedLauncherIds(
 // harmful case: the coordinator would mark the launcher reallocatable
 // while its old agent is still running, holding both the agent port and
 // the model's weights in RAM.
-export async function stopLauncherPipeline(launcherRegistry: LauncherRegistry, launcherId: string): Promise<void> {
-  const launcher = launcherRegistry.listActive().find(l => l.launcherId === launcherId);
-  if (!launcher) {
-    return; // launcher itself is gone -- nothing to call, nothing left to clean up
+export async function stopLauncherPipeline(
+  launcherRegistry: LauncherRegistry,
+  launcherId: string,
+  fallbackEndpoint?: string,
+): Promise<void> {
+  // A lapsed registration does NOT mean the agent stopped: LauncherRegistry
+  // entries expire on their own heartbeat timeout, so without the recorded
+  // endpoint as a fallback an expired launcher's agent was left running
+  // while its launcherId was freed for reallocation.
+  const endpoint = launcherRegistry.listActive().find(l => l.launcherId === launcherId)?.endpoint ?? fallbackEndpoint;
+  if (!endpoint) {
+    return; // never knew where it was -- nothing to call
   }
   try {
     // DELETE /pipeline is idempotent and always 204s, so calling it on a
     // launcher whose agent already exited is harmless.
-    await fetch(`${launcher.endpoint}/pipeline`, {
+    await fetch(`${endpoint}/pipeline`, {
       method: "DELETE",
       signal: AbortSignal.timeout(PIPELINE_ASSEMBLY_TIMEOUT_MS),
     });
   } catch (err) {
-    console.warn(`failed to stop pipeline on launcher ${launcher.endpoint}:`, err);
+    console.warn(`failed to stop pipeline on launcher ${endpoint}:`, err);
   }
 }
 
@@ -351,12 +359,12 @@ export class PipelinePoolManager {
   }
 
   private async tearDown(modelId: string, entry: PooledPipeline): Promise<void> {
-    await this.tryStopLauncher(entry.launcherId);
+    await this.tryStopLauncher(entry.launcherId, entry.launcherEndpoint);
     this.pipelineTracker.removeEntry(modelId, entry.pipelineId);
   }
 
-  private async tryStopLauncher(launcherId: string): Promise<void> {
-    await stopLauncherPipeline(this.launcherRegistry, launcherId);
+  private async tryStopLauncher(launcherId: string, fallbackEndpoint?: string): Promise<void> {
+    await stopLauncherPipeline(this.launcherRegistry, launcherId, fallbackEndpoint);
   }
 
   // Step 3+4: compute every model's desired count, decide the claims
@@ -444,6 +452,7 @@ export class PipelinePoolManager {
       driverNodeId: "",
       computeNodeIds: [],
       launcherId: launcher.launcherId,
+      launcherEndpoint: launcher.endpoint,
       state: "assembling",
       lastUsedAt: Date.now(),
     });
@@ -477,6 +486,7 @@ export class PipelinePoolManager {
         driverNodeId,
         computeNodeIds: selection.computeContributors.map(n => n.nodeId),
         launcherId: launcher.launcherId,
+        launcherEndpoint: launcher.endpoint,
         state: "warm",
         // Wall-clock Date.now(), never an injected clock: server.ts's
         // /generate path stamps this same field with a raw Date.now() when

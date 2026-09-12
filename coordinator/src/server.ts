@@ -397,7 +397,7 @@ async function assemblePipeline(
     // replaced that agent in place.)
     if (tracked) {
       if (tracked.launcherId !== launcher.launcherId) {
-        await stopLauncherPipeline(launcherRegistry, tracked.launcherId);
+        await stopLauncherPipeline(launcherRegistry, tracked.launcherId, tracked.launcherEndpoint);
       }
       pipelineTracker.removeEntry(modelId, tracked.pipelineId);
     }
@@ -406,6 +406,7 @@ async function assemblePipeline(
       driverNodeId,
       computeNodeIds: selection.computeContributors.map(n => n.nodeId),
       launcherId: launcher.launcherId,
+      launcherEndpoint: launcher.endpoint,
       state: "warm",
       lastUsedAt: Date.now(),
     });
@@ -1081,6 +1082,18 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           });
           return;
         }
+
+        // Same placement and reasoning as /generate's own call: after the
+        // safety gate and every validation, so a blocked or malformed
+        // request stream can never talk the pool into scaling up. Without
+        // this, one of the two inference entry points was invisible to
+        // PipelinePoolManager, so traffic arriving over the OpenAI-
+        // compatible API could never scale the pipeline pool it needs.
+        // (Pool-FIRST selection is deliberately not shared here: this
+        // route has never consulted the pool -- that half predates Phase C
+        // and is unchanged -- and wiring it in is a larger change than
+        // closing the demand-blindness this phase introduced.)
+        demandTracker.recordRequest(candidate.model);
 
         const node = selectNode(registry.listActive(reputation), reputation, candidate.model, random);
         if (!node) {

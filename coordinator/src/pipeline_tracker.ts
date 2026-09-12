@@ -5,6 +5,14 @@ export interface PooledPipeline {
   driverNodeId: string;
   computeNodeIds: string[];
   launcherId: string;
+  // The launcher's endpoint as it was at assembly time. Teardown needs it
+  // because LauncherRegistry entries expire on their own heartbeat timeout:
+  // if a launcher's registration lapses while its agent is still running,
+  // looking the endpoint up by launcherId finds nothing and the DELETE is
+  // silently skipped, freeing the launcherId while an orphan agent keeps
+  // holding the port and the model's weights. Optional so entries built by
+  // older code (and by tests) stay valid.
+  launcherEndpoint?: string;
   state: PooledPipelineState;
   lastUsedAt: number;
 }
