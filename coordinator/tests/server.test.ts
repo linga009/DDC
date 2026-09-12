@@ -832,7 +832,14 @@ test("POST /generate for a requiredNodeCount>1 model with a warm tracked pipelin
   const { server, baseUrl, registry, pipelineTracker } = await startTestServer(bigCatalog);
   try {
     const driverNodeId = registry.register(stub.endpoint, "desktop", undefined, "big-model");
-    pipelineTracker.markWarm("big-model", driverNodeId, []);
+    pipelineTracker.addEntry("big-model", {
+      pipelineId: "test-pipeline-4",
+      driverNodeId,
+      computeNodeIds: [],
+      launcherId: "test-launcher-4",
+      state: "warm",
+      lastUsedAt: Date.now(),
+    });
 
     const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
@@ -873,7 +880,14 @@ test("POST /generate for a requiredNodeCount>1 model with a stale tracked pipeli
     // registered (or has since aged out) -- listActive() won't contain it,
     // so the staleness check must trigger and, finding no launcher either,
     // fall through to whatever's manually registered.
-    pipelineTracker.markWarm("big-model", "some-driver-id-not-in-the-registry", []);
+    pipelineTracker.addEntry("big-model", {
+      pipelineId: "test-pipeline-stale-2",
+      driverNodeId: "some-driver-id-not-in-the-registry",
+      computeNodeIds: [],
+      launcherId: "test-launcher-stale-2",
+      state: "warm",
+      lastUsedAt: Date.now(),
+    });
     await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -968,7 +982,14 @@ test("POST /generate for a warm pipeline with an active driver never calls a reg
   const { server, baseUrl, registry, pipelineTracker, launcherRegistry } = await startTestServer(bigCatalog);
   try {
     const driverNodeId = registry.register(driverStub.endpoint, "desktop", undefined, "big-model");
-    pipelineTracker.markWarm("big-model", driverNodeId, []);
+    pipelineTracker.addEntry("big-model", {
+      pipelineId: "test-pipeline-3",
+      driverNodeId,
+      computeNodeIds: [],
+      launcherId: "test-launcher-3",
+      state: "warm",
+      lastUsedAt: Date.now(),
+    });
     // A second, unrelated active node so selectPipeline()'s own
     // requiredNodeCount(2)-candidates gate (pipeline_selector.ts) can't be
     // the reason the launcher goes uncalled -- without this, the warm-check
@@ -1018,7 +1039,14 @@ test("POST /generate for a requiredNodeCount>1 model with a stale tracked pipeli
     // A tracked pipeline pointing at a driver that was never actually
     // registered -- matches the existing "stale tracked pipeline... falls
     // back to manual registration" test's own staleness setup above.
-    pipelineTracker.markWarm("big-model", "some-driver-id-not-in-the-registry", []);
+    pipelineTracker.addEntry("big-model", {
+      pipelineId: "test-pipeline-stale-1",
+      driverNodeId: "some-driver-id-not-in-the-registry",
+      computeNodeIds: [],
+      launcherId: "test-launcher-stale-1",
+      state: "warm",
+      lastUsedAt: Date.now(),
+    });
 
     // selectPipeline() needs requiredNodeCount candidates already in the
     // active pool before it will pick anything -- see the "assembles a
@@ -1083,7 +1111,14 @@ test("POST /generate for a warm pipeline heartbeats the driver, keeping it alive
 
   try {
     const driverNodeId = registry.register(stub.endpoint, "desktop", undefined, "big-model");
-    pipelineTracker.markWarm("big-model", driverNodeId, []);
+    pipelineTracker.addEntry("big-model", {
+      pipelineId: "test-pipeline-2",
+      driverNodeId,
+      computeNodeIds: [],
+      launcherId: "test-launcher-2",
+      state: "warm",
+      lastUsedAt: Date.now(),
+    });
     const launcherPort = Number(new URL(launcherStub.endpoint).port);
     launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherPort);
 
@@ -1168,7 +1203,14 @@ test("POST /generate marks a tracked pipeline failed when its driver's /complete
   const { server, baseUrl, registry, launcherRegistry, pipelineTracker } = await startTestServer(bigCatalog, undefined, undefined, undefined, undefined, random);
   try {
     const driverNodeId = registry.register(driverStub.endpoint, "desktop", undefined, "big-model");
-    pipelineTracker.markWarm("big-model", driverNodeId, []);
+    pipelineTracker.addEntry("big-model", {
+      pipelineId: "test-pipeline-1",
+      driverNodeId,
+      computeNodeIds: [],
+      launcherId: "test-launcher-1",
+      state: "warm",
+      lastUsedAt: Date.now(),
+    });
 
     // selectPipeline requires requiredNodeCount candidates already active
     // before it will attempt reassembly -- two generic filler nodes,

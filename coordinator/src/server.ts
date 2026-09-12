@@ -220,8 +220,15 @@ async function ensurePipelineReady(
     return;
   }
 
-  const tracked = pipelineTracker.get(modelId);
-  if (tracked?.state === "warm" && tracked.driverNodeId) {
+  // At most one entry can exist here -- this synchronous, cold-start-only
+  // path never adds a second one (Task 6's pool manager is what grows a
+  // pool past size 1). Reading index 0 rather than introducing a new
+  // "single tracked entry" concept keeps this function's own state
+  // entirely inside PipelineTracker's one pool-shaped API, with nothing
+  // parallel to keep in sync.
+  const pool = pipelineTracker.getPool(modelId);
+  const tracked = pool[0];
+  if (tracked?.state === "warm") {
     const driverStillActive = registry.listActive(reputation).some(n => n.nodeId === tracked.driverNodeId);
     if (driverStillActive) {
       // A launcher-spawned driver never self-registers/self-heartbeats
@@ -248,8 +255,8 @@ async function ensurePipelineReady(
       // again, and route back to it again, forever, as long as requests
       // keep arriving faster than the 30s timeout. That gap is closed
       // below, not here: /generate's own forwarding logic calls
-      // pipelineTracker.markFailed(modelId) whenever a forward to this
-      // tracked driver fails, which is what actually evicts a dead
+      // pipelineTracker.markEntryFailed(modelId, ...) whenever a forward to
+      // this tracked driver fails, which is what actually evicts a dead
       // driver from "warm" so the next request reassembles through the
       // launcher instead of retrying the same corpse.
       registry.heartbeat(tracked.driverNodeId);
@@ -298,7 +305,9 @@ async function ensurePipelineReady(
       signal: AbortSignal.timeout(PIPELINE_ASSEMBLY_TIMEOUT_MS),
     });
     if (!launcherRes.ok) {
-      pipelineTracker.markFailed(modelId);
+      if (tracked) {
+        pipelineTracker.markEntryFailed(modelId, tracked.pipelineId);
+      }
       return;
     }
 
@@ -314,10 +323,26 @@ async function ensurePipelineReady(
     const launcherUrl = new URL(launcher.endpoint);
     const driverEndpoint = `${launcherUrl.protocol}//${launcherUrl.hostname}:${launcher.agentPort}`;
     const driverNodeId = registry.register(driverEndpoint, "desktop", undefined, modelId);
-    pipelineTracker.markWarm(modelId, driverNodeId, selection.computeContributors.map(n => n.nodeId));
+    // Replace whatever was tracked before (if anything -- there is at
+    // most one entry on this cold-start path) with the freshly-assembled
+    // pipeline, rather than appending a second entry alongside a stale
+    // one.
+    if (tracked) {
+      pipelineTracker.removeEntry(modelId, tracked.pipelineId);
+    }
+    pipelineTracker.addEntry(modelId, {
+      pipelineId: randomUUID(),
+      driverNodeId,
+      computeNodeIds: selection.computeContributors.map(n => n.nodeId),
+      launcherId: launcher.launcherId,
+      state: "warm",
+      lastUsedAt: Date.now(),
+    });
   } catch (err) {
     console.warn(`failed to assemble pipeline for model ${modelId} via launcher ${launcher.endpoint}:`, err);
-    pipelineTracker.markFailed(modelId);
+    if (tracked) {
+      pipelineTracker.markEntryFailed(modelId, tracked.pipelineId);
+    }
   }
 }
 
@@ -713,8 +738,9 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         // request sends back to the caller, which every call site below
         // still does exactly as it did before.
         const markDriverFailedIfTracked = () => {
-          if (pipelineTracker.get(candidate.modelId)?.driverNodeId === node.nodeId) {
-            pipelineTracker.markFailed(candidate.modelId);
+          const entry = pipelineTracker.getPool(candidate.modelId).find(e => e.driverNodeId === node.nodeId);
+          if (entry) {
+            pipelineTracker.markEntryFailed(candidate.modelId, entry.pipelineId);
           }
         };
 

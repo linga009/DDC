@@ -1,28 +1,52 @@
-export type PipelineState = "warm" | "failed";
+export type PooledPipelineState = "warm" | "assembling" | "failed";
 
-export interface TrackedPipeline {
-  driverNodeId?: string;
+export interface PooledPipeline {
+  pipelineId: string;
+  driverNodeId: string;
   computeNodeIds: string[];
-  state: PipelineState;
+  launcherId: string;
+  state: PooledPipelineState;
+  lastUsedAt: number;
 }
 
 // In-memory only, same as every other piece of coordinator state
-// (NodeRegistry, PeerRegistry, ReputationTracker) -- a deliberate,
-// disclosed limitation, not a gap. One tracked pipeline per model id,
-// matching this plan's own Non-Goal (multiple concurrent pipelines per
-// model is Phase C's problem, not this one's).
+// (NodeRegistry, PeerRegistry, ReputationTracker, DemandTracker) -- a
+// deliberate, disclosed limitation, not a gap. Multiple pool entries per
+// model id are now supported (Phase C) -- Phase B's own single-slot
+// version is gone, not kept alongside this one; every caller uses this
+// pool-shaped API.
 export class PipelineTracker {
-  private readonly pipelines = new Map<string, TrackedPipeline>();
+  private readonly pools = new Map<string, PooledPipeline[]>();
 
-  get(modelId: string): TrackedPipeline | undefined {
-    return this.pipelines.get(modelId);
+  getPool(modelId: string): PooledPipeline[] {
+    return this.pools.get(modelId) ?? [];
   }
 
-  markWarm(modelId: string, driverNodeId: string, computeNodeIds: string[]): void {
-    this.pipelines.set(modelId, { driverNodeId, computeNodeIds, state: "warm" });
+  addEntry(modelId: string, entry: PooledPipeline): void {
+    const pool = this.pools.get(modelId);
+    if (pool) {
+      pool.push(entry);
+    } else {
+      this.pools.set(modelId, [entry]);
+    }
   }
 
-  markFailed(modelId: string): void {
-    this.pipelines.set(modelId, { driverNodeId: undefined, computeNodeIds: [], state: "failed" });
+  removeEntry(modelId: string, pipelineId: string): void {
+    const pool = this.pools.get(modelId);
+    if (!pool) {
+      return;
+    }
+    const index = pool.findIndex(entry => entry.pipelineId === pipelineId);
+    if (index !== -1) {
+      pool.splice(index, 1);
+    }
+  }
+
+  markEntryFailed(modelId: string, pipelineId: string): void {
+    const pool = this.pools.get(modelId);
+    const entry = pool?.find(e => e.pipelineId === pipelineId);
+    if (entry) {
+      entry.state = "failed";
+    }
   }
 }
