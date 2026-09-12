@@ -295,6 +295,9 @@ export class PipelinePoolManager {
     // very same tick.
     for (const modelId of modelIds) {
       for (const entry of this.pipelineTracker.getPool(modelId)) {
+        if (entry.state === "assembling") {
+          continue; // a reservation held by an in-flight tryAssemble: no driver exists yet
+        }
         // Only the driver: compute contributors are real registered nodes
         // that ping for themselves, and pinging them here would mask their
         // death instead of detecting it.
@@ -308,6 +311,13 @@ export class PipelinePoolManager {
     for (const modelId of modelIds) {
       // Copy: tearDown() splices the very array getPool() hands back.
       for (const entry of [...this.pipelineTracker.getPool(modelId)]) {
+        if (entry.state === "assembling") {
+          // An in-flight tryAssemble owns this reservation and removes it
+          // itself on success or failure. Its driver does not exist yet, so
+          // every liveness check below would judge it dead and tear down a
+          // pipeline that is still being built.
+          continue;
+        }
         const allNodesActive = [entry.driverNodeId, ...entry.computeNodeIds].every(id => activeNodeIds.has(id));
         if (!allNodesActive) {
           // A heartbeat timeout or a reputation ejection anywhere in the
@@ -416,6 +426,28 @@ export class PipelinePoolManager {
       return false;
     }
 
+    // Reserve the launcher BEFORE the network call, not after it. addEntry
+    // used to run only once POST /pipeline had returned, so for the whole
+    // assembly window this launcher was invisible to claimedLauncherIds()
+    // -- and a concurrent cold-start /generate for a DIFFERENT model would
+    // read it as idle and claim it too. That is exactly the corruption
+    // claimedLauncherIds() exists to prevent: a swarm-launcher supervises
+    // one agent at a time, so both models end up with a "warm" entry
+    // pointing at one agent serving only the later model's weights, and
+    // tearing down either entry kills the other's agent. The reservation
+    // uses the "assembling" state, which every consumer already knows to
+    // skip: it has no driver yet, so it is never routed to, never
+    // heartbeated and never health-checked.
+    const reservationId = randomUUID();
+    this.pipelineTracker.addEntry(modelId, {
+      pipelineId: reservationId,
+      driverNodeId: "",
+      computeNodeIds: [],
+      launcherId: launcher.launcherId,
+      state: "assembling",
+      lastUsedAt: Date.now(),
+    });
+
     try {
       // swarm-node-agent's --remote takes host:port, not a full URL.
       const toHostPort = (endpoint: string) => endpoint.replace(/^https?:\/\//, "");
@@ -430,12 +462,16 @@ export class PipelinePoolManager {
         signal: AbortSignal.timeout(PIPELINE_ASSEMBLY_TIMEOUT_MS),
       });
       if (!res.ok) {
+        this.pipelineTracker.removeEntry(modelId, reservationId);
         return false;
       }
 
       const launcherUrl = new URL(launcher.endpoint);
       const driverEndpoint = `${launcherUrl.protocol}//${launcherUrl.hostname}:${launcher.agentPort}`;
       const driverNodeId = this.registry.register(driverEndpoint, "desktop", undefined, modelId);
+      // Swap the reservation for the real entry: same launcher, so the
+      // claim is continuous and never briefly drops.
+      this.pipelineTracker.removeEntry(modelId, reservationId);
       this.pipelineTracker.addEntry(modelId, {
         pipelineId: randomUUID(),
         driverNodeId,
@@ -452,6 +488,7 @@ export class PipelinePoolManager {
       return true;
     } catch (err) {
       console.warn(`failed to assemble pipeline for model ${modelId} via launcher ${launcher.endpoint}:`, err);
+      this.pipelineTracker.removeEntry(modelId, reservationId);
       return false;
     }
   }

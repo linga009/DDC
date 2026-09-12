@@ -261,6 +261,17 @@ async function assemblePipeline(
   // which a multi-entry pool reaches routinely. pool[0] is therefore "the
   // entry this call may replace", not "the only entry that can exist".
   const pool = pipelineTracker.getPool(modelId);
+
+  // The background pool manager holds an "assembling" reservation across
+  // its own POST /pipeline call. Its launcher is already committed, and a
+  // driver is imminent -- claiming another launcher here would race it, and
+  // treating the reservation as a replaceable stale entry would tear down
+  // an assembly still in flight. Fall through to whatever is already
+  // registered instead, exactly as this path does when no launcher is free.
+  if (pool.some(entry => entry.state === "assembling")) {
+    return;
+  }
+
   const tracked = pool[0];
   if (tracked?.state === "warm") {
     const driverStillActive = registry.listActive(reputation).some(n => n.nodeId === tracked.driverNodeId);

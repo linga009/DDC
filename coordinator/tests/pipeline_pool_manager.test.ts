@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer as createHttpServer } from "node:http";
-import { DEFAULT_INTERVAL_MS, PipelinePoolManager, desiredPipelineCount, planAllocations } from "../src/pipeline_pool_manager.ts";
+import { DEFAULT_INTERVAL_MS, PipelinePoolManager, claimedLauncherIds, desiredPipelineCount, planAllocations } from "../src/pipeline_pool_manager.ts";
 import { PipelineTracker } from "../src/pipeline_tracker.ts";
 import { DemandTracker } from "../src/demand_tracker.ts";
 import { LauncherRegistry, type LauncherInfo } from "../src/launcher_registry.ts";
@@ -537,11 +537,16 @@ test("start() drives runOnce on its interval and stop() ends it", async () => {
   );
   try {
     manager.start();
+    // Wait for a WARM entry, not merely a non-empty pool: tryAssemble now
+    // reserves the launcher with an "assembling" entry before its POST
+    // /pipeline call, so a non-empty pool no longer means assembly finished.
     const deadline = Date.now() + 3000;
-    while (pipelineTracker.getPool("big-model").length === 0 && Date.now() < deadline) {
+    const isWarm = () => pipelineTracker.getPool("big-model").some(e => e.state === "warm");
+    while (!isWarm() && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 10));
     }
     assert.equal(pipelineTracker.getPool("big-model").length, 1);
+    assert.equal(isWarm(), true, "expected the assembly to have completed");
     manager.stop();
     const callsAtStop = launcherStub.getPipelineCalls();
     await new Promise(resolve => setTimeout(resolve, 60));
@@ -549,5 +554,69 @@ test("start() drives runOnce on its interval and stop() ends it", async () => {
   } finally {
     manager.stop();
     launcherStub.server.close();
+  }
+});
+
+test("a launcher is claimed for the whole assembly window, not just after it succeeds", async () => {
+  // Regression test for a cross-path double-claim found by whole-branch
+  // live probing. tryAssemble() used to call addEntry() only AFTER its
+  // POST /pipeline resolved, so for the entire assembly window the
+  // launcher was invisible to claimedLauncherIds() -- and a concurrent
+  // cold-start /generate for a DIFFERENT model read it as idle and
+  // claimed it too. A swarm-launcher supervises one agent at a time, so
+  // both models ended up with an entry pointing at a single agent running
+  // only the later model's weights, and tearing down either killed the
+  // other's agent.
+  let releaseAssembly: () => void = () => {};
+  const held = new Promise<void>(resolve => { releaseAssembly = resolve; });
+  const server = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    await held; // hold POST /pipeline open so the assembly window is observable
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "ready" }));
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected stub launcher to bind to a port");
+  }
+  const endpoint = `http://127.0.0.1:${address.port}`;
+
+  const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
+  const registry = new NodeRegistry();
+  registry.register("http://127.0.0.1:1", "desktop");
+  registry.register("http://127.0.0.1:2", "desktop");
+  const pipelineTracker = new PipelineTracker();
+  const launcherRegistry = new LauncherRegistry();
+  const launcherId = launcherRegistry.register(endpoint, ["big-model"], address.port as number);
+  const demandTracker = new DemandTracker();
+  demandTracker.recordRequest("big-model");
+
+  const manager = makeManager({ catalog, registry, pipelineTracker, launcherRegistry, demandTracker });
+
+  try {
+    const tick = manager.runOnce();
+    // Yield until the reservation appears, without depending on a fixed sleep.
+    for (let i = 0; i < 200 && pipelineTracker.getPool("big-model").length === 0; i++) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+
+    const claimedMidFlight = claimedLauncherIds(catalog, pipelineTracker);
+    assert.equal(
+      claimedMidFlight.has(launcherId),
+      true,
+      "the launcher must count as claimed while its assembly is still in flight, or a concurrent path will claim it too",
+    );
+
+    releaseAssembly();
+    await tick;
+
+    const pool = pipelineTracker.getPool("big-model");
+    assert.equal(pool.length, 1, "the reservation must be swapped for the real entry, not left alongside it");
+    assert.equal(pool[0].state, "warm");
+    assert.equal(pool[0].launcherId, launcherId);
+  } finally {
+    releaseAssembly();
+    server.close();
   }
 });
