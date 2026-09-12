@@ -349,6 +349,83 @@ TEST_F(LauncherFixture, ReassemblingKillsThePreviousAgentBeforeSpawningTheNewOne
     EXPECT_NE(healthResponse.find("HTTP/1.1 200"), std::string::npos);
 }
 
+// Phase C scale-down primitive: DELETE /pipeline stops whatever agent this
+// launcher currently runs, with no replacement.
+//
+// Note on how "the agent is genuinely gone" is proven here. The plan's own
+// draft of this test probed kAgentPort and treated a failed connect as
+// proof. That works -- sendRawRequest() really does throw
+// std::runtime_error when connect() fails, and canConnect() above is this
+// file's existing wrapper for exactly that -- but it is the WEAKER of the
+// two signals available, and this file already documents why (see
+// countRunningAgents()'s comment): on Windows, port-level observations
+// about this agent are muddied by SO_REUSEADDR, and a port probe can only
+// ever tell you something about a socket, never about whether the process
+// holding it actually died. Asking the OS for the process count is what
+// directly answers the question the endpoint is supposed to guarantee, so
+// that is asserted first here and the port probe is kept as a corroborating
+// second signal rather than the only one.
+TEST_F(LauncherFixture, DeletePipelineKillsARunningAgentAndReturns204) {
+    std::string body = R"({"model":"tinyllama-1.1b-chat-v1.0.Q4_K_M","remoteEndpoints":"","layerPlacements":""})";
+    std::string spawnRequest = "POST /pipeline HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                                "\r\nContent-Type: application/json\r\n\r\n" + body;
+    std::string spawnResponse = sendRawRequest(kLauncherPort, spawnRequest);
+    ASSERT_NE(spawnResponse.find("HTTP/1.1 200"), std::string::npos);
+    ASSERT_EQ(countRunningAgents(), 1) << "one /pipeline call should leave exactly one agent running";
+
+    // Confirm the agent is genuinely up and serving before deleting it --
+    // otherwise "it's unreachable afterwards" would prove nothing.
+    std::string healthBefore = sendRawRequest(
+        kAgentPort,
+        "GET /health HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n");
+    ASSERT_NE(healthBefore.find("HTTP/1.1 200"), std::string::npos);
+
+    std::string deleteRequest = "DELETE /pipeline HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    std::string deleteResponse = sendRawRequest(kLauncherPort, deleteRequest);
+    EXPECT_NE(deleteResponse.find("HTTP/1.1 204"), std::string::npos);
+
+    // Real, live proof the agent PROCESS is actually gone -- not just that
+    // the launcher claimed success, and not just that a socket stopped
+    // answering. SpawnedProcess::terminate() already does a bounded wait for
+    // OS teardown before returning, so this should hold the instant the 204
+    // arrives; the short sleep is slack for the observation itself, not a
+    // required part of the guarantee.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_EQ(countRunningAgents(), 0)
+        << "DELETE /pipeline returned 204 but a swarm-node-agent process is still alive -- the launcher "
+           "reported success without actually stopping its agent";
+
+    // Corroborating second signal: the agent's port must no longer accept a
+    // connection either.
+    EXPECT_FALSE(canConnect(kAgentPort))
+        << "the agent's port is still accepting connections after DELETE /pipeline";
+}
+
+TEST_F(LauncherFixture, DeletePipelineWithNoAgentRunningIsANoOpThatStillReturns204) {
+    // The fixture's SetUp() kills any stray agent and starts a launcher that
+    // has not been asked to spawn anything, so nothing is running here.
+    ASSERT_EQ(countRunningAgents(), 0) << "fixture should start with no agent running";
+
+    std::string deleteRequest = "DELETE /pipeline HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    std::string deleteResponse = sendRawRequest(kLauncherPort, deleteRequest);
+    EXPECT_NE(deleteResponse.find("HTTP/1.1 204"), std::string::npos);
+
+    // Calling it again immediately must still succeed (idempotent) -- the
+    // pool manager that drives this endpoint has no way to know whether a
+    // previous scale-down already landed, so "already stopped" and "just
+    // stopped" must be the same successful outcome to a caller.
+    std::string secondDeleteResponse = sendRawRequest(kLauncherPort, deleteRequest);
+    EXPECT_NE(secondDeleteResponse.find("HTTP/1.1 204"), std::string::npos);
+
+    // ...and the launcher itself must still be alive and serving after
+    // both no-op deletes, not wedged or crashed by deleting nothing.
+    std::string body = R"({"model":"nonexistent-model-nobody-has","remoteEndpoints":"","layerPlacements":""})";
+    std::string probe = "POST /pipeline HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                         "\r\nContent-Type: application/json\r\n\r\n" + body;
+    std::string probeResponse = sendRawRequest(kLauncherPort, probe);
+    EXPECT_NE(probeResponse.find("\"error\""), std::string::npos);
+}
+
 // Regression test for a whole-branch-review finding: pollHealthOnce() in
 // launcher_main.cpp used a plain blocking connect() to poll a just-spawned
 // agent's health port, and on this project's actual Windows/MSYS2 target

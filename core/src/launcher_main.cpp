@@ -339,6 +339,27 @@ int main(int argc, char** argv) {
         return swarm::HttpResponse{200, R"({"status":"ready"})"};
     });
 
+    // Scale-down primitive for Phase C's pool manager: stop whatever this
+    // launcher is currently running, with no replacement. Idempotent --
+    // calling this with nothing running is a successful no-op, matching
+    // this project's established convention for tear-down-style endpoints
+    // (POST /peers/:peerId/heartbeat's sibling DELETE /peers/:peerId
+    // returns 404 for "already gone," but that's a coordinator-side
+    // registry lookup; here there is nothing to look up -- "no agent
+    // running" and "agent successfully stopped" are the same outcome from
+    // a caller's point of view, so both return 204). No request body.
+    //
+    // reset() runs SpawnedProcess's destructor, which calls terminate():
+    // that kills the child AND does a bounded wait for the OS to finish
+    // tearing it down before returning, so by the time this 204 reaches the
+    // caller the agent is genuinely gone and its port is free -- the caller
+    // does not have to sleep before assuming so. Same mechanism POST
+    // /pipeline already relies on to free the port before respawning.
+    server.route("DELETE", "/pipeline", [&](const swarm::HttpRequest&) -> swarm::HttpResponse {
+        currentAgent.reset();
+        return swarm::HttpResponse{204, ""};
+    });
+
     server.run();  // blocks forever
     return 0;
 }
