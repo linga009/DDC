@@ -8,6 +8,13 @@ export interface CatalogEntry {
   // >1 models ever engage pipeline_selector.ts/PipelineTracker/the
   // launcher.
   requiredNodeCount?: number;
+  // Ceiling on how many CONCURRENT pipelines (each requiredNodeCount
+  // nodes large) Phase C's pool manager will keep warm for this model at
+  // once -- absent or 1 keeps today's Phase B behavior (at most one
+  // pipeline, assembled on demand). Only meaningful alongside
+  // requiredNodeCount > 1; a model that doesn't need a multi-node
+  // pipeline at all has nothing for this to scale.
+  maxPipelines?: number;
 }
 
 export interface AvailabilityEntry extends CatalogEntry {
@@ -47,5 +54,9 @@ export class ModelCatalog {
 
   requiredNodeCount(id: string): number {
     return this.entries.find(entry => entry.id === id)?.requiredNodeCount ?? 1;
+  }
+
+  maxPipelines(id: string): number {
+    return this.entries.find(entry => entry.id === id)?.maxPipelines ?? 1;
   }
 }

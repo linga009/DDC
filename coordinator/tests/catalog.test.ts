@@ -67,3 +67,18 @@ test("availability() output is unaffected by requiredNodeCount -- purely additiv
   const result = catalog.availability(10);
   assert.deepEqual(result, [{ id: "big", displayName: "Big", minActiveNodes: 5, requiredNodeCount: 3, available: true }]);
 });
+
+test("maxPipelines defaults to 1 for a catalog entry that doesn't specify it", () => {
+  const catalog = new ModelCatalog([{ id: "small", displayName: "Small", minActiveNodes: 0 }]);
+  assert.equal(catalog.maxPipelines("small"), 1);
+});
+
+test("maxPipelines returns the entry's own value when specified", () => {
+  const catalog = new ModelCatalog([{ id: "big", displayName: "Big", minActiveNodes: 5, maxPipelines: 4 }]);
+  assert.equal(catalog.maxPipelines("big"), 4);
+});
+
+test("maxPipelines returns 1 for an unknown model id", () => {
+  const catalog = new ModelCatalog([{ id: "small", displayName: "Small", minActiveNodes: 0 }]);
+  assert.equal(catalog.maxPipelines("nonexistent-model"), 1);
+});
