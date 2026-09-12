@@ -5,7 +5,7 @@ import { DEFAULT_INTERVAL_MS, PipelinePoolManager, claimedLauncherIds, desiredPi
 import { PipelineTracker } from "../src/pipeline_tracker.ts";
 import { DemandTracker } from "../src/demand_tracker.ts";
 import { LauncherRegistry, type LauncherInfo } from "../src/launcher_registry.ts";
-import { NodeRegistry } from "../src/registry.ts";
+import { NodeRegistry, stableNodeId } from "../src/registry.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
 import { ModelCatalog } from "../src/catalog.ts";
 
@@ -653,6 +653,45 @@ test("tearing down an entry whose launcher registration has expired still stops 
 
     assert.equal(pipelineTracker.getPool("big-model").length, 0, "the dead entry should be torn down");
     assert.equal(launcherStub.getDeleteCalls(), 1, "the agent must still be stopped even though its launcher registration lapsed");
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
+test("a launcher whose prospective driver is reputation-ejected is not spawned over and over", async () => {
+  // A launcher-spawned driver's endpoint is fully determined by the
+  // launcher (its host plus its fixed agentPort), and nodeId is sha256 of
+  // that endpoint -- so an ejected driver inherits the ejection on every
+  // respawn. The loop was unbreakable: assemble (POST succeeds), next
+  // tick's health check finds the driver missing from listActive(
+  // reputation) and tears it down, allocate re-claims the same launcher,
+  // repeat -- a real multi-GB model load and kill every single tick.
+  const launcherStub = await startStubLauncher();
+  const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
+  const registry = new NodeRegistry();
+  registry.register("http://127.0.0.1:1", "desktop");
+  registry.register("http://127.0.0.1:2", "desktop");
+  const launcherRegistry = new LauncherRegistry();
+  launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
+  const pipelineTracker = new PipelineTracker();
+  const reputation = new ReputationTracker();
+
+  // Eject the exact driver this launcher would spawn, by its deterministic id.
+  const launcherUrl = new URL(launcherStub.endpoint);
+  const driverId = stableNodeId(`${launcherUrl.protocol}//${launcherUrl.hostname}:${launcherStub.port}`);
+  for (let i = 0; i < 20; i++) reputation.recordDisagreement(driverId);
+  assert.equal(reputation.isTrusted(driverId), false, "precondition: the prospective driver is ejected");
+
+  const demandTracker = new DemandTracker();
+  demandTracker.recordRequest("big-model");
+  const manager = makeManager({ catalog, registry, pipelineTracker, launcherRegistry, reputation, demandTracker });
+
+  try {
+    for (let tick = 0; tick < 5; tick++) {
+      await manager.runOnce();
+    }
+    assert.equal(launcherStub.getPipelineCalls(), 0, "an ejected driver must never be respawned -- it can never become selectable");
+    assert.equal(pipelineTracker.getPool("big-model").length, 0);
   } finally {
     launcherStub.server.close();
   }

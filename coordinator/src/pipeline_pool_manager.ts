@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { NodeRegistry } from "./registry.ts";
+import { stableNodeId } from "./registry.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
 import type { ModelCatalog } from "./catalog.ts";
 import type { LauncherInfo, LauncherRegistry } from "./launcher_registry.ts";
@@ -431,6 +432,22 @@ export class PipelinePoolManager {
     // --remote list.
     const selection = selectPipeline(this.registry.listActive(this.reputation), this.reputation, requiredNodeCount, this.random);
     if (!selection) {
+      return false;
+    }
+
+    // A launcher-spawned driver's endpoint is fully determined by the
+    // launcher (its own host plus its fixed agentPort), and nodeId is
+    // sha256 of that endpoint -- so a driver that has been
+    // reputation-ejected inherits the ejection on every respawn, forever.
+    // Without this check the loop was unbreakable: assemble (the POST
+    // succeeds), next tick's health check sees the driver missing from
+    // listActive(reputation) and tears it down, allocate re-claims the same
+    // launcher, repeat -- one real multi-GB model load and kill every tick,
+    // plus one more per /generate, none of which can ever succeed.
+    const launcherUrlForId = new URL(launcher.endpoint);
+    const prospectiveDriverId = stableNodeId(`${launcherUrlForId.protocol}//${launcherUrlForId.hostname}:${launcher.agentPort}`);
+    if (!this.reputation.isTrusted(prospectiveDriverId)) {
+      console.warn(`skipping launcher ${launcher.endpoint} for model ${modelId}: the driver it would spawn is reputation-ejected`);
       return false;
     }
 

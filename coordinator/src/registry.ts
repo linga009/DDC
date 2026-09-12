@@ -23,7 +23,7 @@ interface StoredNode extends NodeInfo {
   lastSeen: number;
 }
 
-function stableNodeId(endpoint: string): string {
+export function stableNodeId(endpoint: string): string {
   // Deterministic, not random: the same endpoint must always produce the
   // same nodeId, no matter how many times or how far apart in time it
   // registers. This is what makes a re-registration below overwrite (not
