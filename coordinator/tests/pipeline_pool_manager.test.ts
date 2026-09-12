@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer as createHttpServer } from "node:http";
-import { DEFAULT_INTERVAL_MS, PipelinePoolManager, claimedLauncherIds, desiredPipelineCount, planAllocations } from "../src/pipeline_pool_manager.ts";
+import { DEFAULT_INTERVAL_MS, PipelinePoolManager, claimedLauncherIds, desiredPipelineCount, isLauncherClaimed, planAllocations } from "../src/pipeline_pool_manager.ts";
 import { PipelineTracker } from "../src/pipeline_tracker.ts";
 import { DemandTracker } from "../src/demand_tracker.ts";
 import { LauncherRegistry, type LauncherInfo } from "../src/launcher_registry.ts";
@@ -695,4 +695,45 @@ test("a launcher whose prospective driver is reputation-ejected is not spawned o
   } finally {
     launcherStub.server.close();
   }
+});
+
+test("a launcher whose registration lapsed and re-registered is still recognised as claimed", async () => {
+  // LauncherRegistry re-mints a randomUUID whenever a LAPSED registration
+  // re-registers (it refreshes in place only while unexpired). Pool entries
+  // still hold the old id, so a tally keyed on launcherId alone stopped
+  // recognising the physical machine as busy -- even though its agent was
+  // still running and its pool entry still alive -- and a second model
+  // could claim the very same launcher.
+  const catalog = new ModelCatalog([
+    { id: "model-a", displayName: "A", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+    { id: "model-b", displayName: "B", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+  ]);
+  let fakeNow = Date.now();
+  const launcherRegistry = new LauncherRegistry(() => fakeNow, 30000);
+  const endpoint = "http://127.0.0.1:59123";
+  const oldLauncherId = launcherRegistry.register(endpoint, ["model-a", "model-b"], 59124);
+
+  const pipelineTracker = new PipelineTracker();
+  pipelineTracker.addEntry("model-a", {
+    pipelineId: "a-1",
+    driverNodeId: "driver-a",
+    computeNodeIds: [],
+    launcherId: oldLauncherId,
+    launcherEndpoint: endpoint,
+    state: "warm",
+    lastUsedAt: Date.now(),
+  });
+
+  // The launcher goes quiet past its timeout, then comes back.
+  fakeNow += 60000;
+  const newLauncherId = launcherRegistry.register(endpoint, ["model-a", "model-b"], 59124);
+  assert.notEqual(newLauncherId, oldLauncherId, "precondition: re-registering a lapsed launcher mints a new id");
+
+  const claimed = claimedLauncherIds(catalog, pipelineTracker);
+  const live = launcherRegistry.listActive().find(l => l.launcherId === newLauncherId)!;
+  assert.equal(
+    isLauncherClaimed(claimed, live),
+    true,
+    "the machine is still hosting model-a's pipeline, so it must not look idle just because its launcherId rotated",
+  );
 });

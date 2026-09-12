@@ -23,9 +23,18 @@ const DEFAULT_REQUESTS_PER_PIPELINE = 10;
 // healthy, merely-idle pipeline was judged dead, torn down and respawned
 // roughly every 60s with zero traffic. That is the precise opposite of what
 // pre-warming exists to do, and strictly worse than Phase B, which kept its
-// pipeline alive. The 3x headroom also means a tick SKIPPED by start()'s
-// re-entrancy guard (which drops ticks while a slow launcher call is in
-// flight) is survivable; at 30000 a single dropped tick was fatal.
+// pipeline alive. The 3x headroom also buys tolerance for a tick or two
+// SKIPPED by start()'s re-entrancy guard (which drops ticks while a slow
+// launcher call is in flight); at 30000 a single dropped tick was fatal.
+//
+// It is NOT enough to survive a launcher that hangs: runOnce() awaits
+// assemblies and teardowns sequentially with a 60s
+// PIPELINE_ASSEMBLY_TIMEOUT_MS -- twice the node timeout -- and the driver
+// heartbeat pre-pass sits inside that same serialized tick, so one
+// unresponsive launcher can still starve an unrelated healthy model's
+// driver of heartbeats until it ages out and its pipeline is torn down.
+// Known and disclosed, not fixed here: the real fix is to decouple the
+// heartbeat from the tick (or stop awaiting launcher I/O inside it).
 export const DEFAULT_INTERVAL_MS = 10000;
 const DEFAULT_IDLE_GRACE_MS = 300000;
 
@@ -112,7 +121,7 @@ export function planAllocations(
       if (deficit <= 0) {
         break;
       }
-      if (claimed.has(launcher.launcherId)) {
+      if (isLauncherClaimed(claimed, launcher)) {
         continue;
       }
       claimed.add(launcher.launcherId);
@@ -147,12 +156,33 @@ export function claimedLauncherIds(
   pipelineTracker: PipelineTracker,
   exclude?: PooledPipeline,
 ): Set<string> {
-  return new Set(
-    catalog.multiPipelineModelIds()
-      .flatMap(modelId => pipelineTracker.getPool(modelId))
-      .filter(entry => entry !== exclude)
-      .map(entry => entry.launcherId),
-  );
+  // Tallies BOTH the launcherId and the launcher's endpoint. launcherId is
+  // a randomUUID that LauncherRegistry re-mints whenever a lapsed
+  // registration is re-registered (it refreshes in place only while
+  // unexpired), so after any launcher restart or >timeoutMs heartbeat gap
+  // the pool's stored id no longer matches the live one -- and the physical
+  // machine stopped looking busy even though its agent was still running
+  // and its pool entry still alive. The endpoint is the stable identity of
+  // the machine, so checking it as well survives id rotation.
+  const claimed = new Set<string>();
+  for (const modelId of catalog.multiPipelineModelIds()) {
+    for (const entry of pipelineTracker.getPool(modelId)) {
+      if (entry === exclude) {
+        continue;
+      }
+      claimed.add(entry.launcherId);
+      if (entry.launcherEndpoint) {
+        claimed.add(entry.launcherEndpoint);
+      }
+    }
+  }
+  return claimed;
+}
+
+// A launcher counts as claimed under either identity -- see
+// claimedLauncherIds() for why the endpoint has to be checked too.
+export function isLauncherClaimed(claimed: Set<string>, launcher: LauncherInfo): boolean {
+  return claimed.has(launcher.launcherId) || claimed.has(launcher.endpoint);
 }
 
 // Background reconciliation loop: keeps each multi-node model's pool of

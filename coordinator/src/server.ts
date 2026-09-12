@@ -3,14 +3,14 @@ import { timingSafeEqual, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
-import { NodeRegistry, type DeviceTier, type NodeInfo } from "./registry.ts";
+import { NodeRegistry, stableNodeId, type DeviceTier, type NodeInfo } from "./registry.ts";
 import { ModelCatalog } from "./catalog.ts";
 import { PeerRegistry } from "./peer_registry.ts";
 import { LauncherRegistry } from "./launcher_registry.ts";
 import { PipelineTracker } from "./pipeline_tracker.ts";
 import { selectPipeline } from "./pipeline_selector.ts";
 import { DemandTracker } from "./demand_tracker.ts";
-import { claimedLauncherIds, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
+import { claimedLauncherIds, isLauncherClaimed, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
 import { openApiDocument } from "./openapi.ts";
@@ -328,7 +328,7 @@ async function assemblePipeline(
   }
 
   const claimed = claimedLauncherIds(catalog, pipelineTracker, tracked);
-  const launcher = launcherRegistry.listForModel(modelId).find(l => !claimed.has(l.launcherId));
+  const launcher = launcherRegistry.listForModel(modelId).find(l => !isLauncherClaimed(claimed, l));
   if (!launcher) {
     return;
   }
@@ -347,6 +347,39 @@ async function assemblePipeline(
   if (!selection) {
     return;
   }
+
+  // Same pre-flight check the background loop does: a launcher-spawned
+  // driver's endpoint is fully determined by the launcher, and nodeId is
+  // sha256 of that endpoint, so a reputation-ejected driver inherits the
+  // ejection on every respawn. Without this the request path respawned it
+  // on EVERY /generate -- a real multi-GB model load and kill per request,
+  // higher-frequency than the background loop this guard was first added to.
+  const preflightUrl = new URL(launcher.endpoint);
+  const prospectiveDriverId = stableNodeId(`${preflightUrl.protocol}//${preflightUrl.hostname}:${launcher.agentPort}`);
+  if (!reputation.isTrusted(prospectiveDriverId)) {
+    console.warn(`skipping launcher ${launcher.endpoint} for model ${modelId}: the driver it would spawn is reputation-ejected`);
+    return;
+  }
+
+  // Reserve the launcher BEFORE the network call, mirroring the background
+  // loop's tryAssemble(). Without this, THIS path recorded nothing until
+  // its fetch returned, so for the whole assembly window the launcher was
+  // invisible to claimedLauncherIds() -- and a concurrent cold start for a
+  // DIFFERENT model (the dedup Map is keyed by modelId, so it does not
+  // serialise them) or a background tick would claim the same launcher. A
+  // swarm-launcher supervises one agent at a time, so both models ended up
+  // with a warm entry naming one launcher and one driverNodeId, and a user
+  // asking for model A was served model B's weights with a 200.
+  const reservationId = randomUUID();
+  pipelineTracker.addEntry(modelId, {
+    pipelineId: reservationId,
+    driverNodeId: "",
+    computeNodeIds: [],
+    launcherId: launcher.launcherId,
+    launcherEndpoint: launcher.endpoint,
+    state: "assembling",
+    lastUsedAt: Date.now(),
+  });
 
   try {
     // swarm-node-agent's --remote takes host:port, not a full URL --
@@ -369,6 +402,7 @@ async function assemblePipeline(
       signal: AbortSignal.timeout(PIPELINE_ASSEMBLY_TIMEOUT_MS),
     });
     if (!launcherRes.ok) {
+      pipelineTracker.removeEntry(modelId, reservationId);
       if (tracked) {
         pipelineTracker.markEntryFailed(modelId, tracked.pipelineId);
       }
@@ -401,6 +435,9 @@ async function assemblePipeline(
       }
       pipelineTracker.removeEntry(modelId, tracked.pipelineId);
     }
+    // Swap the reservation for the real entry: same launcher, so the claim
+    // is continuous and never briefly drops.
+    pipelineTracker.removeEntry(modelId, reservationId);
     pipelineTracker.addEntry(modelId, {
       pipelineId: randomUUID(),
       driverNodeId,
@@ -412,6 +449,7 @@ async function assemblePipeline(
     });
   } catch (err) {
     console.warn(`failed to assemble pipeline for model ${modelId} via launcher ${launcher.endpoint}:`, err);
+    pipelineTracker.removeEntry(modelId, reservationId);
     if (tracked) {
       pipelineTracker.markEntryFailed(modelId, tracked.pipelineId);
     }
@@ -871,9 +909,15 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         // request sends back to the caller, which every call site below
         // still does exactly as it did before.
         const markDriverFailedIfTracked = () => {
-          const entry = pipelineTracker.getPool(candidate.modelId).find(e => e.driverNodeId === node.nodeId);
-          if (entry) {
-            pipelineTracker.markEntryFailed(candidate.modelId, entry.pipelineId);
+          // Every entry naming this driver, not just the first: entries can
+          // legitimately share a driverNodeId (it is sha256 of the driver
+          // endpoint, and one launcher always spawns its agent on the same
+          // host:agentPort), so a .find() here would evict one and leave the
+          // others warm, routable, and still pointing at the dead driver.
+          for (const entry of pipelineTracker.getPool(candidate.modelId)) {
+            if (entry.driverNodeId === node.nodeId) {
+              pipelineTracker.markEntryFailed(candidate.modelId, entry.pipelineId);
+            }
           }
         };
 
