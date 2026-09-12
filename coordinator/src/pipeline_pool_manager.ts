@@ -161,6 +161,28 @@ export function claimedLauncherIds(
 //
 // Everything it decides is computed by the two pure functions above; this
 // class is the part that talks to the network and mutates the trackers.
+// Shared by this manager's own teardown and by server.ts's cold-start
+// replacement path. Freeing a launcherId without calling this is the
+// harmful case: the coordinator would mark the launcher reallocatable
+// while its old agent is still running, holding both the agent port and
+// the model's weights in RAM.
+export async function stopLauncherPipeline(launcherRegistry: LauncherRegistry, launcherId: string): Promise<void> {
+  const launcher = launcherRegistry.listActive().find(l => l.launcherId === launcherId);
+  if (!launcher) {
+    return; // launcher itself is gone -- nothing to call, nothing left to clean up
+  }
+  try {
+    // DELETE /pipeline is idempotent and always 204s, so calling it on a
+    // launcher whose agent already exited is harmless.
+    await fetch(`${launcher.endpoint}/pipeline`, {
+      method: "DELETE",
+      signal: AbortSignal.timeout(PIPELINE_ASSEMBLY_TIMEOUT_MS),
+    });
+  } catch (err) {
+    console.warn(`failed to stop pipeline on launcher ${launcher.endpoint}:`, err);
+  }
+}
+
 export class PipelinePoolManager {
   private timer: ReturnType<typeof setInterval> | undefined;
   private ticking = false;
@@ -324,23 +346,7 @@ export class PipelinePoolManager {
   }
 
   private async tryStopLauncher(launcherId: string): Promise<void> {
-    const launcher = this.launcherRegistry.listActive().find(l => l.launcherId === launcherId);
-    if (!launcher) {
-      return; // launcher itself is gone -- nothing to call, nothing left to clean up
-    }
-    try {
-      // DELETE /pipeline is idempotent and always 204s, so calling it on a
-      // launcher whose agent already exited is harmless. Not calling it
-      // would be the harmful case: the coordinator would free the
-      // launcherId for reallocation while the old agent is still running
-      // and holding both the agent port and the model's weights in RAM.
-      await fetch(`${launcher.endpoint}/pipeline`, {
-        method: "DELETE",
-        signal: AbortSignal.timeout(PIPELINE_ASSEMBLY_TIMEOUT_MS),
-      });
-    } catch (err) {
-      console.warn(`failed to stop pipeline on launcher ${launcher.endpoint}:`, err);
-    }
+    await stopLauncherPipeline(this.launcherRegistry, launcherId);
   }
 
   // Step 3+4: compute every model's desired count, decide the claims

@@ -10,7 +10,7 @@ import { LauncherRegistry } from "./launcher_registry.ts";
 import { PipelineTracker } from "./pipeline_tracker.ts";
 import { selectPipeline } from "./pipeline_selector.ts";
 import { DemandTracker } from "./demand_tracker.ts";
-import { claimedLauncherIds } from "./pipeline_pool_manager.ts";
+import { claimedLauncherIds, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
 import { openApiDocument } from "./openapi.ts";
@@ -207,7 +207,41 @@ const PIPELINE_ASSEMBLY_TIMEOUT_MS = 60000;
 // Never throws -- any failure just means selectNode() below finds nothing
 // new, falling back to whatever's already manually registered, exactly
 // like today's Phase A behavior.
-async function ensurePipelineReady(
+// Dedup wrapper around assemblePipeline(). Concurrent /generate requests
+// for the same cold model all reach this at once; without serialising
+// them, each independently saw an empty pool, each computed the SAME
+// launcher as unclaimed (nothing is recorded until assembly returns), and
+// each appended its own entry -- 10 parallel requests produced 10 pool
+// entries sharing one launcherId AND one driverNodeId (the driver
+// endpoint is launcherHost:agentPort, so sha256(endpoint) collides by
+// construction). That inflated currentCount until the pool manager
+// believed the model was fully provisioned and stopped allocating, and
+// left phantom "warm" entries pointing at an agent a single teardown had
+// already killed -- a 502 / markFailed / DELETE loop that ate real user
+// requests. Callers that arrive mid-assembly await the in-flight attempt
+// instead of starting a competing one.
+function ensurePipelineReady(
+  modelId: string,
+  catalog: ModelCatalog,
+  registry: NodeRegistry,
+  reputation: ReputationTracker,
+  launcherRegistry: LauncherRegistry,
+  pipelineTracker: PipelineTracker,
+  authToken: string,
+  random: () => number,
+  inFlight: Map<string, Promise<void>>,
+): Promise<void> {
+  const existing = inFlight.get(modelId);
+  if (existing) {
+    return existing;
+  }
+  const attempt = assemblePipeline(modelId, catalog, registry, reputation, launcherRegistry, pipelineTracker, authToken, random)
+    .finally(() => inFlight.delete(modelId));
+  inFlight.set(modelId, attempt);
+  return attempt;
+}
+
+async function assemblePipeline(
   modelId: string,
   catalog: ModelCatalog,
   registry: NodeRegistry,
@@ -222,12 +256,10 @@ async function ensurePipelineReady(
     return;
   }
 
-  // At most one entry can exist here -- this synchronous, cold-start-only
-  // path never adds a second one (Task 6's pool manager is what grows a
-  // pool past size 1). Reading index 0 rather than introducing a new
-  // "single tracked entry" concept keeps this function's own state
-  // entirely inside PipelineTracker's one pool-shaped API, with nothing
-  // parallel to keep in sync.
+  // The pool can hold several entries here -- the background pool manager
+  // grows it, and this cold-start path runs whenever no entry is USABLE,
+  // which a multi-entry pool reaches routinely. pool[0] is therefore "the
+  // entry this call may replace", not "the only entry that can exist".
   const pool = pipelineTracker.getPool(modelId);
   const tracked = pool[0];
   if (tracked?.state === "warm") {
@@ -275,6 +307,15 @@ async function ensurePipelineReady(
   // precisely the dead entry this call is about to replace -- its
   // launcher is genuinely free, and re-using it is what Phase B already
   // did for a stale pipeline.
+  // Never grow the pool past the model's configured ceiling. Replacing
+  // `tracked` is net-neutral (it is removed below), so it is excluded from
+  // the tally; adding alongside a full pool is what must be refused. The
+  // background pool manager already respected maxPipelines -- this path
+  // never consulted it at all.
+  if (pool.length - (tracked ? 1 : 0) >= catalog.maxPipelines(modelId)) {
+    return;
+  }
+
   const claimed = claimedLauncherIds(catalog, pipelineTracker, tracked);
   const launcher = launcherRegistry.listForModel(modelId).find(l => !claimed.has(l.launcherId));
   if (!launcher) {
@@ -335,11 +376,18 @@ async function ensurePipelineReady(
     const launcherUrl = new URL(launcher.endpoint);
     const driverEndpoint = `${launcherUrl.protocol}//${launcherUrl.hostname}:${launcher.agentPort}`;
     const driverNodeId = registry.register(driverEndpoint, "desktop", undefined, modelId);
-    // Replace whatever was tracked before (if anything -- there is at
-    // most one entry on this cold-start path) with the freshly-assembled
-    // pipeline, rather than appending a second entry alongside a stale
-    // one.
+    // Replace whatever was tracked before with the freshly-assembled
+    // pipeline rather than appending alongside a stale one. When the
+    // replacement landed on a DIFFERENT launcher, the old one's agent must
+    // actually be stopped: dropping the entry alone frees the launcherId
+    // for reallocation while its agent keeps running, holding the agent
+    // port and the model's weights until some unrelated model happens to
+    // claim it. (Same launcher needs no call -- POST /pipeline already
+    // replaced that agent in place.)
     if (tracked) {
+      if (tracked.launcherId !== launcher.launcherId) {
+        await stopLauncherPipeline(launcherRegistry, tracked.launcherId);
+      }
       pipelineTracker.removeEntry(modelId, tracked.pipelineId);
     }
     pipelineTracker.addEntry(modelId, {
@@ -359,6 +407,10 @@ async function ensurePipelineReady(
 }
 
 export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peers: PeerRegistry, classifier: SafetyClassifier, reputation: ReputationTracker, authToken: string, random: () => number = Math.random, launcherRegistry: LauncherRegistry = new LauncherRegistry(), pipelineTracker: PipelineTracker = new PipelineTracker(), demandTracker: DemandTracker = new DemandTracker()) {
+  // Per-server, keyed by modelId: the cold-start assembly currently in
+  // flight for that model, if any. Lives here rather than module scope so
+  // two servers in one process (the test suite runs many) never share it.
+  const coldStartsInFlight = new Map<string, Promise<void>>();
   return createHttpServer(async (req, res) => {
     try {
       const method = req.method ?? "GET";
@@ -781,7 +833,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           // synchronously, exactly as Phase B's existing behavior does,
           // and is still a complete no-op for every requiredNodeCount:1
           // model.
-          await ensurePipelineReady(candidate.modelId, catalog, registry, reputation, launcherRegistry, pipelineTracker, authToken, random);
+          await ensurePipelineReady(candidate.modelId, catalog, registry, reputation, launcherRegistry, pipelineTracker, authToken, random, coldStartsInFlight);
           selected = selectNode(registry.listActive(reputation), reputation, candidate.modelId, random);
         }
         if (!selected) {

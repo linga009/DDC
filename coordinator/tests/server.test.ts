@@ -3703,3 +3703,52 @@ test("GET /v1/models lists the catalog in OpenAI's list shape and requires auth"
     server.close();
   }
 });
+
+test("concurrent POST /generate on a cold pool assembles exactly one pipeline, not one per request", async () => {
+  // Regression test for a bug found by whole-branch live probing. Nothing
+  // serialised the cold-start assembly path, so every concurrent request
+  // saw an empty pool, computed the SAME launcher as unclaimed (nothing is
+  // recorded until assembly returns), and appended its own entry. Ten
+  // parallel requests produced ten pool entries sharing one launcherId AND
+  // one driverNodeId -- the driver endpoint is launcherHost:agentPort, so
+  // sha256(endpoint) collides by construction.
+  //
+  // The damage was not merely wasted work: the inflated pool count made the
+  // background manager believe the model was fully provisioned so it stopped
+  // allocating, and a single teardown killed the one real agent while the
+  // phantom "warm" entries survived pointing at it, which /generate then
+  // routed to -- a 502 / markFailed / DELETE loop eating real user requests.
+  let launcherCallCount = 0;
+  const stub = await startStubNodeAgent((body) => {
+    const candidate = body as Record<string, unknown>;
+    if (candidate.model !== undefined) {
+      launcherCallCount++;
+      return { status: 200, body: { status: "ready" } };
+    }
+    return { status: 200, body: { text: "generated" } };
+  });
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }];
+  const { server, baseUrl, registry, launcherRegistry, pipelineTracker } = await startTestServer(bigCatalog);
+  try {
+    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:2", "desktop");
+    const launcherPort = Number(new URL(stub.endpoint).port);
+    launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
+
+    await Promise.all(Array.from({ length: 10 }, () =>
+      authFetch(`${baseUrl}/generate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+      })));
+
+    const pool = pipelineTracker.getPool("big-model");
+    assert.equal(pool.length, 1, `10 concurrent cold-start requests must not grow the pool past maxPipelines:1 (got ${pool.length})`);
+    assert.equal(launcherCallCount, 1, `the launcher must be asked to spawn exactly once (got ${launcherCallCount})`);
+    assert.equal(new Set(pool.map(e => e.launcherId)).size, pool.length, "no launcher may back two pool entries at once");
+    assert.equal(new Set(pool.map(e => e.driverNodeId)).size, pool.length, "no driverNodeId may appear in two pool entries");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
