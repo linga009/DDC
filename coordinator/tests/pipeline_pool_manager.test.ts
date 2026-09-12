@@ -737,3 +737,72 @@ test("a launcher whose registration lapsed and re-registered is still recognised
     "the machine is still hosting model-a's pipeline, so it must not look idle just because its launcherId rotated",
   );
 });
+
+test("a plan that goes stale across an await does not claim a launcher the request path took meanwhile", async () => {
+  // planAllocations() is pure and internally consistent, but allocate()
+  // consumes its plan across `await tryAssemble(...)` boundaries. A real
+  // model load holds the first claim's fetch open for seconds, and in that
+  // window the REQUEST path can legitimately claim a launcher the plan had
+  // earmarked for a later entry. Without a commit-time re-check the later
+  // claim reserved it anyway: one launcher backing two models, same
+  // driverNodeId, and a user served the wrong model's weights with a 200.
+  const catalog = new ModelCatalog([
+    { id: "model-a", displayName: "A", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+    { id: "model-b", displayName: "B", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+  ]);
+  const registry = new NodeRegistry();
+  registry.register("http://127.0.0.1:1", "desktop");
+  registry.register("http://127.0.0.1:2", "desktop");
+  const pipelineTracker = new PipelineTracker();
+  const launcherRegistry = new LauncherRegistry();
+
+  // L1 is slow, so the tick is still awaiting it when we simulate the
+  // request path claiming L2 out from under the plan.
+  let releaseL1: () => void = () => {};
+  const l1Held = new Promise<void>(resolve => { releaseL1 = resolve; });
+  const l1 = createHttpServer(async (req, res) => {
+    for await (const _c of req) { /* drain */ }
+    await l1Held;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "ready" }));
+  });
+  await new Promise<void>(r => l1.listen(0, r));
+  const l1Port = (l1.address() as any).port as number;
+  const l2 = await startStubLauncher();
+
+  launcherRegistry.register(`http://127.0.0.1:${l1Port}`, ["model-a"], l1Port);
+  const l2Id = launcherRegistry.register(l2.endpoint, ["model-b"], l2.port);
+
+  const demand = new DemandTracker();
+  for (let i = 0; i < 10; i++) demand.recordRequest("model-a"); // a outranks b
+  demand.recordRequest("model-b");
+
+  const manager = makeManager({ catalog, registry, pipelineTracker, launcherRegistry, demandTracker: demand });
+  try {
+    const tick = manager.runOnce();
+    for (let i = 0; i < 200 && pipelineTracker.getPool("model-a").length === 0; i++) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+
+    // The request path claims L2 while the tick is still blocked on L1.
+    pipelineTracker.addEntry("model-b", {
+      pipelineId: "taken-by-request-path",
+      driverNodeId: "some-driver",
+      computeNodeIds: [],
+      launcherId: l2Id,
+      launcherEndpoint: l2.endpoint,
+      state: "warm",
+      lastUsedAt: Date.now(),
+    });
+
+    releaseL1();
+    await tick;
+
+    assert.equal(l2.getPipelineCalls(), 0, "the tick must not spawn on a launcher that was claimed while its plan was in flight");
+    assert.equal(pipelineTracker.getPool("model-b").length, 1, "model-b keeps only the request path's entry -- the tick must not add a second");
+  } finally {
+    releaseL1();
+    l1.close();
+    l2.server.close();
+  }
+});

@@ -3837,6 +3837,9 @@ test("two different models cold-starting at once never share one launcher", asyn
       })));
 
     const all = [...pipelineTracker.getPool("model-a"), ...pipelineTracker.getPool("model-b")];
+    // Assert the positive half too: with cold start disabled entirely this
+    // test would otherwise pass vacuously on two empty pools.
+    assert.equal(all.length, 1, "exactly one of the two models should have won the single launcher");
     const launcherIds = all.map(e => e.launcherId);
     assert.equal(new Set(launcherIds).size, launcherIds.length, `one launcher must never back two models' entries (got ${JSON.stringify(launcherIds)})`);
     const driverIds = all.map(e => e.driverNodeId);
@@ -3884,6 +3887,23 @@ test("POST /generate does not respawn a driver that is already reputation-ejecte
     }
 
     assert.equal(launcherCallCount, 0, `an ejected driver must never be respawned, on any path (got ${launcherCallCount} spawns)`);
+    // Positive control: the same setup WITHOUT the ejection must assemble,
+    // so this test cannot pass merely because cold start is broken.
+    const fresh = new ReputationTracker();
+    const control = await startTestServer(bigCatalog, new PeerRegistry(), new KeywordSafetyClassifier([]), fresh);
+    try {
+      control.registry.register("http://127.0.0.1:1", "desktop");
+      control.registry.register("http://127.0.0.1:2", "desktop");
+      control.launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
+      await authFetch(`${control.baseUrl}/generate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+      });
+      assert.equal(launcherCallCount, 1, "control: an un-ejected driver must assemble normally");
+    } finally {
+      control.server.close();
+    }
   } finally {
     server.close();
     stub.server.close();

@@ -125,6 +125,7 @@ export function planAllocations(
         continue;
       }
       claimed.add(launcher.launcherId);
+      claimed.add(launcher.endpoint); // keep this set's identity rule identical to isLauncherClaimed's
       claims.push({ modelId: snapshot.modelId, launcher });
       deficit--;
     }
@@ -162,8 +163,17 @@ export function claimedLauncherIds(
   // unexpired), so after any launcher restart or >timeoutMs heartbeat gap
   // the pool's stored id no longer matches the live one -- and the physical
   // machine stopped looking busy even though its agent was still running
-  // and its pool entry still alive. The endpoint is the stable identity of
-  // the machine, so checking it as well survives id rotation.
+  // and its pool entry still alive. Checking the endpoint as well survives
+  // that id rotation.
+  //
+  // The endpoint is a stable STRING, not a canonical machine identity: one
+  // physical launcher registered as both http://127.0.0.1:P and
+  // http://localhost:P yields two live registry entries that this tally
+  // cannot connect, so it can still be double-claimed. That is the same
+  // endpoint-aliasing class already disclosed for node identity in
+  // Security Phase 3 (see README's Known gaming vectors), and closing it
+  // needs the same proof-of-endpoint-possession mechanism that phase's
+  // design already ruled out of scope -- not fixed here.
   const claimed = new Set<string>();
   for (const modelId of catalog.multiPipelineModelIds()) {
     for (const entry of pipelineTracker.getPool(modelId)) {
@@ -493,6 +503,24 @@ export class PipelinePoolManager {
     // uses the "assembling" state, which every consumer already knows to
     // skip: it has no driver yet, so it is never routed to, never
     // heartbeated and never health-checked.
+    // Re-check at the moment of commitment, not just when the plan was
+    // built. planAllocations() is pure and internally consistent, but
+    // allocate() consumes its plan across `await tryAssemble(...)`
+    // boundaries -- a real model load holds the first claim's fetch open
+    // for seconds -- and in that window the REQUEST path can legitimately
+    // claim a launcher this plan had earmarked for a later entry. Without
+    // this the later claim reserved it anyway, and one launcher ended up
+    // backing two models: same launcherId, same driverNodeId, and a user
+    // asking for one model served the other's weights with a 200.
+    //
+    // This is the rule the two reservations above only half-express:
+    // nothing may commit to a launcher without confirming it is STILL free
+    // at commit time. assemblePipeline() in server.ts needs no equivalent
+    // because it picks and reserves with no await in between.
+    if (isLauncherClaimed(claimedLauncherIds(this.catalog, this.pipelineTracker), launcher)) {
+      return false; // the plan went stale; the next tick re-derives it
+    }
+
     const reservationId = randomUUID();
     this.pipelineTracker.addEntry(modelId, {
       pipelineId: reservationId,

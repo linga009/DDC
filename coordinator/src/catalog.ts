@@ -58,12 +58,15 @@ export class ModelCatalog {
 
   maxPipelines(id: string): number {
     const declared = this.entries.find(entry => entry.id === id)?.maxPipelines;
-    // A non-integer (or NaN) would defeat BOTH ceilings at once: NaN makes
-    // every `desired > current` comparison false, silently disabling
-    // background allocation, while leaving the cold-start cap check
-    // (`>= maxPipelines`) false too, so that path grows unbounded. Treat
-    // anything that isn't a whole number as "not configured".
-    return Number.isInteger(declared) ? declared as number : 1;
+    // Anything that isn't a whole number >= 1 is treated as "not
+    // configured". NaN/non-integers defeat both ceilings at once (NaN makes
+    // every `desired > current` false, disabling background allocation,
+    // while leaving the cold-start `>= maxPipelines` check false too). 0
+    // and negatives are integers but split the two: desiredPipelineCount()
+    // floors at 1 so the background loop still allocates, while the
+    // cold-start cap is unconditionally true, so the request path cannot
+    // even replace a failed entry -- leaving a pipeline it can never heal.
+    return Number.isInteger(declared) && (declared as number) >= 1 ? declared as number : 1;
   }
 
   // Every catalog entry id whose requiredNodeCount is declared > 1 --
