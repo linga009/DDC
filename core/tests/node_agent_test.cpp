@@ -80,12 +80,12 @@ struct AuthTokenEnvGuard {
 // lets startup past the SWARM_AUTH_TOKEN checks, this call fails fast at
 // model load (with a different message, which the assertions catch) instead
 // of loading a real model and blocking forever on server.run().
-int runAgentExpectingRefusalToStart(int port, std::string& output) {
+int runAgentExpectingRefusalToStart(int port, const std::string& extraArgs, std::string& output) {
     const std::string outPath = "node_agent_startup_test_output.txt";
     std::remove(outPath.c_str());
 
     std::string cmd = "\"" SWARM_NODE_AGENT_PATH "\" --model \"no-such-model-file.gguf\" --port " +
-                      std::to_string(port) + " > \"" + outPath + "\" 2>&1";
+                      std::to_string(port) + " " + extraArgs + " > \"" + outPath + "\" 2>&1";
 #ifdef _WIN32
     // std::system() runs this through `cmd /c`, which strips the first and
     // last quote character off a command that begins with one -- turning the
@@ -104,6 +104,13 @@ int runAgentExpectingRefusalToStart(int port, std::string& output) {
     in.close();
     std::remove(outPath.c_str());
     return rc;
+}
+
+// Existing call sites (the SWARM_AUTH_TOKEN startup tests, which predate
+// --device-tier) pass no extra args at all -- this overload keeps them
+// unchanged rather than making every caller pass "" explicitly.
+int runAgentExpectingRefusalToStart(int port, std::string& output) {
+    return runAgentExpectingRefusalToStart(port, "", output);
 }
 
 std::string sendRawRequest(int port, const std::string& rawRequest) {
@@ -179,16 +186,7 @@ protected:
     void SetUp() override {
         setTestAuthTokenEnv();
         KillAnyRunningAgent();
-
-        std::string cmd;
-#ifdef _WIN32
-        cmd = "start /B \"\" \"" SWARM_NODE_AGENT_PATH "\" --model \"" + testModelPath() +
-              "\" --port " + std::to_string(kAgentPort) + " > NUL 2>&1";
-#else
-        cmd = "\"" SWARM_NODE_AGENT_PATH "\" --model \"" + testModelPath() +
-              "\" --port " + std::to_string(kAgentPort) + " > /dev/null 2>&1 &";
-#endif
-        std::system(cmd.c_str());
+        SpawnAgent("");
         // Model load takes real time -- poll /health rather than a fixed
         // sleep, so this fixture doesn't flake on a slower machine or
         // under-sleep on a faster one.
@@ -197,6 +195,30 @@ protected:
 
     void TearDown() override {
         KillAnyRunningAgent();
+    }
+
+    // Kills whatever agent is currently running and respawns it with
+    // extraArgs appended -- lets a handful of tests opt into flags
+    // (--serves-model, --device-tier) the default SetUp() spawn above
+    // doesn't pass, without changing what every other test in this fixture
+    // gets. Pays for a full model reload, so used sparingly.
+    void RespawnWithExtraArgs(const std::string& extraArgs) {
+        KillAnyRunningAgent();
+        SpawnAgent(extraArgs);
+        waitForAgentHealth(kAgentPort);
+    }
+
+private:
+    void SpawnAgent(const std::string& extraArgs) {
+        std::string cmd;
+#ifdef _WIN32
+        cmd = "start /B \"\" \"" SWARM_NODE_AGENT_PATH "\" --model \"" + testModelPath() +
+              "\" --port " + std::to_string(kAgentPort) + " " + extraArgs + " > NUL 2>&1";
+#else
+        cmd = "\"" SWARM_NODE_AGENT_PATH "\" --model \"" + testModelPath() +
+              "\" --port " + std::to_string(kAgentPort) + " " + extraArgs + " > /dev/null 2>&1 &";
+#endif
+        std::system(cmd.c_str());
     }
 };
 
@@ -464,6 +486,110 @@ TEST_F(NodeAgentFixture, CompleteEndpointRejectsWrongAuthWith401) {
     EXPECT_NE(response.find("HTTP/1.1 401"), std::string::npos);
 }
 
+// Endpoint Identity Hardening: POST /identity is what lets a coordinator
+// verify a registration by asking the agent itself, rather than trusting
+// the caller of POST /nodes/register. These tests exercise it through the
+// real, running agent binary -- not a unit-level stub -- matching this
+// project's own established review posture for anything HTTP-shaped.
+
+TEST_F(NodeAgentFixture, IdentityEndpointEchoesTheNonceAndReportsTheDefaultDeviceTier) {
+    // No --serves-model/--device-tier passed by this fixture's default
+    // SetUp(): deviceTier must fall back to "desktop", and servesModel must
+    // be entirely absent from the response rather than an empty string --
+    // an agent started with no --serves-model genuinely doesn't serve a
+    // catalog id yet, which is a different fact than serving an empty one.
+    std::string body = R"({"nonce":"abc123"})";
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos) << response;
+    EXPECT_NE(response.find(R"("nonce":"abc123")"), std::string::npos) << response;
+    EXPECT_NE(response.find(R"("deviceTier":"desktop")"), std::string::npos) << response;
+    EXPECT_EQ(response.find("servesModel"), std::string::npos) << response;
+}
+
+TEST_F(NodeAgentFixture, IdentityEndpointReflectsServesModelAndDeviceTierFlags) {
+    RespawnWithExtraArgs("--serves-model tinyllama-1.1b --device-tier android");
+
+    std::string body = R"({"nonce":"xyz789"})";
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos) << response;
+    EXPECT_NE(response.find(R"("nonce":"xyz789")"), std::string::npos) << response;
+    EXPECT_NE(response.find(R"("deviceTier":"android")"), std::string::npos) << response;
+    EXPECT_NE(response.find(R"("servesModel":"tinyllama-1.1b")"), std::string::npos) << response;
+}
+
+TEST_F(NodeAgentFixture, IdentityEndpointRejectsAMissingNonceWith400) {
+    std::string body = R"({})";
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 400"), std::string::npos) << response;
+}
+
+TEST_F(NodeAgentFixture, IdentityEndpointRejectsANonStringNonceWith400) {
+    std::string body = R"({"nonce":12345})";
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 400"), std::string::npos) << response;
+}
+
+TEST_F(NodeAgentFixture, IdentityEndpointRejectsAnOversizedNonceWith400) {
+    // 201 characters -- one past the 200-character cap. The cap exists so
+    // this route can't be used to echo unbounded attacker-controlled input
+    // back into a JSON response; the coordinator's own nonce is a UUID,
+    // nowhere near this size.
+    std::string oversizedNonce(201, 'a');
+    std::string body = R"({"nonce":")" + oversizedNonce + R"("})";
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 400"), std::string::npos) << response;
+}
+
+TEST_F(NodeAgentFixture, IdentityEndpointEscapesAQuoteAndBackslashInTheNonceRatherThanBreakingTheResponse) {
+    // A nonce is coordinator-generated (a UUID) in real use, but this route
+    // has no way to enforce that -- it must treat the nonce as untrusted
+    // input regardless. A raw '"' or '\' concatenated unescaped into the
+    // response body would produce broken JSON; jsonEscapeString() must
+    // prevent that. The wire request's own JSON escaping is what gets a
+    // literal quote and backslash into the nonce value in the first place.
+    std::string body = R"({"nonce":"a\"b\\c"})";  // nonce value is: a"b\c
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer " + std::string(kTestAuthToken) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos) << response;
+    // The nonce value a"b\c must appear back-escaped as a\"b\\c within the
+    // response's JSON, not as a raw, structure-breaking quote/backslash.
+    EXPECT_NE(response.find(R"("nonce":"a\"b\\c")"), std::string::npos) << response;
+}
+
+TEST_F(NodeAgentFixture, IdentityEndpointRejectsMissingAuthWith401) {
+    std::string body = R"({"nonce":"abc123"})";
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 401"), std::string::npos) << response;
+}
+
+TEST_F(NodeAgentFixture, IdentityEndpointRejectsWrongAuthWith401) {
+    std::string body = R"({"nonce":"abc123"})";
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nAuthorization: Bearer wrong-token\r\n\r\n" + body;
+    std::string response = sendRawRequest(kAgentPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 401"), std::string::npos) << response;
+}
+
 // These three spawn the agent binary directly rather than going through
 // NodeAgentFixture: the whole point is a process that never becomes
 // healthy, so the fixture's spawn-detached-and-poll-/health machinery is
@@ -510,6 +636,23 @@ TEST(NodeAgentStartupTest, RefusesToStartWhenAuthTokenHasALeadingSpace) {
 
     EXPECT_NE(rc, 0) << output;
     EXPECT_NE(output.find("SWARM_AUTH_TOKEN"), std::string::npos) << output;
+}
+
+TEST(NodeAgentStartupTest, RefusesToStartWithAnInvalidDeviceTier) {
+    // Validated at startup against the same fixed three-value enum
+    // POST /identity's response later assumes needs no escaping -- if an
+    // invalid value ever reached that far, it would be embedded raw into a
+    // JSON response. Fails fast (before model load) exactly like the
+    // SWARM_AUTH_TOKEN checks above, which is why the nonexistent-model-file
+    // path this helper always uses is safe to reuse here too.
+    AuthTokenEnvGuard restoreTokenForLaterTests;
+    setTestAuthTokenEnv();
+
+    std::string output;
+    int rc = runAgentExpectingRefusalToStart(50094, "--device-tier laptop", output);
+
+    EXPECT_NE(rc, 0) << output;
+    EXPECT_NE(output.find("--device-tier"), std::string::npos) << output;
 }
 
 TEST_F(MultiNodeAgentFixture, CompleteEndpointWorksAcrossRealRpcShardedInference) {
