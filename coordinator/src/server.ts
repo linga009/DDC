@@ -796,7 +796,8 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         // coordinator-to-coordinator identity protocol, which is a
         // materially different problem from asking a single-purpose agent
         // what it serves. Out of scope for this phase; see README.
-        const peerId = peers.register(normalizedEndpoint);
+        const peerIdentityKey = await canonicalizeEndpoint(normalizedEndpoint);
+        const peerId = peers.register(normalizedEndpoint, peerIdentityKey);
         sendJson(res, 200, { peerId });
         return;
       }

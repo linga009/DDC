@@ -39,6 +39,15 @@ export class SwarmClient {
     });
   }
 
+  // `endpoint` must be a LIVE, reachable URL: the coordinator verifies this
+  // registration by calling POST /identity on it directly with a
+  // single-use nonce before storing anything (Endpoint Identity
+  // Hardening), so this call can now fail (rejects with a 502 detail) for
+  // reasons that have nothing to do with the request body's own shape --
+  // unreachable, timed out, or a mismatched nonce. `deviceTier` and
+  // `servesModel` passed here are only shape-validated; what actually gets
+  // stored is whatever that endpoint's own /identity response reports,
+  // not these values.
   async registerNode(
     endpoint: string,
     deviceTier: "desktop" | "android" | "ios",

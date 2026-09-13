@@ -71,6 +71,14 @@ export const openApiDocument = {
     "/nodes/register": {
       post: {
         summary: "Register a node",
+        description:
+          "Verifies this registration by calling POST /identity on the endpoint itself with a single-use nonce before " +
+          "storing anything. deviceTier and servesModel in the request body are validated for shape but then DISCARDED: " +
+          "the values actually stored are whatever the endpoint's own /identity response reports, not what this request " +
+          "claims. This closes a griefing vector where any token-holder who knew a node's endpoint could silently strip " +
+          "its servesModel by re-registering it with none -- now that call is a no-op, since the coordinator asks the " +
+          "node itself. localityGroup and availableMemoryMb are NOT verified this way and remain exactly as supplied " +
+          "here, unchanged.",
         requestBody: {
           content: {
             "application/json": {
@@ -79,9 +87,9 @@ export const openApiDocument = {
                 required: ["endpoint", "deviceTier"],
                 properties: {
                   endpoint: { type: "string" },
-                  deviceTier: { type: "string", enum: ["desktop", "android", "ios"] },
+                  deviceTier: { type: "string", enum: ["desktop", "android", "ios"], description: "Validated for shape only -- the stored value comes from the endpoint's own /identity response." },
                   localityGroup: { type: "string" },
-                  servesModel: { type: "string" },
+                  servesModel: { type: "string", description: "Validated for shape only -- the stored value comes from the endpoint's own /identity response." },
                 },
               },
             },
@@ -92,6 +100,12 @@ export const openApiDocument = {
           "200": { description: "Registered", content: { "application/json": { schema: { type: "object", properties: { nodeId: { type: "string" } } } } } },
           "400": {
             description: "Invalid request body",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+          "502": {
+            description:
+              "The endpoint could not be verified: unreachable, timed out (5s), a non-2xx response from its own " +
+              "POST /identity, an unparseable body, or a mismatched nonce.",
             content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
           },
         },
@@ -174,6 +188,10 @@ export const openApiDocument = {
     "/peers/register": {
       post: {
         summary: "Register a federated peer coordinator instance",
+        description:
+          "Unlike POST /nodes/register and POST /launchers/register, this is NOT verified against the endpoint " +
+          "itself: a peer is another coordinator, which has no POST /identity route to call. The endpoint's claim is " +
+          "trusted outright.",
         requestBody: {
           content: { "application/json": { schema: { type: "object", required: ["endpoint"], properties: { endpoint: { type: "string", format: "uri" } } } } },
         },
@@ -182,6 +200,48 @@ export const openApiDocument = {
           "200": { description: "Registered", content: { "application/json": { schema: { type: "object", properties: { peerId: { type: "string" } } } } } },
           "400": {
             description: "Invalid endpoint",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+        },
+      },
+    },
+    "/launchers/register": {
+      post: {
+        summary: "Register a swarm-launcher",
+        description:
+          "Verifies this registration by calling POST /identity on the endpoint itself with a single-use nonce " +
+          "(no Authorization header -- a swarm-launcher's /identity route deliberately has none, matching its own " +
+          "127.0.0.1-only trust boundary). agentPort in the request body is validated for shape but then DISCARDED: " +
+          "the value actually stored is whatever the launcher's own /identity response reports. servesModels is NOT " +
+          "verified this way and remains exactly as supplied here, unchanged -- a launcher can spawn any model " +
+          "present under its own --models-dir, so it has no fixed answer to \"what do you serve\" the way a running " +
+          "node agent does.",
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["endpoint", "servesModels", "agentPort"],
+                properties: {
+                  endpoint: { type: "string" },
+                  servesModels: { type: "array", items: { type: "string" } },
+                  agentPort: { type: "integer", description: "Validated for shape only -- the stored value comes from the launcher's own /identity response." },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "401": UNAUTHORIZED_RESPONSE,
+          "200": { description: "Registered", content: { "application/json": { schema: { type: "object", properties: { launcherId: { type: "string" } } } } } },
+          "400": {
+            description: "Invalid request body",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+          "502": {
+            description:
+              "The launcher could not be verified: unreachable, timed out (5s), a non-2xx response from its own " +
+              "POST /identity, an unparseable body, or a mismatched nonce.",
             content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
           },
         },

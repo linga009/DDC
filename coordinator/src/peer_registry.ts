@@ -5,7 +5,16 @@ export interface PeerInfo {
   endpoint: string;
 }
 
+// identityKey is internal-only (not part of PeerInfo): nothing outside
+// this class needs to read a peer's canonical identity back -- it exists
+// purely to make register()'s own dedup match on the canonical form
+// instead of raw endpoint equality. Unlike NodeRegistry/LauncherRegistry,
+// there is no endpoint-authoritative callback for peers (a peer is
+// another coordinator, with no POST /identity route to call -- see
+// POST /peers/register's own comment in server.ts), so canonicalization
+// is the only Endpoint Identity Hardening mechanism that applies here.
 interface StoredPeer extends PeerInfo {
+  identityKey: string;
   lastSeen: number;
 }
 
@@ -21,7 +30,15 @@ export class PeerRegistry {
     this.timeoutMs = timeoutMs;
   }
 
-  register(endpoint: string): string {
+  // `identityKey` is the CANONICAL identity for `endpoint` -- the caller
+  // has already resolved/canonicalized it before calling this, same
+  // division of responsibility as NodeRegistry.register() and
+  // LauncherRegistry.register(). Matching on it (rather than raw endpoint
+  // equality) means two coordinators sharing a machine under an alias
+  // (127.0.0.1 vs localhost) dedupe to one peer instead of double-counting
+  // its reported capacity in the federated aggregate -- the same class of
+  // bug Endpoint Identity Hardening closes for nodes and launchers.
+  register(endpoint: string, identityKey: string): string {
     const now = this.clock();
     for (const [peerId, peer] of this.peers) {
       if (now - peer.lastSeen > this.timeoutMs) {
@@ -34,17 +51,17 @@ export class PeerRegistry {
         this.peers.delete(peerId);
         continue;
       }
-      if (peer.endpoint === endpoint) {
+      if (peer.identityKey === identityKey) {
         // Already registered and still active -- treat this as a refresh
         // (same effect as a heartbeat) rather than minting a duplicate
-        // entry for the same endpoint, which would otherwise double-count
+        // entry for the same machine, which would otherwise double-count
         // that peer's reported capacity in the federated aggregate.
         peer.lastSeen = now;
         return peer.peerId;
       }
     }
     const peerId = randomUUID();
-    this.peers.set(peerId, { peerId, endpoint, lastSeen: now });
+    this.peers.set(peerId, { peerId, endpoint, identityKey, lastSeen: now });
     return peerId;
   }
 
