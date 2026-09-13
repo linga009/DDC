@@ -785,6 +785,52 @@ test("POST /nodes/register: a squatter's pre-registration cannot be armed by the
   }
 });
 
+test("POST /nodes/register: two registrations racing the same colliding identity cannot both commit", async () => {
+  // Third whole-branch review, Critical finding: the collision check above
+  // runs BEFORE `await verifyNodeIdentity()` a few lines down -- a genuine
+  // TOCTOU window, since nothing re-confirms the identity is still free at
+  // the moment of commitment. Live-verified to reproduce both of round 2's
+  // already-fixed bugs (a real agent's servesModel silently stripped; a
+  // victim's honest registration armed onto an attacker's pinned endpoint)
+  // even with the first check in place -- 4 of 10 concurrent colliding
+  // registrations were silently absorbed per burst in that testing.
+  // Reproduced here deterministically, no sleep/timing: the SLOW
+  // registration's identity verification is held open by the stub until
+  // the FAST one has already completed and committed, proving the slow
+  // one's own re-check immediately before registry.register() (this
+  // round's fix) catches what the first check alone could not.
+  const stub = await startGatedIdentityStub("node", "localhost");
+  const fastEndpoint = `http://127.0.0.1:${stub.port}`;
+  const slowEndpoint = `http://localhost:${stub.port}`; // collides with fastEndpoint's identity
+  const { server, baseUrl, registry } = await startTestServer();
+  try {
+    const slowPromise = authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: slowEndpoint, deviceTier: "desktop" }),
+    });
+    await stub.gateReached; // the slow registration is now genuinely mid-verification, nothing committed yet
+
+    const fastRes = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: fastEndpoint, deviceTier: "desktop" }),
+    });
+    assert.equal(fastRes.status, 200, "nothing was pinned yet when the fast registration arrived, so it must succeed");
+
+    stub.release();
+    const slowRes = await slowPromise;
+    assert.equal(slowRes.status, 409, "the slow registration must be rejected once the fast one has already committed the identity, not silently absorbed");
+
+    const active = registry.listActive();
+    assert.equal(active.length, 1, "the race must produce exactly one entry, never a silent overwrite by the loser");
+    assert.equal(active[0].endpoint, fastEndpoint, "the winner must be whichever registration actually committed first");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
 test("POST /nodes/:nodeId/heartbeat returns 204 for a known node and 404 for an unknown one", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
@@ -1340,6 +1386,52 @@ test("POST /launchers/register rejects a registration whose identity genuinely c
   }
 });
 
+test("POST /launchers/register: two registrations racing the same colliding identity cannot both commit", async () => {
+  // Same TOCTOU as POST /nodes/register's own race test above -- the
+  // reviewer flagged launchers as the higher-severity surface for exactly
+  // this class of bug (a swarm-launcher's POST /pipeline is this project's
+  // own documented RCE-shaped surface), and live-verified it live: a fast,
+  // honest launcher registration followed by a slow, colliding attacker
+  // registration both returned 200, with the attacker's servesModels AND
+  // agentPort silently overwriting the honest launcher's entry -- since
+  // launcherDriverEndpoint() is host:agentPort, an attacker-chosen
+  // agentPort on an otherwise-honest launcher's pinned entry means the
+  // coordinator would spawn a real agent on the honest machine and then
+  // treat a DIFFERENT, attacker-controlled port as the driver.
+  const stub = await startGatedIdentityStub("launcher", "localhost");
+  const fastEndpoint = `http://127.0.0.1:${stub.port}`;
+  const slowEndpoint = `http://localhost:${stub.port}`; // collides with fastEndpoint's identity
+  const { server, baseUrl, launcherRegistry } = await startTestServer();
+  try {
+    const slowPromise = authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: slowEndpoint, servesModels: ["attacker-model"], agentPort: 31337 }),
+    });
+    await stub.gateReached; // the slow registration is now genuinely mid-verification, nothing committed yet
+
+    const fastRes = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: fastEndpoint, servesModels: ["mixtral-8x7b"], agentPort: 18500 }),
+    });
+    assert.equal(fastRes.status, 200, "nothing was pinned yet when the fast registration arrived, so it must succeed");
+
+    stub.release();
+    const slowRes = await slowPromise;
+    assert.equal(slowRes.status, 409, "the slow registration must be rejected once the fast one has already committed the identity, not silently absorbed");
+
+    const launchers = launcherRegistry.listActive();
+    assert.equal(launchers.length, 1, "the race must produce exactly one entry, never a silent overwrite by the loser");
+    assert.equal(launchers[0].endpoint, fastEndpoint);
+    assert.deepEqual(launchers[0].servesModels, ["mixtral-8x7b"], "the loser's servesModels must never land on the winner's entry");
+    assert.equal(launchers[0].agentPort, 8090, "the loser's attacker-chosen agentPort must never land on the winner's entry -- the identity stub always reports its own real agentPort (8090), not the caller's claim");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
 test("POST /launchers/register rejects a non-array servesModels", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
@@ -1546,6 +1638,67 @@ test("POST /generate assembles a fresh pipeline via a registered launcher when n
     assert.deepEqual(await res.json(), { text: "from the freshly assembled driver" });
     const active = registry.listActive();
     assert.ok(active.some(n => n.servesModel === "big-model"));
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /generate refuses to let a launcher-spawned driver silently adopt a squatter's pinned endpoint", async () => {
+  // Third whole-branch review, Critical finding -- the request-path
+  // (cold-start) counterpart of pipeline_pool_manager.test.ts's own
+  // regression test for the background loop; see that test's comment for
+  // the full reasoning. Live-verified via this exact route: the
+  // coordinator told an honest launcher to spawn a real agent, then
+  // registered the driver under an identity a squatter had already pinned
+  // under a colliding alias -- and registry.register()'s own
+  // endpoint-pinning kept the SQUATTER's endpoint on the entry, so a real
+  // user's prompt for big-model went to the attacker with a 200. Not
+  // possible on `master` (raw endpoint-string identity meant no collision
+  // could exist here at all) -- canonicalization creates the collision;
+  // the old pinning converted it into a hijack.
+  let capturedLauncherRequest: Record<string, unknown> | undefined;
+  const stub = await startStubNodeAgent((body) => {
+    const candidate = body as Record<string, unknown>;
+    if (candidate.model !== undefined) {
+      capturedLauncherRequest = candidate;
+      return { status: 200, body: { status: "ready" } };
+    }
+    return { status: 200, body: { text: "ATTACKER-CONTROLLED-OR-DRIVER" } };
+  });
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
+  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(bigCatalog);
+  try {
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+
+    const launcherPort = Number(new URL(stub.endpoint).port);
+    // Squat the driver's identity FIRST, under an alias colliding with what
+    // launcherDriverEndpoint() will compute for this launcher
+    // (127.0.0.1:launcherPort, since this stub's own port doubles as its
+    // registered agentPort, same convention the test above uses).
+    const squatterEndpoint = `http://localhost:${launcherPort}`;
+    registry.register(squatterEndpoint, await canonicalizeEndpoint(squatterEndpoint), "desktop", undefined, "squatted-model");
+
+    launcherRegistry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), ["big-model"], launcherPort);
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "secret user prompt", modelId: "big-model" }),
+    });
+
+    // The launcher WAS called -- a real agent really did spawn -- but the
+    // squat must make this request fail rather than silently route to the
+    // squatter's endpoint.
+    assert.equal(capturedLauncherRequest?.model, "big-model");
+    assert.equal(res.status, 503, "no pipeline may be usable when the driver's identity was squatted, and the squatter never claims big-model itself");
+
+    const active = registry.listActive();
+    assert.equal(active.length, 3, "no new entry may have been registered under the squatter's identity");
+    const squatted = active.find(n => n.endpoint === squatterEndpoint);
+    assert.ok(squatted, "the squatter's entry must still exist, completely untouched");
+    assert.equal(squatted?.servesModel, "squatted-model", "the squatter's entry must NOT have acquired the driver's servesModel -- this is the exact hijack the fix closes");
   } finally {
     server.close();
     stub.server.close();
@@ -3206,6 +3359,45 @@ async function startIdentityStub(kind: "node" | "launcher", opts: Record<string,
     throw new Error("expected identity stub to bind to a port");
   }
   return { server, endpoint: `http://127.0.0.1:${address.port}` };
+}
+
+// Like startIdentityStub, but the /identity response is held open for ONE
+// specific hostname alias (`gatedHostname`) until release() is called --
+// lets a test deterministically win a race between two registrations that
+// collide on the same canonical identity, with no real sleep/timing.
+// `gateReached` resolves once a request for the gated alias has actually
+// arrived and is stalled, so a test can be certain the OTHER (non-gated)
+// registration only starts once the first one is genuinely mid-verification
+// -- not "probably before it" by timing luck. Both aliases land on this one
+// real listener (matching this file's established "localhost resolves to
+// 127.0.0.1" collision trick, see the squatter test above); the gate keys
+// off the Host header fetch sets from the URL each registration used, so
+// only the gated alias's request stalls.
+async function startGatedIdentityStub(kind: "node" | "launcher", gatedHostname: string) {
+  let releaseGate: () => void;
+  const gate = new Promise<void>(resolve => { releaseGate = resolve; });
+  let markGateReached: () => void;
+  const gateReached = new Promise<void>(resolve => { markGateReached = resolve; });
+  const server = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}") as Record<string, unknown>;
+    if ((req.headers.host ?? "").startsWith(`${gatedHostname}:`)) {
+      markGateReached();
+      await gate;
+    }
+    const answer = kind === "node"
+      ? { nonce: body.nonce, deviceTier: "desktop" }
+      : { nonce: body.nonce, agentPort: 8090 };
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(answer));
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected gated identity stub to bind to a port");
+  }
+  return { server, port: address.port, gateReached, release: () => releaseGate() };
 }
 
 // Like startStubNodeAgent, but for a POST /complete request with

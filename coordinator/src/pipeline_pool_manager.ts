@@ -220,6 +220,46 @@ export function launcherDriverEndpoint(launcher: LauncherInfo): string {
   return `${launcherUrl.protocol}//${launcherUrl.hostname}:${launcher.agentPort}`;
 }
 
+// Thrown by assertDriverIdentityFree() below -- caught by each caller's
+// existing try/catch (the same path a launcher fetch failure already
+// takes), so a squatted driver identity fails this one assembly attempt
+// loudly instead of silently registering the driver under the squatter's
+// pinned endpoint.
+export class DriverIdentityCollisionError extends Error {}
+
+// A launcher-spawned driver's registration (registry.register(), called
+// directly at each of this function's two call sites) bypasses POST
+// /nodes/register's own collision-rejection check entirely -- there is no
+// HTTP caller here to hand a 409 to. Without this, NodeRegistry.register()'s
+// endpoint-pinning (see its own comment) has the OPPOSITE of its intended
+// effect for this one caller: an unrelated, earlier, attacker-controlled
+// registration that happens to collide with this driver's canonical
+// identity keeps ITS pinned endpoint, and the coordinator then treats that
+// attacker endpoint as the freshly-spawned driver -- live-verified (third
+// whole-branch review) to hand a real user's prompt straight to the
+// attacker with a 200, even though the launcher really did spawn an honest
+// agent. driverEndpoint here is not a caller's unverified claim -- it's
+// derived from an already-identity-verified LauncherRegistry entry, and
+// POST /pipeline having just returned success means a real agent is
+// listening there right now -- but that still doesn't license silently
+// evicting whatever a third party has pinned. The same "reject, don't
+// silently reassign" rule POST /nodes/register enforces applies here too:
+// a squat just fails this one assembly attempt (disclosed residual, not a
+// hijack) rather than registering over it or handing the driver's
+// endpoint away.
+//
+// Call this synchronously, immediately before registry.register(), with
+// no `await` in between -- mirrors POST /nodes/register's own re-check
+// fix, for the same reason: no concurrent registration can land inside a
+// gap that doesn't exist.
+export function assertDriverIdentityFree(registry: NodeRegistry, driverIdentityKey: string, driverEndpoint: string): void {
+  const pinnedEndpoint = registry.listActive().find(n => n.nodeId === stableNodeId(driverIdentityKey))?.endpoint;
+  if (pinnedEndpoint !== undefined && pinnedEndpoint !== driverEndpoint) {
+    throw new DriverIdentityCollisionError(
+      `driver identity ${driverIdentityKey} is already registered under a different endpoint (${pinnedEndpoint}) -- refusing to let this pipeline assembly silently inherit it`);
+  }
+}
+
 // Background reconciliation loop: keeps each multi-node model's pool of
 // warm pipelines matched to recent demand, heals entries whose nodes have
 // died or been reputation-ejected, and tears down pipelines nobody has
@@ -588,6 +628,7 @@ export class PipelinePoolManager {
       // the preflight trust check -- reused here, not rebuilt, so this
       // registration can never derive a different identity than the one
       // that was actually checked.
+      assertDriverIdentityFree(this.registry, driverIdentityKey, driverEndpoint);
       const driverNodeId = this.registry.register(driverEndpoint, driverIdentityKey, "desktop", undefined, modelId);
       // Swap the reservation for the real entry: same launcher, so the
       // claim is continuous and never briefly drops.

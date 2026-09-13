@@ -53,7 +53,11 @@ of warm pipelines matched to recent demand, so a pipeline no longer has to be
 assembled synchronously on the first request that needs one. Like Phase B's
 multi-node assembly, it ships **dormant in production** — no model in the
 default catalog declares `requiredNodeCount > 1`, so nothing engages it until
-an operator configures such a model.
+an operator configures such a model. Endpoint Identity Hardening (canonical
+machine identity for node/launcher registration, replacing a raw endpoint
+string) is also done — unlike Phases B/C it is **not** dormant: it changes
+registration for every node and launcher in every deployment. See "Known
+gaming vectors" below for what it closes and what's still open.
 
 ## Get involved
 
@@ -61,15 +65,24 @@ This is early, real infrastructure — not a finished product — and it's
 built in the open specifically so people can pick up a piece of it. Useful
 ways to help right now:
 
-- **Endpoint identity** *(being scoped now — see below)* — an endpoint
-  *string* is not a canonical machine identity anywhere in this service. A
-  node re-registering as `http://localhost:P` instead of
-  `http://127.0.0.1:P` gets a brand-new `nodeId` and a clean reputation
-  record for free, and a launcher registered under two aliases looks like
-  two idle machines and can be double-claimed, serving a caller another
-  model's weights. This has been disclosed-but-unfixed since Security
-  Phase 3 and is the single highest-value gap left in the trust model;
-  it is now being scoped as its own phase rather than left open.
+- **Name-based virtual hosting collapses distinct machines.** Endpoint
+  Identity Hardening (done, live on `master` — see "Known gaming vectors"
+  below) closed the loopback-alias/DNS-name reputation-reset gap that used
+  to be listed here, but its own identity key is `resolvedIP:port` with the
+  scheme excluded — two genuinely different services sharing one resolved
+  IP and port (the standard shape behind a reverse proxy) now collapse into
+  one identity, silently halving federated peer capacity or hard-rejecting
+  a second node/launcher's registration. Fixing this without breaking the
+  alias-collapsing this phase exists for needs real design thought, not a
+  quick patch.
+- **Proof-of-endpoint-possession identity** (e.g. node-supplied public-key
+  identity) — the mechanism that would close the remaining squat-first gap
+  Endpoint Identity Hardening deliberately left open (a token-holder can
+  still win an identity by registering it *before* the legitimate owner
+  does). Rejected as out of scope for that phase specifically because there
+  is no crypto library anywhere in `core/` — adding one, or hand-rolling
+  Ed25519, is a real, standalone dependency decision worth its own
+  discussion.
 - **Closing one of Phase B's disclosed residual gaps** — see the Dynamic
   pipeline assembly section below for the current list (a still-registered
   dead driver can occasionally be re-selected before it ages out, no
@@ -220,9 +233,21 @@ CLI flags:
   layer's MoE expert tensors to a device endpoint (`local` or one of the
   `--remote` endpoints), same as `InferenceEngine`'s layer-placement
   constructor.
+- `--serves-model <id>` (optional) — the catalog model id this agent is
+  actually serving (e.g. `tinyllama-1.1b`), reported back verbatim by the
+  new `POST /identity` endpoint below. Added by Endpoint Identity
+  Hardening so the coordinator can verify a `POST /nodes/register`
+  caller's `servesModel` claim against what the agent itself says, instead
+  of trusting the claim outright — see the Coordinator service section's
+  `POST /nodes/register` docs. `swarm-launcher` passes this through
+  automatically when it spawns an agent (see the Launcher section below);
+  set it directly when starting an agent manually.
+- `--device-tier <desktop|android|ios>` (optional, default `desktop`) —
+  reported back by `POST /identity` the same way; startup fails fast on any
+  other value.
 
 > [!WARNING]
-> `swarm-node-agent`'s HTTP endpoints (`/health`, `/complete`) require the
+> `swarm-node-agent`'s HTTP endpoints (`/health`, `/complete`, `/identity`) require the
 > shared `SWARM_AUTH_TOKEN` (see the Coordinator service section's
 > Authentication subsection below) but still have no encryption of their
 > own — traffic is plain HTTP. It binds to `127.0.0.1` by default; there is
@@ -231,8 +256,16 @@ CLI flags:
 > tunnel or WireGuard rather than exposing the port directly, matching
 > `swarm-rpc-server`'s recommendation above.
 
-It exposes two HTTP endpoints:
+It exposes three HTTP endpoints:
 
+- `POST /identity` — body `{"nonce": string}`, echoes the nonce back
+  (200-char cap, escaped) along with `{"deviceTier": string, "servesModel"?:
+  string}` (the `--device-tier`/`--serves-model` flags above; `servesModel`
+  is omitted entirely, not sent as `null`, when the flag wasn't set). Added
+  by Endpoint Identity Hardening — this is what `POST /nodes/register`
+  calls to verify a registration instead of trusting the caller's claim;
+  see the Coordinator service section below. Requires the same
+  `SWARM_AUTH_TOKEN` as `/health`/`/complete`.
 - `GET /health` — returns `200 {"status":"ready"}` once the model has
   finished loading and the server is accepting connections. This reflects
   only that startup finished — it is **not** a live engine-health check.
@@ -316,7 +349,7 @@ startup — never derived from a network request):
   different paths, so the coordinator cannot supply one).
 - `--node-agent-path <path>` — the `swarm-node-agent` executable to spawn.
 
-It exposes one HTTP endpoint:
+It exposes three HTTP endpoints:
 
 - `POST /pipeline` — body `{"model": string, "remoteEndpoints": string,
   "layerPlacements": string}` (`remoteEndpoints`/`layerPlacements` are
@@ -324,17 +357,27 @@ It exposes one HTTP endpoint:
   is a deliberately scalar-only extractor). Kills any previously-spawned
   agent (if reassembling), spawns a fresh `swarm-node-agent --model
   <models-dir>/<model>.gguf --port <agent-port> [--remote ...] [--layer-placement
-  ...]` via an explicit argv array — **never through a shell**, so no
-  request-derived value (a model name, a `--remote` endpoint) can inject a
-  second command — polls its `/health` until ready, and responds `200
-  {"status":"ready"}`, or a real error status/body if the model file is
-  missing (rejected before any spawn is attempted, with a guard rejecting
-  `/`, `\`, `:`, and `..` in `model` specifically — a real, live-verified
-  path-traversal bug was found and fixed here during development, see
-  `CLAUDE.md`), the spawn fails, or the health-poll times out.
+  ...] [--serves-model <model>]` via an explicit argv array — **never through
+  a shell**, so no request-derived value (a model name, a `--remote`
+  endpoint) can inject a second command — polls its `/health` until ready,
+  and responds `200 {"status":"ready"}`, or a real error status/body if the
+  model file is missing (rejected before any spawn is attempted, with a
+  guard rejecting `/`, `\`, `:`, and `..` in `model` specifically — a real,
+  live-verified path-traversal bug was found and fixed here during
+  development, see `CLAUDE.md`), the spawn fails, or the health-poll times
+  out.
+- `DELETE /pipeline` — stops the currently-spawned agent, if any. Idempotent
+  and always `204`, including when nothing is running (Phase C, for the
+  pool manager's own scale-down teardown — see below).
+- `POST /identity` — body `{"nonce": string}`, echoes it back along with
+  `{"agentPort": number}` (the launcher's own fixed `--agent-port`). Added
+  by Endpoint Identity Hardening, called by `POST /launchers/register` to
+  verify a registration the same way `swarm-node-agent`'s own `/identity`
+  does for nodes — see the Coordinator service section below.
 
 > [!WARNING]
-> **`POST /pipeline` requires no authentication of its own — this is
+> **None of this launcher's HTTP endpoints require authentication of their
+> own — including the newer `DELETE /pipeline` and `POST /identity` — this is
 > deliberate, not an oversight.** Trust is structural: `HttpServer` (the
 > exact same class `swarm-node-agent` runs on) binds `127.0.0.1` only,
 > unconditionally, for every server built on it — confirmed live-refused
@@ -461,27 +504,47 @@ Endpoints:
   This mirrors `POST /peers/register`'s existing validation and matters
   because `POST /generate` (see below) actually `fetch()`es this URL; an
   unnormalized or malformed endpoint used to register successfully and only
-  fail later, confusingly, at `/generate` time. Accepts an
+  fail later, confusingly, at `/generate` time.
+  **Endpoint Identity Hardening (done, live on `master`) changed what this
+  route trusts.** The coordinator now calls the submitted `endpoint`'s own
+  `POST /identity` (with a single-use nonce, and the shared
+  `SWARM_AUTH_TOKEN` in `Authorization`) before accepting the registration,
+  and stores what the endpoint *itself* reports, not what the caller
+  claimed — so `deviceTier` and `servesModel` are now **endpoint-verified,
+  not self-reported**: a caller can no longer register a node claiming a
+  `servesModel` the endpoint doesn't actually answer for, and a mismatch is
+  rejected with `502` naming the endpoint's real reported value. The one
+  exception is a `swarm-rpc-server` compute contributor, which speaks raw
+  llama.cpp RPC, not HTTP, and so cannot answer `/identity` at all — a
+  registration that genuinely cannot be reached (connection failure, not a
+  real HTTP server answering an error) and claims no `servesModel` is still
+  accepted on the caller's bare claim, exactly as before this phase, so
+  Phase B/C's compute-contributor registration path is unaffected. Before
+  storing anything, the endpoint is also **canonicalized** to a
+  `resolvedHost:port` identity key — `127.0.0.1`, `::1`, `0.0.0.0`, and
+  `localhost` (plus IPv4-mapped-IPv6 spellings of `127.0.0.1`) all collapse
+  to the same `loopback` identity, a real hostname is DNS-resolved (3s
+  timeout, falling back to the literal string on failure or timeout, since
+  a node on a name this coordinator cannot resolve must still be
+  registerable), and a registration whose endpoint doesn't match an
+  already-active entry for the same identity is rejected with `409` naming
+  the endpoint that's actually pinned, rather than silently reassigning
+  it — closing the alias-based reputation-reset and identity-hijack vectors
+  documented in "Known gaming vectors" below. Accepts an
   optional `localityGroup` string field (must be non-empty when provided) —
-  see the locality-grouping note below. Also accepts an optional
-  `servesModel` string field (must be a known catalog model id when
-  provided) declaring which model this node can serve inference requests
-  for. Like `localityGroup`, this is **self-reported and unverified** — the
-  coordinator does not check that a node actually has the declared model
-  loaded and ready; `POST /generate` (see below) trusts it at routing time.
-  Combined with this, anyone who has the shared `SWARM_AUTH_TOKEN` — not
-  the general public, but any single compromised or dishonest swarm
-  member — can register an endpoint claiming to serve a given model and
-  start receiving real `/generate` traffic for it — see the known gaming
-  vectors below for the sharper version of this involving reputation
-  ejection. Also accepts an optional `availableMemoryMb` number field
-  (rejected with `400` if negative or non-numeric) — like every other
-  self-reported field here, unverified, and used only as a soft tiebreak
-  (higher preferred, absent treated as `0`) when Phase B's dynamic
-  assembly picks a driver among several equally-reputable candidates, never
-  as a hard per-model memory gate (this project has no honest basis for a
-  real per-model memory requirement across a catalog spanning TinyLlama
-  1.1B through Mixtral 8x22B).
+  see the locality-grouping note below. `localityGroup` and the
+  `availableMemoryMb` field below **remain self-reported and unverified** —
+  only `deviceTier`/`servesModel` became endpoint-verified by this phase,
+  and combined with this, anyone who has the shared `SWARM_AUTH_TOKEN` can
+  still register a real node under a false `localityGroup`, or a real,
+  reachable node under a false `availableMemoryMb`, for free — see the
+  known gaming vectors below. Also accepts an optional `availableMemoryMb`
+  number field (rejected with `400` if negative or non-numeric) — used only
+  as a soft tiebreak (higher preferred, absent treated as `0`) when Phase B's
+  dynamic assembly picks a driver among several equally-reputable
+  candidates, never as a hard per-model memory gate (this project has no
+  honest basis for a real per-model memory requirement across a catalog
+  spanning TinyLlama 1.1B through Mixtral 8x22B).
 - `POST /nodes/:nodeId/heartbeat` — refresh a node's liveness
 - `GET /nodes` — list currently active nodes
 - `GET /nodes/locality` — active nodes bucketed by their self-reported
@@ -584,9 +647,23 @@ Endpoints:
   during whole-branch review — see `CLAUDE.md`). `servesModels` declares
   which models this launcher has local `.gguf` files for, so dynamic
   assembly (see below) can find a launcher that actually has the requested
-  model instead of trying every registered one in turn. Re-registering the
-  same `endpoint` refreshes the entry (same overwrite-on-register semantics
-  as `POST /nodes/register`) rather than duplicating it.
+  model instead of trying every registered one in turn — this field stays
+  caller-supplied and unverified (a launcher has no single fixed answer to
+  "what do you serve", unlike an agent's one `servesModel`). Re-registering
+  the same identity refreshes the entry rather than duplicating it. **Also
+  covered by Endpoint Identity Hardening**, and — per the whole-branch
+  review that shipped it — the *higher*-severity surface of the two: the
+  same canonicalize-then-verify-then-409-on-collision mechanism described
+  under `POST /nodes/register` above applies here too, calling this
+  endpoint's own `POST /identity` (no auth on the launcher's side, matching
+  `swarm-launcher`'s existing 127.0.0.1-only trust posture) to confirm
+  `agentPort` before accepting the registration, and rejecting a
+  registration whose endpoint collides with an already-active launcher
+  under a different endpoint with `409`. This closes the launcher
+  double-claim documented in the Dynamic pipeline assembly and Phase C
+  sections below, where one physical launcher reachable under two aliases
+  looked like two idle machines and could be double-claimed, serving a
+  caller another model's weights with a `200`.
 - `POST /launchers/:launcherId/heartbeat` — refresh a launcher's liveness
   (204, or 404 if `launcherId` is unknown), same 30-second timeout as every
   other registry in this service.
@@ -730,17 +807,24 @@ default catalog declares one.
 
 **Known, disclosed limitations:**
 
-- **A launcher's endpoint string is not a canonical machine identity.** The
-  pool marks a launcher busy by `launcherId` *and* endpoint, which survives
-  the `launcherId` rotation that happens when a lapsed registration
-  re-registers. But one physical launcher reachable as both
-  `http://127.0.0.1:P` and `http://localhost:P` registers twice and looks
-  like two idle machines, so it can be double-claimed — and since a launcher
-  supervises one agent at a time, a caller then receives another model's
-  weights with a `200`. This is the same endpoint-aliasing class already
-  disclosed for node identity (see Known gaming vectors). A phase closing
-  the endpoint-aliasing class for both nodes and launchers is being scoped
-  now; nothing is implemented yet.
+- **Fixed by Endpoint Identity Hardening (done, live on `master`; see
+  `POST /launchers/register` above and "Known gaming vectors" below):** a
+  launcher's endpoint string used to not be a canonical machine identity,
+  so one physical launcher reachable as both `http://127.0.0.1:P` and
+  `http://localhost:P` registered twice, looked like two idle machines, and
+  could be double-claimed — since a launcher supervises one agent at a
+  time, a caller then received another model's weights with a `200`,
+  live-verified at the time. Endpoints are now canonicalized before
+  matching (loopback aliases collapse, real hostnames are DNS-resolved),
+  and endpoint-verified via the launcher's own `POST /identity` before a
+  registration is accepted, so this specific double-claim is closed. **Not
+  fixed by this:** two launchers that are genuinely different machines but
+  sit behind one reverse proxy under two different hostnames sharing one
+  resolved IP and port still collapse into one identity (name-based virtual
+  hosting is not this phase's model — see "Known gaming vectors" below),
+  and a squatter can still register an identity *first*, before the real
+  launcher ever tries — proof-of-endpoint-possession, needed to close that,
+  remains out of scope (see below).
 - **A hung launcher can cost an unrelated healthy model its pipeline.** The
   reconciliation tick awaits launcher I/O sequentially with a 60-second
   timeout — twice the registry's 30-second node timeout — and the driver
@@ -878,9 +962,16 @@ endpoints from `/generate`'s own outcomes, so real ranking signal only
 exists where an operator or external tool has manually recorded it — a
 future automatic-feedback phase is real potential follow-on work, not
 implemented here. The score is also only as durable as the `nodeId` it's
-attached to — see the endpoint-aliasing caveat in "Known gaming vectors"
-below; an operator can mint a fresh, neutral-scoring identity for the same
-physical node by re-registering under an alias. This is not a general load
+attached to. **Before Endpoint Identity Hardening**, an operator could mint
+a fresh, neutral-scoring identity for the same physical node by
+re-registering under a loopback alias (`127.0.0.1` vs `localhost` vs
+`[::1]`) or a second DNS name pointed at it — that specific reset is now
+closed (see "Known gaming vectors" below): all of those collapse to one
+canonical identity, so the score survives the re-registration. An operator
+can still mint a genuinely fresh, distinct identity by registering under a
+genuinely different endpoint (a different port, a different real machine)
+— by design, not a bug, and explicitly not Sybil resistance (see "Known
+gaming vectors"). This is not a general load
 balancer: there is no in-flight-request tracking or capacity weighting,
 only a random tie-break among exactly-equal scores.
 
@@ -957,54 +1048,79 @@ the 30-second heartbeat timeout and coming back either. Verified live:
 eject a node with 5 disagreements, re-register the same endpoint,
 `GET /nodes` still excludes it and `GET /nodes/:nodeId/reputation` still
 reports the same `nodeId` with its disagreement count intact.
-**Not fixed by this:** identity is stable per *endpoint string*, not per
-underlying node — `stableNodeId()` only lowercases the string, it does not
-canonicalize it, so a single listening socket answers to unlimited alias
-strings for free, no new port or infrastructure required. Verified live: a
-node ejected while registered as `http://127.0.0.1:PORT` re-registers as
-`http://localhost:PORT` (same running server, same socket) and comes back
-with a completely different `nodeId` and a clean `0/0, trusted: true`
-reputation record — `/generate` immediately routes to it again. The same
-works with `http://[::1]:PORT`, a trailing-dot FQDN vs. the bare form, or
-any other DNS name pointed at the same machine. An attacker who holds
-`SWARM_AUTH_TOKEN` can separately mint unlimited genuinely-distinct
-identities by registering different endpoints (e.g. several ports on one
-machine) too — Phase 3 makes a given endpoint *string* stable and
-non-resettable, it does not limit how many strings, aliased or distinct,
-one attacker can register in the first place. Relatedly, an ejected node
-does not even need to re-register to come back: the reputation-mutating
-routes deliberately check the *unfiltered* node list rather than the
-reputation-filtered one (so an already-ejected node stays reachable for
-legitimate agree/disagree corrections), which also means any token-holder
-can rehabilitate an ejected node in place with 6
-`POST /nodes/:nodeId/reputation/agree` calls, no re-registration involved;
-verified live. The overwrite-on-register mechanism that makes identity
-durable for a *given* endpoint string also cuts the other way: any
-token-holder who knows a node's exact `endpoint` (trivially readable via
-`GET /nodes`) can silently overwrite that node's `deviceTier`/
-`localityGroup`/`servesModel` claim by re-registering the same endpoint —
-verified live: registering `http://127.0.0.1:1` again with no `servesModel`
-field instantly stripped a live, fully-trusted node's `servesModel` claim
-from its registry entry, with zero reputation calls made and no trace
-visible via `GET /nodes/:nodeId/reputation` (still `0/0`, `trusted: true`)
-— unclaiming a competitor from `/generate` routing for its real model in
-one HTTP call, cheaper and stealthier than the five-disagreement ejection
-vector above. This is a new consequence of Phase 3's own fix, not present
-before it: pre-Phase-3, re-registering someone else's endpoint minted a
-harmless duplicate entry under a different `nodeId` rather than overwriting
-the original. It does not let the attacker redirect traffic to themselves
-— the coordinator's `new URL().href` parsing already normalizes the *host*
-to lowercase before `stableNodeId()` ever sees it, so this overwrite can
-only clobber the record's other fields, never repoint where `/generate`
-actually sends the request — so it is a targeted denial/griefing primitive,
-not a token-capture one. **A fix for the endpoint-aliasing half of this is now being scoped as its
-own phase** (it was previously left open): aliasing is what makes both the
-reputation reset above and Phase C's launcher double-claim possible, and
-closing it — along with the overwrite gap — needs the same
-proof-of-endpoint-possession mechanism (e.g. node-supplied public-key
-identity) that was rejected as out of scope *for Security Phase 3*, not
-rejected permanently. Nothing is implemented yet; this paragraph will say
-what actually shipped once it has. Separately, the
+**The endpoint-aliasing gap above is now fixed by Endpoint Identity
+Hardening (done, live on `master`).** `stableNodeId()` used to hash only
+the lowercased endpoint *string*, so a single listening socket answered to
+unlimited alias strings for free — a node ejected while registered as
+`http://127.0.0.1:PORT` could re-register as `http://localhost:PORT` (same
+running server, same socket) and come back with a completely different
+`nodeId` and a clean `0/0, trusted: true` reputation record, verified live
+at the time. `POST /nodes/register` (see above) now **canonicalizes** the
+endpoint to a `resolvedHost:port` identity key before hashing — `127.0.0.1`
+/ `::1` / `0.0.0.0` / `localhost` (and IPv4-mapped-IPv6 spellings of
+`127.0.0.1`) collapse to one `loopback` identity, and a real hostname is
+DNS-resolved — and **verifies** the registration by calling the endpoint's
+own new `POST /identity` with a single-use nonce, storing what the
+endpoint itself reports rather than the caller's claim. A registration
+whose endpoint doesn't match an already-active entry for the same identity
+is rejected outright with `409`, naming the endpoint that's actually
+pinned, rather than silently reassigning it. Live-verified, including
+under real concurrency (this exact mechanism needed three whole-branch
+review rounds to get right — see `CLAUDE.md` for the two rounds of
+regressions caught and fixed along the way, the last being a genuine
+TOCTOU race: two registrations racing the same colliding identity could
+both pass the collision check before either had committed, closed by
+re-confirming the identity is still free immediately before the commit,
+with no `await` in between): re-registering under a loopback alias or a
+second DNS name pointed at the same machine no longer resets reputation,
+and the overwrite-by-known-endpoint griefing vector this section used to
+document (silently stripping a competitor's `servesModel` claim by
+re-registering its exact endpoint with the field omitted) is also closed
+as a side effect — `servesModel`/`deviceTier` are now endpoint-verified, so
+re-registering someone else's real endpoint just re-confirms the same
+truth the endpoint itself already reports, it cannot strip it. **Not fixed
+by this, and not intended to be — this is explicitly not Sybil
+resistance** (see the design doc's Non-Goals): a token-holder can still
+mint unlimited genuinely-distinct identities by registering different
+endpoints (different ports, different real machines) — canonicalization
+makes reputation-resetting *cost something* (a genuinely different,
+independently-verified endpoint) rather than being free and instant; it
+does not limit how many such endpoints one attacker can register in the
+first place. A squatter can also still win an identity by registering it
+*first*, before the legitimate owner ever tries — closing that needs
+proof-of-endpoint-possession (e.g. node-supplied public-key identity),
+which was considered and rejected for this phase specifically because
+there is no crypto library anywhere in `core/` (see `CLAUDE.md`); what this
+phase closes is a squat being silently *armed* by someone else's later,
+honest registration — the legitimate owner now gets a loud `409` naming
+the squatter's endpoint, never a `200` that quietly routes their traffic
+elsewhere. **Two new, narrower gaps this phase itself introduces, both
+live-verified during its third whole-branch review:** the identity key is
+`resolvedIP:port` with the URL scheme excluded, so two *genuinely
+different* machines sharing one resolved IP and port — the standard shape
+for two services behind one reverse proxy under different hostnames — now
+collapse into one identity too. For `POST /peers/register` this is a
+silent capacity loss, not a rejection: the second peer's registration
+returns `200` with a `peerId`, but is never added to `GET /peers` and its
+`/catalog` is never polled, quietly halving federated capacity with no
+error anywhere — a real cost for a project whose headline property is
+Mastodon-style federation across independently-run instances. For
+`POST /nodes/register` and `POST /launchers/register` it's the opposite
+failure mode: the second registration is hard-rejected with `409`, so two
+agents genuinely behind one name-based virtual host cannot both register.
+Separately, `http://` and `https://` on the same host:port are one
+identity by design (this phase deliberately excludes the scheme from the
+key), so an operator moving a node to TLS on the same port gets locked out
+with `409` until the old plaintext entry ages out (≤30s) — a real but
+minor operational surprise, not a security gap, worth knowing when
+migrating a node. Relatedly, an ejected node does not even need to
+re-register to come back: the reputation-mutating routes deliberately
+check the *unfiltered* node list rather than the reputation-filtered one
+(so an already-ejected node stays reachable for legitimate agree/disagree
+corrections), which also means any token-holder can rehabilitate an
+ejected node in place with 6 `POST /nodes/:nodeId/reputation/agree` calls,
+no re-registration involved — unaffected by this phase, still open.
+Separately, the
 disagreement ratio is still all-time with no decay or windowing, so an established node
 with a long good history (e.g. 200 agreements) still needs 200
 *consecutive* disagreements to be ejected — the inverse of catching a node
@@ -1033,18 +1149,25 @@ and `"garage-mesh"` produced 3 distinct nodeIds, all live simultaneously in
 same endpoint string under a new group now overwrites the previous
 registration instead of adding to it — a node can still claim any single
 group it likes under a given endpoint string, but can no longer occupy
-several groups under that same string at once. As with the reputation fix
-above, this is a per-endpoint-string guarantee, not a per-device one: the
-same physical node can still occupy several groups simultaneously by
-registering under aliases of itself (`127.0.0.1` vs `localhost` vs `[::1]`
-vs any other DNS name pointed at it), one group per alias — that gap is
-not closed by this phase. This matters because `GET /nodes/locality`
-exists as groundwork for a future pipeline assembler that will likely
-prefer larger or majority locality clusters when selecting nodes; the fix
-raises the cost of inflating a group's apparent size (from "one call per
-extra entry" to "one call per extra alias"), it does not close it. The
-base truthfulness gap remains open: a single false claim about which one
-group a node belongs to is still free and undetected.
+several groups under that same string at once. **Endpoint Identity
+Hardening has since closed the alias half of this too** (see "Known gaming
+vectors" above): identity is now keyed by a canonicalized `resolvedHost:port`,
+not the raw endpoint string, so `127.0.0.1` / `localhost` / `[::1]` / any
+other DNS name pointed at the same machine all collapse to the *same*
+identity — a physical node can no longer occupy several `localityGroup`s
+simultaneously by registering under aliases of itself, one alias no longer
+buys one extra group membership. `localityGroup` itself remains entirely
+unverified, and still stays whatever a legitimate re-registration under
+the exact same (now-canonical) identity last claimed — Endpoint Identity
+Hardening deliberately left `localityGroup` and `availableMemoryMb`
+caller-supplied (only `deviceTier`/`servesModel` became endpoint-verified;
+see `POST /nodes/register` above), since a node's own physical/network
+proximity has no analogous "ask the endpoint" verification the way
+"what model do you serve" does. The base truthfulness gap remains open: a
+single false claim about which one group a node belongs to is still free
+and undetected, and a token-holder can still mint a genuinely fresh
+identity (a different port, a different real machine) to claim yet another
+group — not Sybil resistance, by design (see above).
 Separately, a node can also register with `localityGroup: "ungrouped"`
 verbatim, which is indistinguishable from a node that never set the field
 at all. `GET /nodes/locality` exists purely as a stable, queryable

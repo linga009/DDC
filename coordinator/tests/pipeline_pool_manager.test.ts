@@ -183,6 +183,61 @@ test("runOnce assembles a fresh pipeline for a model with demand, an idle launch
   }
 });
 
+test("runOnce refuses to let a launcher-spawned driver silently adopt a squatter's pinned endpoint", async () => {
+  // Third whole-branch review, Critical finding: registry.register()
+  // (called directly here, bypassing POST /nodes/register's own collision
+  // check entirely) has its endpoint-pinning aimed the WRONG way for this
+  // one caller. driverEndpoint is derived from an already-verified
+  // LauncherRegistry entry, and POST /pipeline having just returned
+  // success means a real agent is listening there right now -- but an
+  // unrelated, earlier, attacker-controlled registration that happens to
+  // collide with this driver's canonical identity still kept ITS pinned
+  // endpoint before this fix, and the coordinator then treated that
+  // attacker endpoint as the freshly-spawned driver. Live-verified to hand
+  // a real user's prompt to the squatter with a 200 even though the
+  // launcher really did spawn an honest agent. Not possible on `master`
+  // (raw endpoint-string identity meant no collision could exist here at
+  // all) -- canonicalization creates the collision; the old pinning
+  // converted it into a hijack.
+  const launcherStub = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }]);
+    const registry = new NodeRegistry();
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+
+    // Squat the driver's identity FIRST, under an alias colliding with what
+    // launcherDriverEndpoint() will compute for this launcher
+    // (127.0.0.1:launcherStub.port, since this stub's own port doubles as
+    // its registered agentPort, same convention the test above uses).
+    const squatterEndpoint = `http://localhost:${launcherStub.port}`;
+    registry.register(squatterEndpoint, await canonicalizeEndpoint(squatterEndpoint), "desktop", undefined, "squatted-model");
+
+    const launcherRegistry = new LauncherRegistry();
+    launcherRegistry.register(launcherStub.endpoint, await canonicalizeEndpoint(launcherStub.endpoint), ["big-model"], launcherStub.port);
+    const demandTracker = new DemandTracker();
+    demandTracker.recordRequest("big-model");
+    const pipelineTracker = new PipelineTracker();
+
+    const manager = makeManager({ catalog, registry, launcherRegistry, demandTracker, pipelineTracker });
+    await manager.runOnce();
+
+    // The launcher was still called -- a real agent really did spawn --
+    // but registration of that driver must now fail loudly instead of
+    // silently landing on the squatter's pinned entry.
+    assert.equal(launcherStub.getPipelineCalls(), 1, "the launcher was still called -- the failure must happen at registration, after spawning, not before");
+    assert.equal(pipelineTracker.getPool("big-model").length, 0, "no pipeline may be tracked as warm when the driver's identity was squatted");
+
+    const active = registry.listActive();
+    assert.equal(active.length, 3, "no new entry may have been registered under the squatter's identity");
+    const squatted = active.find(n => n.endpoint === squatterEndpoint);
+    assert.ok(squatted, "the squatter's entry must still exist, completely untouched");
+    assert.equal(squatted?.servesModel, "squatted-model", "the squatter's entry must NOT have acquired the driver's servesModel");
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
 test("runOnce does nothing for a model with requiredNodeCount 1", async () => {
   const launcherStub = await startStubLauncher();
   try {

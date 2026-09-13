@@ -10,7 +10,7 @@ import { LauncherRegistry } from "./launcher_registry.ts";
 import { PipelineTracker } from "./pipeline_tracker.ts";
 import { selectPipeline } from "./pipeline_selector.ts";
 import { DemandTracker } from "./demand_tracker.ts";
-import { claimedLauncherIds, isLauncherClaimed, launcherDriverEndpoint, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
+import { assertDriverIdentityFree, claimedLauncherIds, isLauncherClaimed, launcherDriverEndpoint, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
 import { canonicalizeEndpoint } from "./endpoint_identity.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
@@ -628,6 +628,7 @@ async function assemblePipeline(
     // preflight trust check -- reused here, not rebuilt, so this
     // registration can never derive a different identity than the one
     // that was actually checked.
+    assertDriverIdentityFree(registry, driverIdentityKey, driverEndpoint);
     const driverNodeId = registry.register(driverEndpoint, driverIdentityKey, "desktop", undefined, modelId);
     // Replace whatever was tracked before with the freshly-assembled
     // pipeline rather than appending alongside a stale one. When the
@@ -831,6 +832,34 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
             return;
           }
         }
+        // Third whole-branch review, Critical finding, fixed here: the
+        // check above happens BEFORE the `await verifyNodeIdentity()` a few
+        // lines up -- a genuine TOCTOU window, up to IDENTITY_TIMEOUT_MS
+        // wide (an attacker can widen it further by stalling their own
+        // /identity response), during which a second, colliding
+        // registration can run this whole handler concurrently and commit
+        // first. Live-verified: with two callers racing a colliding
+        // identity, the loser's check above still read "nothing pinned yet"
+        // and sailed through to here, silently reproducing both of round
+        // 2's fixed bugs (a real agent's servesModel silently stripped; a
+        // victim's honest, verified registration written onto an
+        // attacker's endpoint, capturing real prompts) even with the first
+        // check in place -- 4 of 10 concurrent colliding registrations were
+        // silently absorbed per burst in testing. Re-reading the pinned
+        // endpoint here, synchronously, with no `await` between this check
+        // and registry.register() below, closes the window completely: two
+        // requests can still both pass the FIRST check (nothing pinned
+        // yet), but only one of them can ever reach this second check
+        // before the other's register() call has already committed, and
+        // Node's single-threaded event loop guarantees nothing can run
+        // between this check and that commit to reopen the gap.
+        const pinnedEndpointAtCommit = registry.listActive().find(n => n.nodeId === identityNodeId)?.endpoint;
+        if (pinnedEndpointAtCommit !== undefined && pinnedEndpointAtCommit !== normalizedNodeEndpoint) {
+          sendJson(res, 409, {
+            error: `this identity is already registered under a different endpoint (${pinnedEndpointAtCommit}) -- registration refused rather than silently reassigning it`,
+          });
+          return;
+        }
         const nodeId = registry.register(normalizedNodeEndpoint, identityKey, resolvedDeviceTier, localityGroup, resolvedServesModel, availableMemoryMb);
         sendJson(res, 200, { nodeId });
         return;
@@ -1023,6 +1052,29 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           verifiedLauncher = await verifyLauncherIdentity(normalizedLauncherEndpoint);
         } catch (err) {
           sendJson(res, 502, { error: err instanceof IdentityVerificationError ? err.message : "failed to verify this registration" });
+          return;
+        }
+        // Third whole-branch review, Critical finding, fixed here too --
+        // same TOCTOU window as POST /nodes/register's own fix above (see
+        // its much longer comment for the full reasoning and live
+        // reproduction), between the collision check above and the
+        // `await verifyLauncherIdentity()` a few lines up. Live-verified on
+        // this route specifically: a fast, honest launcher registration
+        // followed ~2.4s later by a slow, colliding attacker registration
+        // both returned 200, with the attacker's servesModels AND
+        // agentPort silently overwriting the honest launcher's entry --
+        // since launcherDriverEndpoint() is host:agentPort, an
+        // attacker-chosen agentPort on an otherwise-honest launcher's
+        // pinned entry means the coordinator spawns a real agent on the
+        // honest machine and then treats a DIFFERENT, attacker-controlled
+        // port as the driver. Re-reading the pinned endpoint here,
+        // synchronously, with no `await` before launcherRegistry.register()
+        // below, closes the window the same way.
+        const pinnedLauncherEndpointAtCommit = launcherRegistry.listActive().find(l => l.identityKey === launcherIdentityKey)?.endpoint;
+        if (pinnedLauncherEndpointAtCommit !== undefined && pinnedLauncherEndpointAtCommit !== normalizedLauncherEndpoint) {
+          sendJson(res, 409, {
+            error: `this identity is already registered under a different endpoint (${pinnedLauncherEndpointAtCommit}) -- registration refused rather than silently reassigning it`,
+          });
           return;
         }
         const launcherId = launcherRegistry.register(normalizedLauncherEndpoint, launcherIdentityKey, candidate.servesModels as string[], verifiedLauncher.agentPort);

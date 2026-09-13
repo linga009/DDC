@@ -74,8 +74,10 @@ export class NodeRegistry {
   // resolve together) without this method also being taught that a
   // DIFFERENT endpoint string can now legitimately collide.
   //
-  // This pinning is defense-in-depth, not the primary defense.
-  // Two whole-branch review rounds are the reason for that split:
+  // This pinning is defense-in-depth, not the primary defense. THREE
+  // whole-branch review rounds are the reason for that split -- each one
+  // found the previous round's fix had patched the location a symptom was
+  // observed rather than the actual mechanism:
   // - Round 1 pinned `endpoint` here (this code) so a colliding
   //   registration could never overwrite it directly, matching the
   //   pattern LauncherRegistry.register()/PeerRegistry.register() already
@@ -83,23 +85,30 @@ export class NodeRegistry {
   //   either).
   // - Round 2 found that pinning alone was not enough: server.ts's
   //   /nodes/register route still let a colliding registration reach
-  //   verifyNodeIdentity() and this method at all. verifyNodeIdentity()
-  //   verifies whichever endpoint the CALLER submitted -- on a collision,
-  //   NOT the endpoint already pinned here -- and its result was then
-  //   written onto the PINNED entry regardless. Live-verified: an
-  //   attacker pre-registers a placeholder under an alias, pinning their
-  //   OWN endpoint; the real owner's later, genuinely successful,
-  //   correctly-verified registration then had ITS verified fields
-  //   written onto the ATTACKER's pinned endpoint, arming a full
-  //   prompt-capture hijack with the victim's own honest data. The real
-  //   fix is in server.ts's route handler: a registration whose endpoint
-  //   does not match an already-ACTIVE entry for the same identity is now
-  //   rejected outright (409) BEFORE it ever reaches verifyNodeIdentity()
-  //   or this method -- see that route's own, much longer comment. This
-  //   method's own pinning below remains as a second layer for any other
-  //   caller of register() (the launcher-spawned internal driver
-  //   registrations in assemblePipeline()/tryAssemble() call this
-  //   directly, bypassing the HTTP route's check entirely).
+  //   verifyNodeIdentity() and this method at all. The fix: a registration
+  //   whose endpoint does not match an already-ACTIVE entry for the same
+  //   identity is rejected outright (409) BEFORE it ever reaches
+  //   verifyNodeIdentity() or this method.
+  // - Round 3 found that check itself had a TOCTOU gap -- it ran before
+  //   `await verifyNodeIdentity()`, so a second, colliding registration
+  //   could race through the same window and commit first. Fixed by
+  //   re-checking synchronously, with no `await` between the re-check and
+  //   register(), directly in the route handler -- see its comment.
+  //   Round 3 also found this method's pinning ACTIVELY HARMFUL for one
+  //   caller: the launcher-spawned internal driver registrations in
+  //   server.ts's assemblePipeline() and pipeline_pool_manager.ts's
+  //   tryAssemble() call this method directly, bypassing every one of the
+  //   HTTP route's checks above -- and for THEM, the pinning below meant a
+  //   squatter's earlier, unrelated registration silently kept its pinned
+  //   endpoint instead of the driver's real one, live-verified to hand a
+  //   real user's prompt to the squatter with a 200. Both call sites now
+  //   guard themselves with pipeline_pool_manager.ts's
+  //   assertDriverIdentityFree() immediately before calling register()
+  //   here, refusing the assembly attempt outright on a collision instead
+  //   of relying on (or being undermined by) this method's own pinning.
+  //   This method's pinning below remains in place as a fallback for any
+  //   future direct caller that does NOT have its own pre-commit check --
+  //   it is not, and should not be assumed to be, sufficient on its own.
   //
   // localityGroup/availableMemoryMb remain exactly as disclosed already
   // (Security Phase 3): still overwritable by anyone who can trigger a
