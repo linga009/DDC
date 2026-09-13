@@ -59,6 +59,16 @@ function uniqueCategories(categories: unknown[]): string[] {
 
 class JsonParseError extends Error {}
 
+// Thrown by verifyNodeIdentity()/verifyLauncherIdentity() below for every
+// way the POST /identity callback can fail -- unreachable, timed out, a
+// non-2xx status, an unparseable body, a mismatched nonce, or a
+// malformed/missing required field in the answer. All of these map to the
+// same 502 status (this project's established convention: a downstream
+// dependency failing, not the caller's own request being malformed), but
+// with a message naming which one actually happened -- see this class's
+// call sites in the two register routes.
+class IdentityVerificationError extends Error {}
+
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
@@ -123,6 +133,7 @@ const CLASSIFY_TIMEOUT_MS = 2000;
 const DEFAULT_N_PREDICT = 64;
 const MAX_N_PREDICT = 512;
 const GENERATE_TIMEOUT_MS = 120000;
+const IDENTITY_TIMEOUT_MS = 5000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -132,6 +143,105 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
       (err) => { clearTimeout(timer); reject(err); },
     );
   });
+}
+
+// Endpoint Identity Hardening: verifies a POST /nodes/register request by
+// asking the endpoint itself what it serves, rather than trusting the
+// caller's claim. A single-use nonce (regenerated on every call, never
+// reused) is what proves this specific response came from a live
+// round-trip to this endpoint right now, not a cached, forged, or replayed
+// one. Only deviceTier/servesModel come from here -- localityGroup and
+// availableMemoryMb stay caller-supplied and unverified (the agent has no
+// notion of either), matching the design doc's own per-field table.
+//
+// Deliberately NOT used for the launcher-spawned internal driver
+// registrations in assemblePipeline()/tryAssemble(): the coordinator just
+// told a launcher to spawn that agent, which may not be listening yet, so
+// calling this there would fail spuriously on a live, correct spawn. Only
+// the PUBLIC POST /nodes/register route (an operator registering a node
+// they claim already exists) calls this.
+async function verifyNodeIdentity(endpoint: string, authToken: string, catalog: ModelCatalog): Promise<{ deviceTier: DeviceTier; servesModel?: string }> {
+  const nonce = randomUUID();
+  let res: Response;
+  try {
+    res = await fetch(`${endpoint}/identity`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${authToken}` },
+      body: JSON.stringify({ nonce }),
+      signal: AbortSignal.timeout(IDENTITY_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new IdentityVerificationError(
+      `could not reach ${endpoint}/identity to verify this registration: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!res.ok) {
+    throw new IdentityVerificationError(`${endpoint}/identity responded with status ${res.status} -- registration could not be verified`);
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new IdentityVerificationError(`${endpoint}/identity did not return valid JSON -- registration could not be verified`);
+  }
+  const candidate = body as Record<string, unknown>;
+  if (candidate.nonce !== nonce) {
+    throw new IdentityVerificationError(`${endpoint}/identity returned a mismatched nonce -- registration could not be verified`);
+  }
+  if (typeof candidate.deviceTier !== "string" || !VALID_DEVICE_TIERS.includes(candidate.deviceTier as DeviceTier)) {
+    throw new IdentityVerificationError(`${endpoint}/identity did not report a valid deviceTier`);
+  }
+  // A servesModel the agent reports but this coordinator's catalog doesn't
+  // recognise is treated as "doesn't serve anything (yet)" rather than
+  // failing the whole registration -- an agent's config drifting from this
+  // coordinator's catalog is an operational mismatch to route around, not
+  // a reason to make the node entirely unregisterable. Same leniency this
+  // route already applied to the (now-ignored) caller-supplied field.
+  const servesModel = typeof candidate.servesModel === "string" && catalog.hasModel(candidate.servesModel)
+    ? candidate.servesModel
+    : undefined;
+  return { deviceTier: candidate.deviceTier as DeviceTier, servesModel };
+}
+
+// Launcher counterpart of verifyNodeIdentity() above. No Authorization
+// header -- matching every other outbound call this coordinator makes to
+// a launcher (POST /pipeline, DELETE /pipeline): a swarm-launcher's own
+// /identity route deliberately has no auth check at all (its trust
+// boundary is HttpServer's 127.0.0.1-only bind), so sending one here would
+// be inconsistent with how this coordinator treats every other launcher
+// route. Only agentPort is confirmed -- servesModels stays caller-supplied
+// and unverified, since a launcher has no fixed answer to "what do you
+// serve" the way a running agent does (see design doc's per-field table).
+async function verifyLauncherIdentity(endpoint: string): Promise<{ agentPort: number }> {
+  const nonce = randomUUID();
+  let res: Response;
+  try {
+    res = await fetch(`${endpoint}/identity`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ nonce }),
+      signal: AbortSignal.timeout(IDENTITY_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new IdentityVerificationError(
+      `could not reach ${endpoint}/identity to verify this registration: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!res.ok) {
+    throw new IdentityVerificationError(`${endpoint}/identity responded with status ${res.status} -- registration could not be verified`);
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new IdentityVerificationError(`${endpoint}/identity did not return valid JSON -- registration could not be verified`);
+  }
+  const candidate = body as Record<string, unknown>;
+  if (candidate.nonce !== nonce) {
+    throw new IdentityVerificationError(`${endpoint}/identity returned a mismatched nonce -- registration could not be verified`);
+  }
+  if (typeof candidate.agentPort !== "number" || !Number.isInteger(candidate.agentPort) || candidate.agentPort < 1) {
+    throw new IdentityVerificationError(`${endpoint}/identity did not report a valid agentPort`);
+  }
+  return { agentPort: candidate.agentPort };
 }
 
 async function fetchPeerCapacity(endpoint: string, authToken: string): Promise<number> {
@@ -551,7 +661,22 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           availableMemoryMb = candidate.availableMemoryMb;
         }
         const identityKey = await canonicalizeEndpoint(normalizedNodeEndpoint);
-        const nodeId = registry.register(normalizedNodeEndpoint, identityKey, candidate.deviceTier as DeviceTier, localityGroup, servesModel, availableMemoryMb);
+        // Endpoint Identity Hardening: everything above this line validates
+        // the CALLER's request shape, unchanged from before this phase --
+        // still 400 on a malformed body. What happens next is new: the
+        // caller's deviceTier/servesModel claims above are discarded, not
+        // stored. Whatever the endpoint itself reports via POST /identity
+        // is what gets registered, closing the griefing primitive where any
+        // token-holder who knows a node's endpoint could silently strip its
+        // servesModel by re-registering it with none.
+        let verified: { deviceTier: DeviceTier; servesModel?: string };
+        try {
+          verified = await verifyNodeIdentity(normalizedNodeEndpoint, authToken, catalog);
+        } catch (err) {
+          sendJson(res, 502, { error: err instanceof IdentityVerificationError ? err.message : "failed to verify this registration" });
+          return;
+        }
+        const nodeId = registry.register(normalizedNodeEndpoint, identityKey, verified.deviceTier, localityGroup, verified.servesModel, availableMemoryMb);
         sendJson(res, 200, { nodeId });
         return;
       }
@@ -662,6 +787,15 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         // URL that silently 404s, and would let the same instance register
         // twice (with and without the slash) and double-count its capacity.
         const normalizedEndpoint = parsedEndpoint.href.replace(/\/$/, "");
+        // Deliberate asymmetry with POST /nodes/register and POST
+        // /launchers/register just above and below: there is no
+        // endpoint-authoritative verification here, and none is added by
+        // Endpoint Identity Hardening. A peer is another COORDINATOR, not a
+        // swarm-node-agent/swarm-launcher -- it has no POST /identity route
+        // to call, and inventing one would mean designing and securing a
+        // coordinator-to-coordinator identity protocol, which is a
+        // materially different problem from asking a single-purpose agent
+        // what it serves. Out of scope for this phase; see README.
         const peerId = peers.register(normalizedEndpoint);
         sendJson(res, 200, { peerId });
         return;
@@ -705,7 +839,18 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           return;
         }
         const launcherIdentityKey = await canonicalizeEndpoint(normalizedLauncherEndpoint);
-        const launcherId = launcherRegistry.register(normalizedLauncherEndpoint, launcherIdentityKey, candidate.servesModels as string[], candidate.agentPort);
+        // Only agentPort is confirmed against the launcher itself --
+        // servesModels stays exactly as the caller supplied it above,
+        // unverified, since a launcher has no fixed answer to "what do you
+        // serve" (see verifyLauncherIdentity()'s own comment).
+        let verifiedLauncher: { agentPort: number };
+        try {
+          verifiedLauncher = await verifyLauncherIdentity(normalizedLauncherEndpoint);
+        } catch (err) {
+          sendJson(res, 502, { error: err instanceof IdentityVerificationError ? err.message : "failed to verify this registration" });
+          return;
+        }
+        const launcherId = launcherRegistry.register(normalizedLauncherEndpoint, launcherIdentityKey, candidate.servesModels as string[], verifiedLauncher.agentPort);
         sendJson(res, 200, { launcherId });
         return;
       }

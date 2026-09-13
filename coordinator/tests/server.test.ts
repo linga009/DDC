@@ -57,6 +57,60 @@ function authFetch(url: string, options: RequestInit = {}, token: string = TEST_
   });
 }
 
+// Endpoint Identity Hardening: POST /nodes/register and POST
+// /launchers/register now verify a registration by calling the endpoint's
+// own POST /identity, so a caller-supplied endpoint must genuinely be
+// listening. This file's tests were written before that requirement and
+// overwhelmingly hardcode a small, fixed set of dead ports as pure
+// bookkeeping values (http://127.0.0.1:50052/50053 for nodes,
+// http://127.0.0.1:9000 for launchers) -- rewriting every one of those
+// dozens of literal-endpoint assertions to a dynamically-allocated stub
+// port would be a far larger, purely mechanical diff for no behavioral
+// gain, since none of these tests cares what real agent/launcher sits
+// behind the endpoint. Instead, these three fixed ports are made genuinely
+// live for the whole file's run -- the same fixed-port-fixture convention
+// this project's own C++ test fixtures already use throughout
+// (core/tests/launcher_test.cpp's kLauncherPort/kAgentPort, etc.), applied
+// here for the first time on the TypeScript side because this is the
+// first TypeScript test suite where an endpoint's bookkeeping value and
+// its real reachability stopped being independent facts.
+//
+// None of these three ports is ever asserted to be UNREACHABLE by any
+// test in this file (verified before adding this) -- the tests that
+// deliberately register an unreachable node use port 1 instead, and
+// register it via registry.register() directly rather than through this
+// verified HTTP route, since simulating "a node that went unreachable
+// after registering" has nothing to do with THIS phase's registration-time
+// verification.
+function startPermanentIdentityStub(port: number, kind: "node" | "launcher", answer: Record<string, unknown>): void {
+  const server = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    if (req.url === "/identity") {
+      const candidate = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}") as Record<string, unknown>;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: candidate.nonce, ...answer }));
+      return;
+    }
+    // Nothing in this file exercises any other route (POST /complete,
+    // POST /pipeline) on one of these three fixed-port stubs -- every test
+    // that needs real agent/launcher behavior uses a dynamically-allocated
+    // stub instead (startStubNodeAgent, startStubLauncher, or an inline
+    // one). A 404 here would be a loud signal that assumption stopped
+    // holding.
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: `this fixed-port identity stub (kind: ${kind}) only answers POST /identity` }));
+  });
+  // unref() so this file's own test process can still exit naturally once
+  // its real work is done, rather than being kept alive forever by three
+  // servers nothing is ever explicitly told to close.
+  server.listen(port).unref();
+}
+
+startPermanentIdentityStub(50052, "node", { deviceTier: "desktop" });
+startPermanentIdentityStub(50053, "node", { deviceTier: "desktop" });
+startPermanentIdentityStub(9000, "launcher", { agentPort: 8090 });
+
 test("selectNode returns undefined when no candidate matches the requested model", async () => {
   const reputation = new ReputationTracker();
   const nodes: NodeInfo[] = [
@@ -277,6 +331,139 @@ test("POST /nodes/register returns a nodeId and the node appears in the catalog'
     assert.equal(smallModel.available, true); // 1 active node, threshold is 1
   } finally {
     server.close();
+  }
+});
+
+// Endpoint Identity Hardening: POST /nodes/register now verifies a
+// registration by calling the endpoint itself via POST /identity with a
+// single-use nonce, rather than trusting the caller's claim. These four
+// tests exercise that mechanism directly, against real running stub
+// servers -- not by inspecting server.ts's internals.
+
+test("POST /nodes/register returns 502 when the endpoint answers /identity with the wrong nonce", async () => {
+  // Deliberately echoes back a DIFFERENT nonce than it was sent --
+  // simulating either a broken agent or a genuine replay/forgery attempt.
+  const wrongNonceStub = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain -- the real nonce is ignored on purpose */ }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ nonce: "not-the-nonce-that-was-sent", deviceTier: "desktop" }));
+  });
+  await new Promise<void>(resolve => wrongNonceStub.listen(0, resolve));
+  const address = wrongNonceStub.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected wrong-nonce stub to bind a port");
+  }
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${address.port}`, deviceTier: "desktop" }),
+    });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.match(body.error, /nonce/i);
+  } finally {
+    server.close();
+    wrongNonceStub.close();
+  }
+});
+
+test("POST /nodes/register returns 502 when the endpoint 404s on /identity (an old agent without this route)", async () => {
+  // Simulates a real, pre-Endpoint-Identity-Hardening swarm-node-agent:
+  // reachable, answers everything else, but has no POST /identity route at
+  // all -- HttpServer's own default-404 behavior for an unregistered
+  // (method, path) pair.
+  const oldAgentStub = createHttpServer((req, res) => {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not found" }));
+  });
+  await new Promise<void>(resolve => oldAgentStub.listen(0, resolve));
+  const address = oldAgentStub.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected old-agent stub to bind a port");
+  }
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${address.port}`, deviceTier: "desktop" }),
+    });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.match(body.error, /404|status/i);
+  } finally {
+    server.close();
+    oldAgentStub.close();
+  }
+});
+
+test("POST /nodes/register returns 502 when the endpoint never answers /identity (hangs past the timeout)", async () => {
+  const hangingStub = createHttpServer(async (req) => {
+    for await (const _chunk of req) { /* drain, then never respond */ }
+    // No res.end() -- the connection is simply left open.
+  });
+  await new Promise<void>(resolve => hangingStub.listen(0, resolve));
+  const address = hangingStub.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected hanging stub to bind a port");
+  }
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const start = Date.now();
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${address.port}`, deviceTier: "desktop" }),
+    });
+    const elapsedMs = Date.now() - start;
+    assert.equal(res.status, 502);
+    // The 5s IDENTITY_TIMEOUT_MS bound must actually be enforced, not just
+    // documented -- generous upper bound to avoid flakiness on a loaded
+    // machine, matching this project's established "assert the
+    // qualitative claim with margin" timing-test convention.
+    assert.ok(elapsedMs < 15000, `registration took ${elapsedMs}ms -- the 5s identity timeout does not appear to be enforced`);
+  } finally {
+    server.close();
+    hangingStub.close();
+  }
+});
+
+test("POST /nodes/register cannot be used to strip a live node's servesModel -- the endpoint's own answer wins", async () => {
+  // The griefing primitive this phase closes: before Endpoint Identity
+  // Hardening, any token-holder who knew a node's endpoint could silently
+  // strip its servesModel by re-registering that endpoint with none, since
+  // the caller's claim was trusted outright. Now the coordinator asks the
+  // endpoint itself, so a third party's "attacking" re-registration is a
+  // no-op -- it can only ever learn/confirm the node's real, unchanged
+  // servesModel, never overwrite it with something false.
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: {} }), { deviceTier: "desktop", servesModel: "tinyllama-1.1b" });
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    // The "attack": re-register the SAME endpoint with no servesModel at
+    // all, exactly the one-call strip that was live-verified possible
+    // against NodeRegistry's own overwrite-on-register semantics before
+    // this phase (see Security Phase 3's disclosed gaming vector).
+    const attackRes = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop" }),
+    });
+    assert.equal(attackRes.status, 200);
+
+    const nodes = await (await authFetch(`${baseUrl}/nodes`)).json();
+    assert.equal(nodes.length, 1);
+    assert.equal(nodes[0].servesModel, "tinyllama-1.1b", "the node's real servesModel must survive an attempted strip, reported by the endpoint itself");
+  } finally {
+    server.close();
+    stub.server.close();
   }
 });
 
@@ -875,7 +1062,7 @@ test("POST /generate for a requiredNodeCount>1 model with no tracked pipeline an
 });
 
 test("POST /generate for a requiredNodeCount>1 model with a stale tracked pipeline and no launcher falls back to manual registration", async () => {
-  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "from the manually registered node" } }));
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: { text: "from the manually registered node" } }), { deviceTier: "desktop", servesModel: "big-model" });
   const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
   const { server, baseUrl, registry, pipelineTracker } = await startTestServer(bigCatalog);
   try {
@@ -2554,11 +2741,30 @@ test("every path+method documented in openapi.json resolves to a real route (not
 // /generate's routing logic without a real C++ process or model -- the
 // real cross-language path is covered separately by the opt-in e2e test
 // (Task 3), not here.
-async function startStubNodeAgent(handler: (body: unknown) => { status: number; body: unknown }) {
+// `identity` configures how this stub answers the coordinator's own POST
+// /identity verification callback (Endpoint Identity Hardening) -- every
+// caller of this helper that goes on to register the stub's endpoint via
+// the real POST /nodes/register route needs this answered, or that
+// registration now fails with a 502. Defaults match this file's own
+// dominant real-world case ({desktop, tinyllama-1.1b}); override per-test
+// when a test's assertions expect something else reflected back via
+// GET /nodes. This is answered centrally, BEFORE `handler` ever sees the
+// request, so `handler` (meant for /complete-shaped bodies) is never
+// confused by a bare {nonce} body it doesn't understand.
+async function startStubNodeAgent(
+  handler: (body: unknown) => { status: number; body: unknown },
+  identity: { deviceTier?: string; servesModel?: string } = { deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
+) {
   const server = createHttpServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
     const body = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
+    if (req.url === "/identity") {
+      const candidate = body as Record<string, unknown>;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: candidate.nonce, deviceTier: identity.deviceTier, servesModel: identity.servesModel }));
+      return;
+    }
     const { status, body: responseBody } = handler(body);
     res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify(responseBody));
@@ -2567,6 +2773,39 @@ async function startStubNodeAgent(handler: (body: unknown) => { status: number; 
   const address = server.address();
   if (address === null || typeof address === "string") {
     throw new Error("expected stub node agent to bind to a port");
+  }
+  return { server, endpoint: `http://127.0.0.1:${address.port}` };
+}
+
+// Minimal stand-in for a real swarm-node-agent/swarm-launcher, used ONLY to
+// answer the coordinator's own POST /identity verification callback --
+// for tests that need a registration to actually succeed but never
+// exercise any other route on the "agent"/"launcher" (POST /complete,
+// POST /pipeline, ...). `kind: "node"` answers {nonce, deviceTier,
+// servesModel}; `kind: "launcher"` answers {nonce, agentPort}.
+async function startIdentityStub(
+  kind: "node",
+  opts?: { deviceTier?: string; servesModel?: string },
+): Promise<{ server: ReturnType<typeof createHttpServer>; endpoint: string }>;
+async function startIdentityStub(
+  kind: "launcher",
+  opts?: { agentPort?: number },
+): Promise<{ server: ReturnType<typeof createHttpServer>; endpoint: string }>;
+async function startIdentityStub(kind: "node" | "launcher", opts: Record<string, unknown> = {}) {
+  const server = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}") as Record<string, unknown>;
+    const answer = kind === "node"
+      ? { nonce: body.nonce, deviceTier: opts.deviceTier ?? "desktop", servesModel: opts.servesModel }
+      : { nonce: body.nonce, agentPort: opts.agentPort ?? 8090 };
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(answer));
+  });
+  await new Promise<void>(resolve => server.listen(0, resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected identity stub to bind to a port");
   }
   return { server, endpoint: `http://127.0.0.1:${address.port}` };
 }
@@ -2581,7 +2820,19 @@ async function startStubNodeAgent(handler: (body: unknown) => { status: number; 
 // wire shape Task 5 depends on.
 async function startStreamingStubNodeAgent(chunks: string[], delayMs = 20) {
   const server = createHttpServer(async (req, res) => {
-    for await (const _chunk of req) { /* drain the request body */ }
+    const bodyChunks: Buffer[] = [];
+    for await (const chunk of req) bodyChunks.push(chunk as Buffer);
+    // Same reasoning as startStubNodeAgent's own identity handling: this
+    // stub's endpoint gets registered via the real POST /nodes/register
+    // route, which now verifies it via POST /identity before anything
+    // else. Every OTHER path this stub receives is a real /complete
+    // streaming request, unaffected.
+    if (req.url === "/identity") {
+      const candidate = JSON.parse(Buffer.concat(bodyChunks).toString("utf-8") || "{}") as Record<string, unknown>;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: candidate.nonce, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }));
+      return;
+    }
     res.writeHead(200, { "content-type": "text/event-stream" });
     for (const chunk of chunks) {
       res.write(`data: ${chunk}\n\n`);
@@ -2679,13 +2930,16 @@ test("POST /generate returns 503 when no active node serves the requested model"
 });
 
 test("POST /generate returns 502 when the selected node is unreachable", async () => {
-  const { server, baseUrl } = await startTestServer();
+  const { server, baseUrl, registry } = await startTestServer();
   try {
-    await authFetch(`${baseUrl}/nodes/register`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "http://127.0.0.1:1", deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
-    });
+    // Registered directly via NodeRegistry, not the real POST
+    // /nodes/register route: this simulates a node that WAS reachable
+    // (registration succeeded) and has since gone dark before /generate
+    // tries to reach it, which has nothing to do with Endpoint Identity
+    // Hardening's registration-time verification -- port 1 was never
+    // meant to be a real listener here, only an address /generate's own
+    // outbound fetch will fail to connect to.
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop", undefined, "tinyllama-1.1b");
 
     const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
@@ -2909,13 +3163,13 @@ test("POST /generate with stream:true still classifies the prompt before contact
 });
 
 test("POST /generate with stream:true returns a normal 502 when the selected node is unreachable", async () => {
-  const { server, baseUrl } = await startTestServer();
+  const { server, baseUrl, registry } = await startTestServer();
   try {
-    await authFetch(`${baseUrl}/nodes/register`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: "http://127.0.0.1:1", deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
-    });
+    // Same reasoning as the non-streaming sibling test above: registered
+    // directly, simulating a node that went dark after a real
+    // registration, not exercising Endpoint Identity Hardening's
+    // registration-time verification.
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop", undefined, "tinyllama-1.1b");
 
     const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
@@ -2969,6 +3223,14 @@ test("POST /generate with stream:true relays a node's SSE response even with a m
   // content-type check must not itself become a false-positive 502 for a
   // node that is behaving correctly.
   const server = createHttpServer(async (req, res) => {
+    if (req.url === "/identity") {
+      const identityChunks: Buffer[] = [];
+      for await (const chunk of req) identityChunks.push(chunk as Buffer);
+      const identityCandidate = JSON.parse(Buffer.concat(identityChunks).toString("utf-8") || "{}") as Record<string, unknown>;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: identityCandidate.nonce, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }));
+      return;
+    }
     for await (const _chunk of req) { /* drain */ }
     res.writeHead(200, { "content-type": "Text/Event-Stream" });
     res.write("data: hi\n\n");
@@ -3307,6 +3569,15 @@ test("POST /v1/chat/completions with stream:true consumes the node's usage frame
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
     capturedNodeRequest = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
+    if (req.url === "/identity") {
+      // This was the coordinator's own POST /identity verification call,
+      // not a real /complete forward -- answer it directly and don't let
+      // it overwrite capturedNodeRequest for this test's own assertions.
+      const identityCandidate = capturedNodeRequest as Record<string, unknown>;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: identityCandidate.nonce, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }));
+      return;
+    }
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write("data: Par\n\n");
     res.write("data: is\n\n");
@@ -3377,6 +3648,14 @@ test("POST /v1/chat/completions with stream:true survives a malformed usage fram
   // (buggy or hostile agent build) must not throw uncaught inside the relay
   // loop and truncate an otherwise-complete stream.
   const usageStub = createHttpServer(async (req, res) => {
+    if (req.url === "/identity") {
+      const identityChunks: Buffer[] = [];
+      for await (const chunk of req) identityChunks.push(chunk as Buffer);
+      const identityCandidate = JSON.parse(Buffer.concat(identityChunks).toString("utf-8") || "{}") as Record<string, unknown>;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: identityCandidate.nonce, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }));
+      return;
+    }
     for await (const _chunk of req) { /* drain */ }
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write("data: Par\n\n");
@@ -3447,6 +3726,15 @@ test("POST /v1/chat/completions with stream:true omits the trailing usage chunk 
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
     capturedNodeRequest = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
+    if (req.url === "/identity") {
+      // This was the coordinator's own POST /identity verification call,
+      // not a real /complete forward -- answer it directly and don't let
+      // it overwrite capturedNodeRequest for this test's own assertions.
+      const identityCandidate = capturedNodeRequest as Record<string, unknown>;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: identityCandidate.nonce, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }));
+      return;
+    }
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write("data: Par\n\n");
     res.write('event: usage\ndata: {"prompt_tokens":7,"completion_tokens":1,"finish_reason":"length"}\n\n');
@@ -3508,6 +3796,14 @@ test("POST /v1/chat/completions with stream:true drops an unrecognized named eve
   // never silently become visible content). Only a plain data-only frame
   // (frame.event === undefined) is real generated text.
   const metricsStub = createHttpServer(async (req, res) => {
+    if (req.url === "/identity") {
+      const identityChunks: Buffer[] = [];
+      for await (const chunk of req) identityChunks.push(chunk as Buffer);
+      const identityCandidate = JSON.parse(Buffer.concat(identityChunks).toString("utf-8") || "{}") as Record<string, unknown>;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: identityCandidate.nonce, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }));
+      return;
+    }
     for await (const _chunk of req) { /* drain */ }
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write("data: Hello\n\n");
@@ -3560,6 +3856,14 @@ test("POST /v1/chat/completions with stream:true relays a node's mid-stream erro
   // {error: {message, type, code}} envelope rather than passing it through
   // raw, since an OpenAI client parses that shape.
   const erroringStub = createHttpServer(async (req, res) => {
+    if (req.url === "/identity") {
+      const identityChunks: Buffer[] = [];
+      for await (const chunk of req) identityChunks.push(chunk as Buffer);
+      const identityCandidate = JSON.parse(Buffer.concat(identityChunks).toString("utf-8") || "{}") as Record<string, unknown>;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: identityCandidate.nonce, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }));
+      return;
+    }
     for await (const _chunk of req) { /* drain */ }
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write("data: Par\n\n");
@@ -3624,6 +3928,14 @@ test("POST /v1/chat/completions with stream:true ends the connection without [DO
   // shape from the mid-stream "event: error" frame, which is relayed as an
   // OpenAI-shaped error frame instead.
   const truncatingStub = createHttpServer(async (req, res) => {
+    if (req.url === "/identity") {
+      const identityChunks: Buffer[] = [];
+      for await (const chunk of req) identityChunks.push(chunk as Buffer);
+      const identityCandidate = JSON.parse(Buffer.concat(identityChunks).toString("utf-8") || "{}") as Record<string, unknown>;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: identityCandidate.nonce, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }));
+      return;
+    }
     for await (const _chunk of req) { /* drain */ }
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write("data: Par\n\n");

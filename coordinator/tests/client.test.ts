@@ -27,11 +27,27 @@ async function startTestServer() {
   return { server, baseUrl };
 }
 
-async function startStubNodeAgent(handler: (body: unknown) => { status: number; body: unknown }) {
+// `identity` configures how this stub answers the coordinator's own POST
+// /identity verification callback (Endpoint Identity Hardening) -- every
+// caller that registers this stub's endpoint via the real
+// SwarmClient.registerNode()/POST /nodes/register needs this answered, or
+// registration now fails with a 502. Answered centrally, BEFORE `handler`
+// ever sees the request, matching coordinator/tests/server.test.ts's own
+// identical fix for the same reason.
+async function startStubNodeAgent(
+  handler: (body: unknown) => { status: number; body: unknown },
+  identity: { deviceTier?: string; servesModel?: string } = { deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
+) {
   const server = createHttpServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
     const body = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
+    if (req.url === "/identity") {
+      const candidate = body as Record<string, unknown>;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: candidate.nonce, deviceTier: identity.deviceTier, servesModel: identity.servesModel }));
+      return;
+    }
     const { status, body: responseBody } = handler(body);
     res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify(responseBody));
@@ -43,6 +59,29 @@ async function startStubNodeAgent(handler: (body: unknown) => { status: number; 
   }
   return { server, endpoint: `http://127.0.0.1:${address.port}` };
 }
+
+// Endpoint Identity Hardening: same reasoning and convention as
+// coordinator/tests/server.test.ts's own startPermanentIdentityStub --
+// this file's tests overwhelmingly hardcode http://127.0.0.1:50052 as a
+// pure bookkeeping value that has never needed to be reachable before.
+// None of this file's tests asserts this port is unreachable.
+function startPermanentIdentityStub(port: number, answer: Record<string, unknown>): void {
+  const server = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    if (req.url === "/identity") {
+      const candidate = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}") as Record<string, unknown>;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: candidate.nonce, ...answer }));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "this fixed-port identity stub only answers POST /identity" }));
+  });
+  server.listen(port).unref();
+}
+
+startPermanentIdentityStub(50052, { deviceTier: "desktop" });
 
 test("SwarmClient sends the configured auth token on every request", async () => {
   let receivedAuth: string | null = null;
@@ -235,15 +274,21 @@ test("SwarmClient.registerNode rejects with the server's error detail on a 400",
 });
 
 test("SwarmClient.registerNode accepts an optional servesModel", async () => {
+  // Not the shared fixed-port stub -- that one answers with no servesModel,
+  // which is what most tests in this file want, but this test needs one
+  // reflected. A dedicated stub configured for it avoids the two pulling
+  // in different directions.
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: {} }), { deviceTier: "desktop", servesModel: "tinyllama-1.1b" });
   const { server, baseUrl } = await startTestServer();
   try {
     const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
-    const nodeId = await client.registerNode("http://127.0.0.1:50052", "desktop", undefined, "tinyllama-1.1b");
+    const nodeId = await client.registerNode(stub.endpoint, "desktop", undefined, "tinyllama-1.1b");
     const nodes = await client.listNodes();
     assert.equal((nodes as { nodeId: string; servesModel?: string }[])[0].servesModel, "tinyllama-1.1b");
     assert.equal(typeof nodeId, "string");
   } finally {
     server.close();
+    stub.server.close();
   }
 });
 
