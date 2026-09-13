@@ -82,6 +82,15 @@ function authFetch(url: string, options: RequestInit = {}, token: string = TEST_
 // verified HTTP route, since simulating "a node that went unreachable
 // after registering" has nothing to do with THIS phase's registration-time
 // verification.
+// Whole-branch review, Important finding, fixed here: this used to
+// server.listen(port) with no host (binding EVERY interface, not just
+// loopback -- visible on the LAN for the life of the test process) and no
+// 'error' handler, so a real EADDRINUSE (this exact port, hit by another
+// concurrently-running test file that happened to pick the same number --
+// client.test.ts genuinely did) surfaced as an uncaught exception that
+// could crash the whole file's run rather than a clear, attributable
+// failure. Explicit 127.0.0.1 binding plus a loud, named error keep this
+// contained to this file even if a genuine collision occurs.
 function startPermanentIdentityStub(port: number, kind: "node" | "launcher", answer: Record<string, unknown>): void {
   const server = createHttpServer(async (req, res) => {
     const chunks: Buffer[] = [];
@@ -101,10 +110,13 @@ function startPermanentIdentityStub(port: number, kind: "node" | "launcher", ans
     res.writeHead(404, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: `this fixed-port identity stub (kind: ${kind}) only answers POST /identity` }));
   });
+  server.on("error", (err) => {
+    throw new Error(`server.test.ts's fixed-port identity stub for ${kind} on 127.0.0.1:${port} failed to start: ${err.message}`);
+  });
   // unref() so this file's own test process can still exit naturally once
   // its real work is done, rather than being kept alive forever by three
   // servers nothing is ever explicitly told to close.
-  server.listen(port).unref();
+  server.listen(port, "127.0.0.1").unref();
 }
 
 startPermanentIdentityStub(50052, "node", { deviceTier: "desktop" });
@@ -358,7 +370,7 @@ test("POST /nodes/register returns 502 when the endpoint answers /identity with 
     const res = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: `http://127.0.0.1:${address.port}`, deviceTier: "desktop" }),
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${address.port}`, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
     });
     assert.equal(res.status, 502);
     const body = await res.json();
@@ -366,6 +378,40 @@ test("POST /nodes/register returns 502 when the endpoint answers /identity with 
   } finally {
     server.close();
     wrongNonceStub.close();
+  }
+});
+
+// Whole-branch review, Minor finding, fixed here: res.json() alone has no
+// size limit -- a registrant-controlled endpoint returning an arbitrarily
+// large body was live-verified to be buffered in full (120MB) and let the
+// registration succeed anyway, with nothing but IDENTITY_TIMEOUT_MS
+// (which bounds time, not bytes) as a backstop.
+test("POST /nodes/register returns 502 when the endpoint's /identity response exceeds the size cap", async () => {
+  const oversizedStub = createHttpServer(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "application/json" });
+    // Comfortably past the 4KB cap without actually allocating megabytes
+    // in this test.
+    res.end(JSON.stringify({ nonce: "x".repeat(8192), deviceTier: "desktop" }));
+  });
+  await new Promise<void>(resolve => oversizedStub.listen(0, resolve));
+  const address = oversizedStub.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected oversized-response stub to bind a port");
+  }
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${address.port}`, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.match(body.error, /exceeded|bytes/i);
+  } finally {
+    server.close();
+    oversizedStub.close();
   }
 });
 
@@ -388,7 +434,7 @@ test("POST /nodes/register returns 502 when the endpoint 404s on /identity (an o
     const res = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: `http://127.0.0.1:${address.port}`, deviceTier: "desktop" }),
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${address.port}`, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
     });
     assert.equal(res.status, 502);
     const body = await res.json();
@@ -415,7 +461,7 @@ test("POST /nodes/register returns 502 when the endpoint never answers /identity
     const res = await authFetch(`${baseUrl}/nodes/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: `http://127.0.0.1:${address.port}`, deviceTier: "desktop" }),
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${address.port}`, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
     });
     const elapsedMs = Date.now() - start;
     assert.equal(res.status, 502);
@@ -430,14 +476,112 @@ test("POST /nodes/register returns 502 when the endpoint never answers /identity
   }
 });
 
+// Whole-branch review, Critical finding, fixed here: verification used to
+// run unconditionally for EVERY POST /nodes/register, but a real,
+// documented registration shape -- a raw swarm-rpc-server compute
+// contributor, registered with no servesModel (README's own documented
+// pattern for this role) -- has categorically no HTTP /identity route to
+// answer it, being llama.cpp's raw RPC backend, not even an HTTP server.
+// Live-verified before this fix: every such registration failed with a
+// 502 "fetch failed", silently disabling Phase B/C's entire multi-node
+// pipeline machinery (no compute contributor could ever register).
+test("POST /nodes/register registers a node with no servesModel claim without ever contacting it -- the swarm-rpc-server compute-contributor case", async () => {
+  // No stub server at all -- if this registration tried to call
+  // POST /identity on this address, it would fail (nothing is listening),
+  // proving the callback genuinely isn't invoked for this case.
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:1", deviceTier: "desktop" }),
+    });
+    assert.equal(res.status, 200);
+    const nodes = await (await authFetch(`${baseUrl}/nodes`)).json();
+    assert.equal(nodes.length, 1);
+    assert.equal(nodes[0].deviceTier, "desktop", "deviceTier stays exactly as the caller claimed for this role");
+    assert.equal(nodes[0].servesModel, undefined);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /nodes/register cannot strip a live node's servesModel by simply omitting it -- omission still triggers full verification", async () => {
+  // The interaction the fix above has to get right: the skip-verification
+  // exemption exists for a FRESH compute-contributor registration, but
+  // must not become a second way to strip an EXISTING node's
+  // already-verified servesModel just by leaving the field out instead of
+  // claiming a false one.
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: {} }), { deviceTier: "desktop", servesModel: "tinyllama-1.1b" });
+  const { server, baseUrl } = await startTestServer();
+  try {
+    await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+
+    // The "attack": re-register the same endpoint with NO servesModel
+    // field at all -- omission, not a false claim -- attempting to reach
+    // the skip-verification fast path instead of the mismatch check.
+    const attackRes = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop" }),
+    });
+    assert.equal(attackRes.status, 200);
+
+    const nodes = await (await authFetch(`${baseUrl}/nodes`)).json();
+    assert.equal(nodes.length, 1);
+    assert.equal(nodes[0].servesModel, "tinyllama-1.1b", "omitting servesModel must not clear an already-verified one -- the real endpoint's own answer still wins");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+test("POST /nodes/register rejects a claimed servesModel the endpoint's own /identity answer does not confirm", async () => {
+  // Whole-branch review, Critical finding, fixed here: this used to be
+  // silently discarded and replaced with whatever the endpoint reported
+  // (including nothing), so the node registered successfully, appeared in
+  // GET /nodes, and even showed available:true in GET /catalog -- yet
+  // could never be routed to, with no error anywhere explaining why.
+  // Live-reproduced against this repo's own generate_e2e.ts, which spawns
+  // a real agent without --serves-model.
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: {} }), { deviceTier: "desktop" }); // no servesModel in its own answer
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.match(body.error, /servesModel/i);
+
+    // And it must not have registered as a half-broken, invisible-failure
+    // node either -- the whole point is a loud rejection, not a silent
+    // downgrade.
+    const nodes = await (await authFetch(`${baseUrl}/nodes`)).json();
+    assert.equal(nodes.length, 0);
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
 test("POST /nodes/register cannot be used to strip a live node's servesModel -- the endpoint's own answer wins", async () => {
-  // The griefing primitive this phase closes: before Endpoint Identity
-  // Hardening, any token-holder who knew a node's endpoint could silently
-  // strip its servesModel by re-registering that endpoint with none, since
-  // the caller's claim was trusted outright. Now the coordinator asks the
-  // endpoint itself, so a third party's "attacking" re-registration is a
-  // no-op -- it can only ever learn/confirm the node's real, unchanged
-  // servesModel, never overwrite it with something false.
+  // The griefing primitive this phase narrows (not fully closes -- see the
+  // dedicated endpoint-pinning tests just below, and README's Known
+  // gaming vectors, for what still isn't verified): before Endpoint
+  // Identity Hardening, any token-holder who knew a node's endpoint could
+  // silently strip its servesModel by re-registering that endpoint with
+  // none, since the caller's claim was trusted outright. Now the
+  // coordinator asks the endpoint itself for servesModel/deviceTier
+  // specifically, so a third party's attack on THOSE two fields is a
+  // no-op. localityGroup/availableMemoryMb remain unverified and
+  // overwritable exactly as already disclosed pre-phase.
   const stub = await startStubNodeAgent(() => ({ status: 200, body: {} }), { deviceTier: "desktop", servesModel: "tinyllama-1.1b" });
   const { server, baseUrl } = await startTestServer();
   try {
@@ -461,6 +605,61 @@ test("POST /nodes/register cannot be used to strip a live node's servesModel -- 
     const nodes = await (await authFetch(`${baseUrl}/nodes`)).json();
     assert.equal(nodes.length, 1);
     assert.equal(nodes[0].servesModel, "tinyllama-1.1b", "the node's real servesModel must survive an attempted strip, reported by the endpoint itself");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+// Whole-branch review, Critical finding, fixed in NodeRegistry.register():
+// canonicalization widened what counts as a colliding registration (an
+// alias, or an attacker-chosen DNS name resolving to a victim's real IP)
+// without NodeRegistry also being taught that a DIFFERENT endpoint string
+// can now legitimately collide -- so it kept doing what it always safely
+// did when the only way to collide was the exact same string: overwrite
+// `endpoint` unconditionally. That silently redirected every future
+// /generate call for the victim's identity to the attacker, who could
+// then repoint DNS at will with zero further coordinator interaction.
+// verifyNodeIdentity() genuinely contacts whoever answers at the endpoint
+// submitted and gets truthful fields back -- that was never the gap. Using
+// "truthful fields from whoever answered" to justify overwriting WHERE
+// FUTURE REQUESTS GO was.
+test("POST /nodes/register: a registration whose identity genuinely collides with an active entry never overwrites that entry's endpoint", async () => {
+  // Constructs an actual identityKey collision (two different endpoint
+  // strings that really do canonicalize to the same key) by registering
+  // the SAME physical stub agent under two different loopback aliases,
+  // and proves the endpoint stored for that identity is pinned to
+  // whichever was registered FIRST while that entry is still active --
+  // not silently replaced by the second registration's own claimed
+  // endpoint string. A real DNS-based collision (a name an attacker
+  // controls resolving to a victim's real IP) exercises the exact same
+  // code path in production; this test forces the collision
+  // deterministically, without depending on real DNS.
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: {} }), { deviceTier: "desktop", servesModel: "tinyllama-1.1b" });
+  const port = Number(new URL(stub.endpoint).port);
+  const firstEndpoint = `http://127.0.0.1:${port}`;
+  const secondEndpoint = `http://localhost:${port}`;
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const first = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: firstEndpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+    const { nodeId: firstId } = await first.json();
+
+    const second = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: secondEndpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+    assert.equal(second.status, 200);
+    const { nodeId: secondId } = await second.json();
+    assert.equal(secondId, firstId, "precondition: these two endpoints must genuinely collide onto one identity");
+
+    const nodes = await (await authFetch(`${baseUrl}/nodes`)).json();
+    assert.equal(nodes.length, 1);
+    assert.equal(nodes[0].endpoint, firstEndpoint, "the FIRST-registered endpoint must remain the contact URL while that entry is still active");
   } finally {
     server.close();
     stub.server.close();
@@ -939,6 +1138,49 @@ test("POST /launchers/register normalizes away a trailing slash on endpoint", as
     assert.equal(launcherRegistry.findForModel("mixtral-8x7b")?.endpoint, "http://127.0.0.1:9000");
   } finally {
     server.close();
+  }
+});
+
+// Whole-branch review, Minor finding, fixed here: verifyLauncherIdentity()
+// bounded agentPort below (>= 1) but not above, so a launcher reporting an
+// out-of-range port (e.g. 70000) built an invalid URL in
+// launcherDriverEndpoint() during a LATER /generate call, and
+// canonicalizeEndpoint()'s new URL() threw a TypeError with no surrounding
+// catch -- a 500 for the request-path caller, and (for the background
+// pool manager's own sibling call) a caught, merely-skipped tick. Both
+// agentPort checks (the caller-body one here, and verifyLauncherIdentity's
+// own) are now upper-bounded at 65535.
+test("POST /launchers/register rejects an out-of-range agentPort with 400", async () => {
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:9000", servesModels: ["mixtral-8x7b"], agentPort: 70000 }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error, /agentPort/i);
+  } finally {
+    server.close();
+  }
+});
+
+test("POST /launchers/register rejects a launcher whose /identity reports an out-of-range agentPort", async () => {
+  const stub = await startIdentityStub("launcher", { agentPort: 70000 });
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, servesModels: ["mixtral-8x7b"], agentPort: 8090 }),
+    });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.match(body.error, /agentPort/i);
+  } finally {
+    server.close();
+    stub.server.close();
   }
 });
 

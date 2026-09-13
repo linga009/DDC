@@ -145,6 +145,48 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+const IDENTITY_RESPONSE_MAX_BYTES = 4096;
+
+// Reads and parses an /identity response body with a hard size cap.
+// Whole-branch review, Minor finding, fixed here: `res.json()` alone has
+// no size limit, so a registrant-controlled endpoint returning an
+// arbitrarily large body (live-verified: 120MB, buffered in full,
+// registration still succeeded) could be repeated concurrently by any
+// token-holder with nothing else bounding it -- IDENTITY_TIMEOUT_MS
+// bounds time, not bytes. A real /identity answer is a handful of short
+// fields; 4KB is generous headroom, not a tight fit.
+async function readIdentityResponseJson(res: Response, endpoint: string): Promise<Record<string, unknown>> {
+  const reader = res.body?.getReader();
+  if (!reader) {
+    throw new IdentityVerificationError(`${endpoint}/identity returned no readable body -- registration could not be verified`);
+  }
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > IDENTITY_RESPONSE_MAX_BYTES) {
+        await reader.cancel();
+        throw new IdentityVerificationError(`${endpoint}/identity response exceeded ${IDENTITY_RESPONSE_MAX_BYTES} bytes -- registration could not be verified`);
+      }
+      chunks.push(value);
+    }
+  } catch (err) {
+    if (err instanceof IdentityVerificationError) {
+      throw err;
+    }
+    throw new IdentityVerificationError(`${endpoint}/identity response could not be read -- registration could not be verified`);
+  }
+  const text = Buffer.concat(chunks.map(c => Buffer.from(c))).toString("utf-8");
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw new IdentityVerificationError(`${endpoint}/identity did not return valid JSON -- registration could not be verified`);
+  }
+}
+
 // Endpoint Identity Hardening: verifies a POST /nodes/register request by
 // asking the endpoint itself what it serves, rather than trusting the
 // caller's claim. A single-use nonce (regenerated on every call, never
@@ -160,7 +202,25 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 // calling this there would fail spuriously on a live, correct spawn. Only
 // the PUBLIC POST /nodes/register route (an operator registering a node
 // they claim already exists) calls this.
-async function verifyNodeIdentity(endpoint: string, authToken: string, catalog: ModelCatalog): Promise<{ deviceTier: DeviceTier; servesModel?: string }> {
+//
+// Also deliberately NOT called at all when the caller's request has no
+// servesModel claim -- see this function's own call site for why (a real,
+// documented registration shape, the raw swarm-rpc-server compute
+// contributor, has categorically no HTTP identity route to answer this).
+//
+// `claimedServesModel` is the CALLER's own claim, if any. Whole-branch
+// review, Critical finding, fixed here: this used to be silently
+// discarded and replaced with whatever the endpoint reported (including
+// nothing at all), which meant an agent started without --serves-model
+// registered successfully, showed up in GET /nodes, and even showed
+// available:true in GET /catalog -- yet could never actually be routed
+// to, with no error anywhere explaining why (live-reproduced: the
+// project's own generate_e2e.ts test, which spawns a real agent without
+// --serves-model, failed this way). A claimed model the endpoint does not
+// confirm is now a verification FAILURE, not a silent downgrade to
+// "serves nothing" -- loud and immediate, at registration time, instead
+// of a confusing 503 on every later /generate call for that model.
+async function verifyNodeIdentity(endpoint: string, authToken: string, catalog: ModelCatalog, claimedServesModel: string | undefined): Promise<{ deviceTier: DeviceTier; servesModel?: string }> {
   const nonce = randomUUID();
   let res: Response;
   try {
@@ -177,13 +237,7 @@ async function verifyNodeIdentity(endpoint: string, authToken: string, catalog: 
   if (!res.ok) {
     throw new IdentityVerificationError(`${endpoint}/identity responded with status ${res.status} -- registration could not be verified`);
   }
-  let body: unknown;
-  try {
-    body = await res.json();
-  } catch {
-    throw new IdentityVerificationError(`${endpoint}/identity did not return valid JSON -- registration could not be verified`);
-  }
-  const candidate = body as Record<string, unknown>;
+  const candidate = await readIdentityResponseJson(res, endpoint);
   if (candidate.nonce !== nonce) {
     throw new IdentityVerificationError(`${endpoint}/identity returned a mismatched nonce -- registration could not be verified`);
   }
@@ -194,12 +248,23 @@ async function verifyNodeIdentity(endpoint: string, authToken: string, catalog: 
   // recognise is treated as "doesn't serve anything (yet)" rather than
   // failing the whole registration -- an agent's config drifting from this
   // coordinator's catalog is an operational mismatch to route around, not
-  // a reason to make the node entirely unregisterable. Same leniency this
-  // route already applied to the (now-ignored) caller-supplied field.
-  const servesModel = typeof candidate.servesModel === "string" && catalog.hasModel(candidate.servesModel)
+  // a reason to make the node entirely unregisterable. This leniency only
+  // applies when the CALLER made no claim of its own (see below for what
+  // happens when they did).
+  const reportedServesModel = typeof candidate.servesModel === "string" && catalog.hasModel(candidate.servesModel)
     ? candidate.servesModel
     : undefined;
-  return { deviceTier: candidate.deviceTier as DeviceTier, servesModel };
+  if (claimedServesModel !== undefined && claimedServesModel !== reportedServesModel) {
+    // The caller asserted a specific model; the endpoint's own answer does
+    // not confirm it (wrong model, or none at all -- e.g. an agent started
+    // without --serves-model). Reject loudly here rather than silently
+    // registering a node that will look perfectly healthy in GET
+    // /nodes/GET /catalog forever while never being routable for the
+    // model the caller actually wanted it registered for.
+    throw new IdentityVerificationError(
+      `${endpoint}/identity reported servesModel ${JSON.stringify(reportedServesModel)}, not the claimed ${JSON.stringify(claimedServesModel)} -- registration could not be verified`);
+  }
+  return { deviceTier: candidate.deviceTier as DeviceTier, servesModel: reportedServesModel };
 }
 
 // Launcher counterpart of verifyNodeIdentity() above. No Authorization
@@ -228,17 +293,16 @@ async function verifyLauncherIdentity(endpoint: string): Promise<{ agentPort: nu
   if (!res.ok) {
     throw new IdentityVerificationError(`${endpoint}/identity responded with status ${res.status} -- registration could not be verified`);
   }
-  let body: unknown;
-  try {
-    body = await res.json();
-  } catch {
-    throw new IdentityVerificationError(`${endpoint}/identity did not return valid JSON -- registration could not be verified`);
-  }
-  const candidate = body as Record<string, unknown>;
+  const candidate = await readIdentityResponseJson(res, endpoint);
   if (candidate.nonce !== nonce) {
     throw new IdentityVerificationError(`${endpoint}/identity returned a mismatched nonce -- registration could not be verified`);
   }
-  if (typeof candidate.agentPort !== "number" || !Number.isInteger(candidate.agentPort) || candidate.agentPort < 1) {
+  // Upper-bounded too (Whole-branch review, Minor finding): an
+  // out-of-range port here builds an invalid URL in launcherDriverEndpoint()
+  // later, which throws a TypeError canonicalizeEndpoint() never used to
+  // be able to raise from caller-controlled input, surfacing as an
+  // uncaught 500 on a live /generate call instead of a clean rejection here.
+  if (typeof candidate.agentPort !== "number" || !Number.isInteger(candidate.agentPort) || candidate.agentPort < 1 || candidate.agentPort > 65535) {
     throw new IdentityVerificationError(`${endpoint}/identity did not report a valid agentPort`);
   }
   return { agentPort: candidate.agentPort };
@@ -663,20 +727,60 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         const identityKey = await canonicalizeEndpoint(normalizedNodeEndpoint);
         // Endpoint Identity Hardening: everything above this line validates
         // the CALLER's request shape, unchanged from before this phase --
-        // still 400 on a malformed body. What happens next is new: the
-        // caller's deviceTier/servesModel claims above are discarded, not
-        // stored. Whatever the endpoint itself reports via POST /identity
-        // is what gets registered, closing the griefing primitive where any
-        // token-holder who knows a node's endpoint could silently strip its
-        // servesModel by re-registering it with none.
-        let verified: { deviceTier: DeviceTier; servesModel?: string };
-        try {
-          verified = await verifyNodeIdentity(normalizedNodeEndpoint, authToken, catalog);
-        } catch (err) {
-          sendJson(res, 502, { error: err instanceof IdentityVerificationError ? err.message : "failed to verify this registration" });
-          return;
+        // still 400 on a malformed body. What happens next is new: when
+        // the caller claims a servesModel, deviceTier/servesModel are
+        // verified against the endpoint itself instead of trusted
+        // outright, closing the griefing primitive where any token-holder
+        // who knows a node's endpoint could silently strip its servesModel
+        // by re-registering it with none.
+        //
+        // Whole-branch review, Critical finding, fixed here: verification
+        // used to run unconditionally, but a real, documented registration
+        // shape -- a raw swarm-rpc-server compute contributor, registered
+        // with NO servesModel (README's own instructions for this role) --
+        // has categorically no HTTP /identity route to answer it, being
+        // llama.cpp's raw RPC backend, not even an HTTP server. Every such
+        // registration failed with a 502 "fetch failed", live-verified to
+        // silently disable Phase B/C's entire multi-node pipeline
+        // machinery (no compute contributor could ever register, so no
+        // requiredNodeCount > 1 pipeline could ever be assembled). deviceTier
+        // for that role was already purely caller-asserted before this
+        // phase existed -- this restores exactly that, and only that.
+        // The skip-verification exemption above only applies while there is
+        // nothing already-verified at stake: if an ACTIVE entry for this
+        // exact identity already has a servesModel (meaning some earlier
+        // registration DID go through full verification), a new
+        // registration that simply omits the field must not be allowed to
+        // silently clear it via the exemption -- that would reopen the
+        // very griefing primitive this phase closes, just via a different
+        // door (claim nothing, rather than claim falsely). Requiring full
+        // verification here is safe for the genuine "this node's role
+        // changed to compute-only" case too: if the endpoint's own
+        // /identity answer confirms it truly serves nothing now, that
+        // clears the field through the normal verified path, exactly as
+        // intended; if the endpoint cannot answer /identity at all (e.g.
+        // it is now a bare, non-HTTP swarm-rpc-server), the registration
+        // is rejected rather than silently trusted, and converting an
+        // existing agent-role node into a compute-only one needs some
+        // other path -- disclosed, not solved, here.
+        const existingServesModel = registry.listActive().find(n => n.nodeId === stableNodeId(identityKey))?.servesModel;
+        let resolvedDeviceTier: DeviceTier;
+        let resolvedServesModel: string | undefined;
+        if (servesModel === undefined && existingServesModel === undefined) {
+          resolvedDeviceTier = candidate.deviceTier as DeviceTier;
+          resolvedServesModel = undefined;
+        } else {
+          let verified: { deviceTier: DeviceTier; servesModel?: string };
+          try {
+            verified = await verifyNodeIdentity(normalizedNodeEndpoint, authToken, catalog, servesModel);
+          } catch (err) {
+            sendJson(res, 502, { error: err instanceof IdentityVerificationError ? err.message : "failed to verify this registration" });
+            return;
+          }
+          resolvedDeviceTier = verified.deviceTier;
+          resolvedServesModel = verified.servesModel;
         }
-        const nodeId = registry.register(normalizedNodeEndpoint, identityKey, verified.deviceTier, localityGroup, verified.servesModel, availableMemoryMb);
+        const nodeId = registry.register(normalizedNodeEndpoint, identityKey, resolvedDeviceTier, localityGroup, resolvedServesModel, availableMemoryMb);
         sendJson(res, 200, { nodeId });
         return;
       }
@@ -835,8 +939,8 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           sendJson(res, 400, { error: "servesModels must be an array of strings" });
           return;
         }
-        if (typeof candidate.agentPort !== "number" || !Number.isInteger(candidate.agentPort) || candidate.agentPort < 1) {
-          sendJson(res, 400, { error: "agentPort must be a positive integer" });
+        if (typeof candidate.agentPort !== "number" || !Number.isInteger(candidate.agentPort) || candidate.agentPort < 1 || candidate.agentPort > 65535) {
+          sendJson(res, 400, { error: "agentPort must be a positive integer no greater than 65535" });
           return;
         }
         const launcherIdentityKey = await canonicalizeEndpoint(normalizedLauncherEndpoint);

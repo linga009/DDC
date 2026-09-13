@@ -64,9 +64,55 @@ export class NodeRegistry {
   // POST /generate fetches `${node.endpoint}/complete` verbatim, and
   // substituting a resolved IP here would break TLS SNI and name-based
   // virtual hosting for an https endpoint.
+  //
+  // Whole-branch review finding, Critical, fixed here: before Endpoint
+  // Identity Hardening, the only way to collide with an existing nodeId
+  // was to submit the exact same (lowercased) endpoint STRING, so
+  // overwriting `endpoint` with a value identical to what it already held
+  // was a no-op by construction -- Security Phase 3 never had to think
+  // about this. Canonicalization widened what counts as a collision
+  // (aliases, and any two endpoints an attacker can make resolve
+  // together) without this method also being taught that a DIFFERENT
+  // endpoint string can now legitimately collide. Live-verified before
+  // this fix: registering a DNS name an attacker controls that resolves
+  // to a trusted node's IP -- or simply a different loopback address, if
+  // the loopback range collapsed as broadly as canonicalizeEndpoint()
+  // used to -- silently overwrote the victim's `endpoint`, redirecting
+  // every future /generate call for that identity to the attacker, who
+  // could then repoint DNS at will with zero further coordinator
+  // interaction. verifyNodeIdentity() genuinely contacts the machine
+  // behind the SUBMITTED endpoint and gets truthful fields back from it --
+  // that was never the gap. The gap was that "truthful fields from
+  // whoever answered" was then used to justify overwriting WHERE FUTURE
+  // REQUESTS GO, which is a different and stronger claim than anything the
+  // callback actually establishes.
+  //
+  // The fix matches the pattern LauncherRegistry.register() and
+  // PeerRegistry.register() already established (their own refresh
+  // branches never touch `endpoint` either) instead of inventing a new
+  // rule: while an ACTIVE entry already exists for this identity, its
+  // endpoint is never replaced by a colliding registration, no matter what
+  // that registration claims or how its own /identity call resolved.
+  // deviceTier/servesModel still refresh from the newly-verified answer
+  // (harmless even under attack, since verifyNodeIdentity() always
+  // contacts whoever is really listening at the identity's stable
+  // endpoint once one exists) -- only the contact URL itself is pinned.
+  // localityGroup/availableMemoryMb remain exactly as disclosed already
+  // (Security Phase 3): still overwritable by anyone who can trigger a
+  // collision, now reachable via alias/DNS collision and not only an
+  // exact endpoint-string match -- see README.
+  //
+  // An EXPIRED existing entry does not pin anything: that is the
+  // legitimate "this identity's node moved / came back under a new
+  // address" case, and it free-forms exactly like a first-time
+  // registration once the old entry has aged out.
   register(endpoint: string, identityKey: string, deviceTier: DeviceTier, localityGroup?: string, servesModel?: string, availableMemoryMb?: number): string {
     const nodeId = stableNodeId(identityKey);
-    this.nodes.set(nodeId, { nodeId, endpoint, deviceTier, localityGroup, servesModel, availableMemoryMb, lastSeen: this.clock() });
+    const now = this.clock();
+    const existing = this.nodes.get(nodeId);
+    const existingIsActive = existing !== undefined && now - existing.lastSeen <= this.timeoutMs;
+    const resolvedEndpoint = existingIsActive ? existing.endpoint : endpoint;
+    this.nodes.set(nodeId, { nodeId, endpoint: resolvedEndpoint, deviceTier, localityGroup, servesModel, availableMemoryMb, lastSeen: now });
     return nodeId;
   }
 

@@ -56,7 +56,18 @@ test(
     const spawnEnv = process.platform === "win32"
       ? { ...process.env, PATH: `C:\\msys64\\ucrt64\\bin;${process.env.PATH ?? ""}`, SWARM_AUTH_TOKEN: TEST_AUTH_TOKEN }
       : { ...process.env, SWARM_AUTH_TOKEN: TEST_AUTH_TOKEN };
-    const agent: ChildProcess = spawn(AGENT_BINARY, ["--model", MODEL_PATH, "--port", String(AGENT_PORT)], { env: spawnEnv });
+    // --serves-model is required as of Endpoint Identity Hardening: the
+    // coordinator verifies a registration that claims a servesModel by
+    // calling the agent's own POST /identity and requires it to confirm
+    // that exact model id, rejecting the registration loudly (502) rather
+    // than silently discarding a mismatched or absent claim. Without this
+    // flag, the real agent's /identity answer would report no servesModel
+    // at all, and registerNode()'s "tinyllama-1.1b" claim below would be
+    // rejected outright -- live-verified during whole-branch review as the
+    // exact way an unmodified agent silently became unroutable before this
+    // fix (200 + visible in GET /nodes + available:true in GET /catalog,
+    // yet /generate always 503'd, with nothing explaining why).
+    const agent: ChildProcess = spawn(AGENT_BINARY, ["--model", MODEL_PATH, "--port", String(AGENT_PORT), "--serves-model", "tinyllama-1.1b"], { env: spawnEnv });
     try {
       await waitForHealth(AGENT_PORT, 30000);
 

@@ -62,7 +62,7 @@ async function startStubNodeAgent(
 
 // Endpoint Identity Hardening: same reasoning and convention as
 // coordinator/tests/server.test.ts's own startPermanentIdentityStub --
-// this file's tests overwhelmingly hardcode http://127.0.0.1:50052 as a
+// this file's tests overwhelmingly hardcode http://127.0.0.1:51052 as a
 // pure bookkeeping value that has never needed to be reachable before.
 // None of this file's tests asserts this port is unreachable.
 function startPermanentIdentityStub(port: number, answer: Record<string, unknown>): void {
@@ -78,10 +78,25 @@ function startPermanentIdentityStub(port: number, answer: Record<string, unknown
     res.writeHead(404, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "this fixed-port identity stub only answers POST /identity" }));
   });
-  server.listen(port).unref();
+  // Whole-branch review, Important finding, fixed here: this used to
+  // server.listen(port) with no host (binding every interface, not just
+  // loopback) and no 'error' handler, AND used the SAME literal port
+  // (50052) as coordinator/tests/server.test.ts's own fixed-port stub --
+  // node --test runs different test files as separate but CONCURRENT
+  // processes, so both genuinely raced to bind the same real TCP port
+  // (a machine-wide resource, not scoped per process), live-reproduced as
+  // an uncaught EADDRINUSE that crashed whichever file lost the race,
+  // dropping 16 tests, at a concurrency setting higher than this
+  // environment's default happened to exercise. Now on its own distinct
+  // port (51052, not 50052), bound to 127.0.0.1 only, with a named error
+  // instead of an uncaught exception if a collision still occurs.
+  server.on("error", (err) => {
+    throw new Error(`client.test.ts's fixed-port identity stub on 127.0.0.1:${port} failed to start: ${err.message}`);
+  });
+  server.listen(port, "127.0.0.1").unref();
 }
 
-startPermanentIdentityStub(50052, { deviceTier: "desktop" });
+startPermanentIdentityStub(51052, { deviceTier: "desktop" });
 
 test("SwarmClient sends the configured auth token on every request", async () => {
   let receivedAuth: string | null = null;
@@ -108,7 +123,7 @@ test("SwarmClient registers a node and lists it", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
     const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
-    const nodeId = await client.registerNode("http://127.0.0.1:50052", "desktop");
+    const nodeId = await client.registerNode("http://127.0.0.1:51052", "desktop");
     assert.equal(typeof nodeId, "string");
 
     const nodes = await client.listNodes();
@@ -123,7 +138,7 @@ test("SwarmClient heartbeat returns true for a known node and false for an unkno
   const { server, baseUrl } = await startTestServer();
   try {
     const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
-    const nodeId = await client.registerNode("http://127.0.0.1:50052", "desktop");
+    const nodeId = await client.registerNode("http://127.0.0.1:51052", "desktop");
     assert.equal(await client.heartbeat(nodeId), true);
     assert.equal(await client.heartbeat("never-registered"), false);
   } finally {
@@ -135,7 +150,7 @@ test("SwarmClient records reputation events and reads them back", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
     const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
-    const nodeId = await client.registerNode("http://127.0.0.1:50052", "desktop");
+    const nodeId = await client.registerNode("http://127.0.0.1:51052", "desktop");
     assert.equal(await client.recordAgreement(nodeId), true);
     assert.equal(await client.recordDisagreement(nodeId), true);
 
@@ -155,7 +170,7 @@ test("SwarmClient.getReputation throws on a 401 instead of returning the error b
     // exists -- this proves the 401 comes from the wrong token, not from the
     // 404 path the method already handled.
     const goodClient = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
-    const nodeId = await goodClient.registerNode("http://127.0.0.1:50052", "desktop");
+    const nodeId = await goodClient.registerNode("http://127.0.0.1:51052", "desktop");
 
     const wrongTokenClient = new SwarmClient(baseUrl, "not-the-right-token");
     // Previously this resolved to { error: "missing or invalid Authorization
@@ -175,7 +190,7 @@ test("SwarmClient's boolean-returning methods throw on a 401 rather than reporti
   const { server, baseUrl } = await startTestServer();
   try {
     const goodClient = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
-    const nodeId = await goodClient.registerNode("http://127.0.0.1:50052", "desktop");
+    const nodeId = await goodClient.registerNode("http://127.0.0.1:51052", "desktop");
     const peerId = await goodClient.registerPeer("http://127.0.0.1:9099");
     // The node and peer both really exist, so a correctly-authenticated
     // caller gets `true` -- which is exactly what makes the wrong-token
@@ -204,7 +219,7 @@ test("SwarmClient reads capacity and catalog", async () => {
     const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
     assert.equal(await client.getCapacity(), 0);
 
-    await client.registerNode("http://127.0.0.1:50052", "desktop");
+    await client.registerNode("http://127.0.0.1:51052", "desktop");
     assert.equal(await client.getCapacity(), 1);
 
     const catalog = await client.getCatalog();
@@ -219,7 +234,7 @@ test("SwarmClient lists nodes grouped by locality", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
     const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
-    await client.registerNode("http://127.0.0.1:50052", "desktop", "kitchen-mesh");
+    await client.registerNode("http://127.0.0.1:51052", "desktop", "kitchen-mesh");
     const groups = await client.listNodesByLocality();
     assert.equal((groups["kitchen-mesh"] as unknown[]).length, 1);
   } finally {
@@ -262,7 +277,7 @@ test("SwarmClient.registerNode rejects with the server's error detail on a 400",
   try {
     const client = new SwarmClient(baseUrl, TEST_AUTH_TOKEN);
     await assert.rejects(
-      () => client.registerNode("http://127.0.0.1:50052", "toaster" as any),
+      () => client.registerNode("http://127.0.0.1:51052", "toaster" as any),
       (err: Error) => {
         assert.match(err.message, /deviceTier must be one of/);
         return true;

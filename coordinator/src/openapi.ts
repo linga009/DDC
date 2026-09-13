@@ -72,13 +72,20 @@ export const openApiDocument = {
       post: {
         summary: "Register a node",
         description:
-          "Verifies this registration by calling POST /identity on the endpoint itself with a single-use nonce before " +
-          "storing anything. deviceTier and servesModel in the request body are validated for shape but then DISCARDED: " +
-          "the values actually stored are whatever the endpoint's own /identity response reports, not what this request " +
-          "claims. This closes a griefing vector where any token-holder who knew a node's endpoint could silently strip " +
-          "its servesModel by re-registering it with none -- now that call is a no-op, since the coordinator asks the " +
-          "node itself. localityGroup and availableMemoryMb are NOT verified this way and remain exactly as supplied " +
-          "here, unchanged.",
+          "If servesModel is claimed, verifies this registration by calling POST /identity on the endpoint itself " +
+          "with a single-use nonce: deviceTier/servesModel in the request body are validated for shape but then " +
+          "REPLACED with whatever the endpoint's own /identity response reports, and a claimed servesModel the " +
+          "endpoint does not confirm is rejected outright (502), not silently downgraded. If servesModel is omitted " +
+          "(the swarm-rpc-server compute-contributor pattern -- see README), verification is skipped entirely and " +
+          "deviceTier is trusted as claimed, since a bare RPC backend has no HTTP /identity route to answer it -- " +
+          "unless an ACTIVE entry for this identity already has a verified servesModel, in which case omitting the " +
+          "field does not silently clear it; full verification still runs. This narrows, but does not fully close, " +
+          "the griefing vector where a token-holder who knew a node's endpoint could overwrite its claims by " +
+          "re-registering it: the identity's contact URL (endpoint) is now pinned against a colliding registration " +
+          "and cannot be hijacked this way, and servesModel/deviceTier are endpoint-verified when claimed, but " +
+          "localityGroup and availableMemoryMb are NOT verified this way and remain exactly as supplied here, " +
+          "unchanged -- still overwritable by anyone who can trigger a registration for this identity. See README's " +
+          "Known gaming vectors.",
         requestBody: {
           content: {
             "application/json": {
@@ -105,7 +112,8 @@ export const openApiDocument = {
           "502": {
             description:
               "The endpoint could not be verified: unreachable, timed out (5s), a non-2xx response from its own " +
-              "POST /identity, an unparseable body, or a mismatched nonce.",
+              "POST /identity, an oversized response body, an unparseable body, a mismatched nonce, or (when " +
+              "servesModel was claimed) an /identity answer that does not confirm it.",
             content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
           },
         },
@@ -241,7 +249,8 @@ export const openApiDocument = {
           "502": {
             description:
               "The launcher could not be verified: unreachable, timed out (5s), a non-2xx response from its own " +
-              "POST /identity, an unparseable body, or a mismatched nonce.",
+              "POST /identity, an oversized response body, an unparseable body, a mismatched nonce, or an " +
+              "out-of-range (not 1-65535) agentPort.",
             content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
           },
         },
