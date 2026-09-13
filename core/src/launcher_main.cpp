@@ -306,6 +306,17 @@ int main(int argc, char** argv) {
         }
 
         std::vector<std::string> agentArgv = {nodeAgentPath, "--model", modelFile, "--port", std::to_string(agentPort)};
+        // Endpoint Identity Hardening: `model` above is already validated
+        // (non-empty, no path-traversal characters) and is exactly the
+        // catalog id this launcher was asked to serve -- pass it straight
+        // through so the spawned agent has something authoritative to
+        // report via its own POST /identity, closing the loop this
+        // launcher itself cannot close (it has no --serves-models flag; it
+        // can spawn any model present under --models-dir, so "what does
+        // this LAUNCHER serve" is not a fact it possesses -- only "what did
+        // I just spawn" is).
+        agentArgv.push_back("--serves-model");
+        agentArgv.push_back(model);
         for (const auto& endpoint : splitCommaSeparated(remoteEndpointsRaw)) {
             agentArgv.push_back("--remote");
             agentArgv.push_back(endpoint);
@@ -358,6 +369,35 @@ int main(int argc, char** argv) {
     server.route("DELETE", "/pipeline", [&](const swarm::HttpRequest&) -> swarm::HttpResponse {
         currentAgent.reset();
         return swarm::HttpResponse{204, ""};
+    });
+
+    // Endpoint Identity Hardening: lets a coordinator verify a launcher
+    // registration by asking the launcher itself, the same mechanism
+    // swarm-node-agent's own POST /identity gives nodes. Deliberately NO
+    // auth check here, matching /pipeline and DELETE /pipeline above --
+    // this binary's entire trust boundary is HttpServer's 127.0.0.1-only
+    // bind (see this route's siblings' own comments); adding auth to one
+    // route while the others have none would be inconsistent, not safer.
+    //
+    // Reports only what this process can actually vouch for: its own
+    // liveness (implicit in answering at all) and agentPort, which Phase C
+    // already derives a spawned driver's identity from
+    // (launcherHost:agentPort). It does NOT report servesModels -- a
+    // launcher can spawn any model present under --models-dir, so it has
+    // no fixed answer to "what do you serve" the way a running agent does
+    // once told via --serves-model above. servesModels stays
+    // caller-supplied and unverified; do not add a fabricated one here.
+    server.route("POST", "/identity", [agentPort](const swarm::HttpRequest& req) -> swarm::HttpResponse {
+        std::string nonce;
+        if (!swarm::extractJsonString(req.body, "nonce", nonce)) {
+            return swarm::HttpResponse{400, R"({"error":"nonce must be a JSON string field"})"};
+        }
+        if (nonce.size() > 200) {
+            return swarm::HttpResponse{400, R"({"error":"nonce must not exceed 200 characters"})"};
+        }
+        std::string body = R"({"nonce":")" + swarm::jsonEscapeString(nonce) +
+                            R"(","agentPort":)" + std::to_string(agentPort) + "}";
+        return swarm::HttpResponse{200, body};
     });
 
     server.run();  // blocks forever

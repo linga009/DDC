@@ -426,6 +426,67 @@ TEST_F(LauncherFixture, DeletePipelineWithNoAgentRunningIsANoOpThatStillReturns2
     EXPECT_NE(probeResponse.find("\"error\""), std::string::npos);
 }
 
+// Endpoint Identity Hardening: POST /identity lets a coordinator verify a
+// launcher registration by asking the launcher itself, rather than
+// trusting whatever the caller of POST /launchers/register claimed.
+
+TEST_F(LauncherFixture, IdentityEndpointEchoesTheNonceAndReportsTheAgentPort) {
+    std::string body = R"({"nonce":"abc123"})";
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nContent-Type: application/json\r\n\r\n" + body;
+    std::string response = sendRawRequest(kLauncherPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos) << response;
+    EXPECT_NE(response.find(R"("nonce":"abc123")"), std::string::npos) << response;
+    EXPECT_NE(response.find(R"("agentPort":)" + std::to_string(kAgentPort)), std::string::npos) << response;
+    // No servesModels field -- a launcher can spawn any model present under
+    // --models-dir, so it has no fixed answer to "what do you serve" the
+    // way a running agent's own POST /identity does.
+    EXPECT_EQ(response.find("servesModels"), std::string::npos) << response;
+}
+
+TEST_F(LauncherFixture, IdentityEndpointRequiresNoAuthHeader) {
+    // Deliberate: this binary's entire trust boundary is HttpServer's
+    // 127.0.0.1-only bind, matching /pipeline and DELETE /pipeline's
+    // existing no-auth stance. A request with NO Authorization header at
+    // all must still succeed.
+    std::string body = R"({"nonce":"no-auth-needed"})";
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nContent-Type: application/json\r\n\r\n" + body;
+    std::string response = sendRawRequest(kLauncherPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos) << response;
+}
+
+TEST_F(LauncherFixture, IdentityEndpointRejectsAMissingNonceWith400) {
+    std::string body = R"({})";
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nContent-Type: application/json\r\n\r\n" + body;
+    std::string response = sendRawRequest(kLauncherPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 400"), std::string::npos) << response;
+}
+
+TEST_F(LauncherFixture, IdentityEndpointRejectsAnOversizedNonceWith400) {
+    std::string oversizedNonce(201, 'a');
+    std::string body = R"({"nonce":")" + oversizedNonce + R"("})";
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nContent-Type: application/json\r\n\r\n" + body;
+    std::string response = sendRawRequest(kLauncherPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 400"), std::string::npos) << response;
+}
+
+TEST_F(LauncherFixture, IdentityEndpointEscapesAQuoteAndBackslashInTheNonce) {
+    std::string body = R"({"nonce":"a\"b\\c"})";  // nonce value is: a"b\c
+    std::string request = "POST /identity HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nContent-Type: application/json\r\n\r\n" + body;
+    std::string response = sendRawRequest(kLauncherPort, request);
+
+    EXPECT_NE(response.find("HTTP/1.1 200"), std::string::npos) << response;
+    EXPECT_NE(response.find(R"("nonce":"a\"b\\c")"), std::string::npos) << response;
+}
+
 // Regression test for a whole-branch-review finding: pollHealthOnce() in
 // launcher_main.cpp used a plain blocking connect() to poll a just-spawned
 // agent's health port, and on this project's actual Windows/MSYS2 target
@@ -490,4 +551,45 @@ TEST(LauncherUnhealthySpawnTiming, PipelineEndpointFailsPromptlyWhenTheSpawnedAg
         << "unhealthy-spawn detection took " << elapsedSeconds
         << "s -- expected close to the intended ~30-45s ceiling now that connect() itself is bounded, "
            "not the pre-fix ~2m42s one";
+}
+
+// Endpoint Identity Hardening: proves --serves-model is actually threaded
+// through to the spawned agent's real argv, not just added to the source
+// without being wired into agentArgv. Reuses argv_echo for the same reason
+// the sibling unhealthy-spawn test above does -- it's the only way to
+// observe a spawned child's real argv, since nothing in-process can (see
+// argv_echo_main.cpp's own header comment). Pays the same ~30-45s
+// unhealthy-spawn-detection cost as that sibling test, for the same
+// underlying reason: argv_echo never binds --agent-port, so the launcher's
+// own health-poll loop has to exhaust before /pipeline's response returns.
+TEST(LauncherServesModelPassthrough, PipelineEndpointPassesServesModelToTheSpawnedAgentsRealArgv) {
+    constexpr int kLauncherPort = 50114;
+    constexpr int kAgentPort = 50115;
+
+    setTestAuthTokenEnv();
+    killAnyRunningLauncher();
+    startLauncherProcess(kLauncherPort, kAgentPort, SWARM_ARGV_ECHO_PATH);
+
+    std::string body = R"({"model":"tinyllama-1.1b-chat-v1.0.Q4_K_M","remoteEndpoints":"","layerPlacements":""})";
+    std::string request = "POST /pipeline HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nContent-Type: application/json\r\n\r\n" + body;
+    sendRawRequest(kLauncherPort, request);
+
+    killAnyRunningLauncher();
+
+    // argv_echo's argv[1] ("--model", the launcher's own first argv entry)
+    // is consumed as ITS output-file path, so the file is literally named
+    // "--model" -- see this file's sibling unhealthy-spawn test above for
+    // the full explanation of this layout.
+    std::ifstream in("--model");
+    std::string contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    std::remove("--model");
+
+    // The value passed must be the model ID the caller requested
+    // ("tinyllama-1.1b-chat-v1.0.Q4_K_M"), not the resolved .gguf FILE path
+    // (modelFile) --serves-model sits alongside in agentArgv -- so the
+    // agent's own POST /identity later reports the catalog id a coordinator
+    // actually registered against, not a filesystem path.
+    EXPECT_NE(contents.find("--serves-model\ntinyllama-1.1b-chat-v1.0.Q4_K_M\n"), std::string::npos) << contents;
 }
