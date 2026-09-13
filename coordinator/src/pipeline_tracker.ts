@@ -13,6 +13,14 @@ export interface PooledPipeline {
   // holding the port and the model's weights. Optional so entries built by
   // older code (and by tests) stay valid.
   launcherEndpoint?: string;
+  // The launcher's CANONICAL identity key (see endpoint_identity.ts's
+  // canonicalizeEndpoint()) as it was at assembly time -- kept alongside
+  // launcherEndpoint above, not in place of it: this is what
+  // claimedLauncherIds() tallies to recognise a launcher registered under
+  // an alias as the same machine, while launcherEndpoint remains the
+  // contact URL teardown actually calls DELETE on. Optional for the same
+  // reason launcherEndpoint is.
+  launcherIdentityKey?: string;
   state: PooledPipelineState;
   lastUsedAt: number;
 }

@@ -384,6 +384,7 @@ async function assemblePipeline(
     computeNodeIds: [],
     launcherId: launcher.launcherId,
     launcherEndpoint: launcher.endpoint,
+    launcherIdentityKey: launcher.identityKey,
     state: "assembling",
     lastUsedAt: Date.now(),
   });
@@ -453,6 +454,7 @@ async function assemblePipeline(
       computeNodeIds: selection.computeContributors.map(n => n.nodeId),
       launcherId: launcher.launcherId,
       launcherEndpoint: launcher.endpoint,
+      launcherIdentityKey: launcher.identityKey,
       state: "warm",
       lastUsedAt: Date.now(),
     });
@@ -702,7 +704,8 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           sendJson(res, 400, { error: "agentPort must be a positive integer" });
           return;
         }
-        const launcherId = launcherRegistry.register(normalizedLauncherEndpoint, candidate.servesModels as string[], candidate.agentPort);
+        const launcherIdentityKey = await canonicalizeEndpoint(normalizedLauncherEndpoint);
+        const launcherId = launcherRegistry.register(normalizedLauncherEndpoint, launcherIdentityKey, candidate.servesModels as string[], candidate.agentPort);
         sendJson(res, 200, { launcherId });
         return;
       }

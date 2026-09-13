@@ -946,7 +946,7 @@ test("POST /generate assembles a fresh pipeline via a registered launcher when n
     // the subsequent POST /complete call land on the one stub, which is
     // enough to prove the coordinator called the right two things with
     // the right data without needing two real processes.
-    launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
+    launcherRegistry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), ["big-model"], launcherPort);
 
     const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
@@ -1003,7 +1003,7 @@ test("POST /generate for a warm pipeline with an active driver never calls a reg
     registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
 
     const launcherPort = Number(new URL(launcherStub.endpoint).port);
-    launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherPort);
+    launcherRegistry.register(launcherStub.endpoint, await canonicalizeEndpoint(launcherStub.endpoint), ["big-model"], launcherPort);
 
     const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
@@ -1059,7 +1059,7 @@ test("POST /generate for a requiredNodeCount>1 model with a stale tracked pipeli
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
 
     const launcherPort = Number(new URL(stub.endpoint).port);
-    launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
+    launcherRegistry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), ["big-model"], launcherPort);
 
     const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
@@ -1123,7 +1123,7 @@ test("POST /generate for a warm pipeline heartbeats the driver, keeping it alive
       lastUsedAt: Date.now(),
     });
     const launcherPort = Number(new URL(launcherStub.endpoint).port);
-    launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherPort);
+    launcherRegistry.register(launcherStub.endpoint, await canonicalizeEndpoint(launcherStub.endpoint), ["big-model"], launcherPort);
 
     // Advance just under 30s and make a request. The driver is still
     // active by its original registration timestamp, so this should route
@@ -1223,7 +1223,7 @@ test("POST /generate marks a tracked pipeline failed when its driver's /complete
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
 
     const launcherPort = Number(new URL(launcherStub.endpoint).port);
-    launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherPort);
+    launcherRegistry.register(launcherStub.endpoint, await canonicalizeEndpoint(launcherStub.endpoint), ["big-model"], launcherPort);
 
     // First request: the tracked pipeline is warm and the driver is still
     // registered/active, so ensurePipelineReady routes straight to it --
@@ -1342,7 +1342,7 @@ test("POST /generate with a non-empty pool never calls ensurePipelineReady's lau
     // with the pool-first check deleted entirely.
     registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
-    launcherRegistry.register(launcherStub.endpoint, ["big-model"], Number(new URL(launcherStub.endpoint).port));
+    launcherRegistry.register(launcherStub.endpoint, await canonicalizeEndpoint(launcherStub.endpoint), ["big-model"], Number(new URL(launcherStub.endpoint).port));
 
     const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
@@ -1378,7 +1378,7 @@ test("POST /generate falls back to ensurePipelineReady's cold-start assembly whe
   try {
     registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
-    launcherRegistry.register(stub.endpoint, ["big-model"], Number(new URL(stub.endpoint).port));
+    launcherRegistry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), ["big-model"], Number(new URL(stub.endpoint).port));
 
     const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
@@ -1478,7 +1478,7 @@ test("POST /generate heartbeats whichever pool entry's driver it routes to, keep
     // instead of bailing out early on selectPipeline's candidate gate.
     registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
-    launcherRegistry.register(launcherStub.endpoint, ["big-model"], Number(new URL(launcherStub.endpoint).port));
+    launcherRegistry.register(launcherStub.endpoint, await canonicalizeEndpoint(launcherStub.endpoint), ["big-model"], Number(new URL(launcherStub.endpoint).port));
 
     now = 20000;
     const res1 = await generate();
@@ -1547,7 +1547,7 @@ test("POST /generate's cold-start assembly never claims a launcher already backi
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
 
     const agentPort = Number(new URL(sharedLauncher.endpoint).port);
-    const launcherId = launcherRegistry.register(sharedLauncher.endpoint, ["model-a", "model-b"], agentPort);
+    const launcherId = launcherRegistry.register(sharedLauncher.endpoint, await canonicalizeEndpoint(sharedLauncher.endpoint), ["model-a", "model-b"], agentPort);
     // model-a's live pipeline: its driver is the agent this launcher
     // already spawned, at the launcher's own host and agentPort.
     const driverA = registry.register(`http://127.0.0.1:${agentPort}`, await canonicalizeEndpoint(`http://127.0.0.1:${agentPort}`), "desktop", undefined, "model-a");
@@ -1607,8 +1607,8 @@ test("POST /generate's cold-start assembly skips a claimed launcher and uses an 
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
 
     // Registered FIRST, so findForModel's "first match" would pick it.
-    const claimedId = launcherRegistry.register(claimedLauncher.endpoint, ["model-a", "model-b"], Number(new URL(claimedLauncher.endpoint).port));
-    launcherRegistry.register(freeLauncher.endpoint, ["model-b"], Number(new URL(freeLauncher.endpoint).port));
+    const claimedId = launcherRegistry.register(claimedLauncher.endpoint, await canonicalizeEndpoint(claimedLauncher.endpoint), ["model-a", "model-b"], Number(new URL(claimedLauncher.endpoint).port));
+    launcherRegistry.register(freeLauncher.endpoint, await canonicalizeEndpoint(freeLauncher.endpoint), ["model-b"], Number(new URL(freeLauncher.endpoint).port));
 
     const driverA = registry.register("http://127.0.0.1:3", await canonicalizeEndpoint("http://127.0.0.1:3"), "desktop", undefined, "model-a");
     pipelineTracker.addEntry("model-a", { pipelineId: "pa", driverNodeId: driverA, computeNodeIds: [], launcherId: claimedId, state: "warm", lastUsedAt: Date.now() });
@@ -3734,7 +3734,7 @@ test("concurrent POST /generate on a cold pool assembles exactly one pipeline, n
     registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     const launcherPort = Number(new URL(stub.endpoint).port);
-    launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
+    launcherRegistry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), ["big-model"], launcherPort);
 
     await Promise.all(Array.from({ length: 10 }, () =>
       authFetch(`${baseUrl}/generate`, {
@@ -3828,7 +3828,7 @@ test("two different models cold-starting at once never share one launcher", asyn
     const launcherPort = Number(new URL(stub.endpoint).port);
     // ONE launcher machine serving both models -- servesModels is an array,
     // so a multi-model launcher is exactly the case Phase C exists for.
-    launcherRegistry.register(stub.endpoint, ["model-a", "model-b"], launcherPort);
+    launcherRegistry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), ["model-a", "model-b"], launcherPort);
 
     await Promise.all(["model-a", "model-b"].map(modelId =>
       authFetch(`${baseUrl}/generate`, {
@@ -3872,7 +3872,7 @@ test("POST /generate does not respawn a driver that is already reputation-ejecte
     registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     const launcherPort = Number(new URL(stub.endpoint).port);
-    launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
+    launcherRegistry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), ["big-model"], launcherPort);
 
     // Same identity computation production code uses: canonicalize first,
     // then hash -- stableNodeId() no longer canonicalizes on its own
@@ -3898,7 +3898,7 @@ test("POST /generate does not respawn a driver that is already reputation-ejecte
     try {
       control.registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
       control.registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
-      control.launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
+      control.launcherRegistry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), ["big-model"], launcherPort);
       await authFetch(`${control.baseUrl}/generate`, {
         method: "POST",
         headers: { "content-type": "application/json" },

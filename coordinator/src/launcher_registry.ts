@@ -3,6 +3,15 @@ import { randomUUID } from "node:crypto";
 export interface LauncherInfo {
   launcherId: string;
   endpoint: string;
+  // Canonical identity key (see endpoint_identity.ts's canonicalizeEndpoint())
+  // for the machine this launcher is reachable at -- distinct from
+  // launcherId, which is a randomUUID re-minted whenever a lapsed
+  // registration re-registers. Matching a re-registration on THIS instead
+  // of raw endpoint equality is what recognises one physical launcher
+  // registered under two aliases (127.0.0.1 vs localhost) as one machine,
+  // rather than two, which was live-verified to let a second model claim
+  // the "other" alias and receive the wrong model's weights.
+  identityKey: string;
   servesModels: string[];
   agentPort: number;
 }
@@ -30,17 +39,25 @@ export class LauncherRegistry {
     this.timeoutMs = timeoutMs;
   }
 
-  register(endpoint: string, servesModels: string[], agentPort: number): string {
+  // `identityKey` is the CANONICAL identity for `endpoint` -- the caller
+  // has already resolved/canonicalized it before calling this, same
+  // division of responsibility as NodeRegistry.register().
+  register(endpoint: string, identityKey: string, servesModels: string[], agentPort: number): string {
     const now = this.clock();
     for (const [launcherId, launcher] of this.launchers) {
       if (now - launcher.lastSeen > this.timeoutMs) {
         this.launchers.delete(launcherId);
         continue;
       }
-      if (launcher.endpoint === endpoint) {
+      if (launcher.identityKey === identityKey) {
         // Refresh in place rather than minting a duplicate entry for the
-        // same endpoint -- also picks up an updated servesModels/agentPort
+        // same machine -- also picks up an updated servesModels/agentPort
         // if the operator restarted the launcher with different flags.
+        // Matching on identityKey (not raw endpoint equality) is what
+        // recognises this launcher under an alias it registered under
+        // before -- endpoint itself is intentionally left as whatever it
+        // was first registered as, unchanged here, matching this
+        // registry's existing behavior for servesModels/agentPort above.
         launcher.servesModels = servesModels;
         launcher.agentPort = agentPort;
         launcher.lastSeen = now;
@@ -48,7 +65,7 @@ export class LauncherRegistry {
       }
     }
     const launcherId = randomUUID();
-    this.launchers.set(launcherId, { launcherId, endpoint, servesModels, agentPort, lastSeen: now });
+    this.launchers.set(launcherId, { launcherId, endpoint, identityKey, servesModels, agentPort, lastSeen: now });
     return launcherId;
   }
 
@@ -71,7 +88,7 @@ export class LauncherRegistry {
     const active: LauncherInfo[] = [];
     for (const [launcherId, launcher] of this.launchers) {
       if (now - launcher.lastSeen <= this.timeoutMs) {
-        active.push({ launcherId: launcher.launcherId, endpoint: launcher.endpoint, servesModels: launcher.servesModels, agentPort: launcher.agentPort });
+        active.push({ launcherId: launcher.launcherId, endpoint: launcher.endpoint, identityKey: launcher.identityKey, servesModels: launcher.servesModels, agentPort: launcher.agentPort });
       } else {
         this.launchers.delete(launcherId);
       }

@@ -126,7 +126,7 @@ export function planAllocations(
         continue;
       }
       claimed.add(launcher.launcherId);
-      claimed.add(launcher.endpoint); // keep this set's identity rule identical to isLauncherClaimed's
+      claimed.add(launcher.identityKey); // keep this set's identity rule identical to isLauncherClaimed's
       claims.push({ modelId: snapshot.modelId, launcher });
       deficit--;
     }
@@ -158,23 +158,28 @@ export function claimedLauncherIds(
   pipelineTracker: PipelineTracker,
   exclude?: PooledPipeline,
 ): Set<string> {
-  // Tallies BOTH the launcherId and the launcher's endpoint. launcherId is
+  // Tallies BOTH the launcherId and the launcher's CANONICAL identity key
+  // (endpoint_identity.ts's canonicalizeEndpoint(), stored per pool entry
+  // as launcherIdentityKey -- Endpoint Identity Hardening). launcherId is
   // a randomUUID that LauncherRegistry re-mints whenever a lapsed
   // registration is re-registered (it refreshes in place only while
   // unexpired), so after any launcher restart or >timeoutMs heartbeat gap
   // the pool's stored id no longer matches the live one -- and the physical
   // machine stopped looking busy even though its agent was still running
-  // and its pool entry still alive. Checking the endpoint as well survives
-  // that id rotation.
+  // and its pool entry still alive. Checking the identity key as well
+  // survives that id rotation.
   //
-  // The endpoint is a stable STRING, not a canonical machine identity: one
+  // Before Endpoint Identity Hardening this tallied the raw endpoint
+  // STRING instead, which is not a canonical machine identity: one
   // physical launcher registered as both http://127.0.0.1:P and
-  // http://localhost:P yields two live registry entries that this tally
-  // cannot connect, so it can still be double-claimed. That is the same
-  // endpoint-aliasing class already disclosed for node identity in
-  // Security Phase 3 (see README's Known gaming vectors), and closing it
-  // needs the same proof-of-endpoint-possession mechanism that phase's
-  // design already ruled out of scope -- not fixed here.
+  // http://localhost:P produced two live registry entries this tally
+  // could not connect, so it could still be double-claimed -- live-
+  // verified during Phase C's third review to serve a caller another
+  // model's weights with a 200. The identity key collapses that alias
+  // pair to one string; it is still a string, not a proof of possession,
+  // so a DNS-name alias pointed at a different machine you don't control
+  // is a separate, disclosed residual gap -- see README's Known gaming
+  // vectors.
   const claimed = new Set<string>();
   for (const modelId of catalog.multiPipelineModelIds()) {
     for (const entry of pipelineTracker.getPool(modelId)) {
@@ -182,8 +187,8 @@ export function claimedLauncherIds(
         continue;
       }
       claimed.add(entry.launcherId);
-      if (entry.launcherEndpoint) {
-        claimed.add(entry.launcherEndpoint);
+      if (entry.launcherIdentityKey) {
+        claimed.add(entry.launcherIdentityKey);
       }
     }
   }
@@ -191,9 +196,9 @@ export function claimedLauncherIds(
 }
 
 // A launcher counts as claimed under either identity -- see
-// claimedLauncherIds() for why the endpoint has to be checked too.
+// claimedLauncherIds() for why the identity key has to be checked too.
 export function isLauncherClaimed(claimed: Set<string>, launcher: LauncherInfo): boolean {
-  return claimed.has(launcher.launcherId) || claimed.has(launcher.endpoint);
+  return claimed.has(launcher.launcherId) || claimed.has(launcher.identityKey);
 }
 
 // The endpoint a launcher-spawned driver is reachable at: the launcher's
@@ -556,6 +561,7 @@ export class PipelinePoolManager {
       computeNodeIds: [],
       launcherId: launcher.launcherId,
       launcherEndpoint: launcher.endpoint,
+      launcherIdentityKey: launcher.identityKey,
       state: "assembling",
       lastUsedAt: Date.now(),
     });
@@ -592,6 +598,7 @@ export class PipelinePoolManager {
         computeNodeIds: selection.computeContributors.map(n => n.nodeId),
         launcherId: launcher.launcherId,
         launcherEndpoint: launcher.endpoint,
+        launcherIdentityKey: launcher.identityKey,
         state: "warm",
         // Wall-clock Date.now(), never an injected clock: server.ts's
         // /generate path stamps this same field with a raw Date.now() when
