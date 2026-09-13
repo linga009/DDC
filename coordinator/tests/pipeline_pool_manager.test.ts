@@ -233,6 +233,16 @@ test("runOnce refuses to let a launcher-spawned driver silently adopt a squatter
     const squatted = active.find(n => n.endpoint === squatterEndpoint);
     assert.ok(squatted, "the squatter's entry must still exist, completely untouched");
     assert.equal(squatted?.servesModel, "squatted-model", "the squatter's entry must NOT have acquired the driver's servesModel");
+
+    // Fourth whole-branch review, Important finding: the real agent the
+    // launcher just spawned must not be left running, orphaned, forever --
+    // never registered anywhere, holding the launcher's fixed agent port
+    // and real model weights in RAM. Live-verified before this fix: the
+    // launcher was left with a live, unregistered agent, and every
+    // subsequent tick found this same launcher "idle" and respawned over
+    // it again -- a fresh multi-GB load per tick, indefinitely, for as
+    // long as the squat persists.
+    assert.equal(launcherStub.getDeleteCalls(), 1, "the orphaned agent must be torn down immediately when the driver's registration is refused, not left running");
   } finally {
     launcherStub.server.close();
   }

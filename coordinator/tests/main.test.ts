@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readFileSync, writeFileSync } from "node:fs";
 import { loadSafetyRules } from "../src/safety_rules_loader.ts";
+import { withRealSafetyRulesFileLock } from "./safety_rules_file_lock.ts";
 
 const mainPath = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 
@@ -169,40 +170,52 @@ async function withCorruptedRulesFile(
   replacement: string,
   run: () => Promise<void>,
 ): Promise<void> {
-  const rulesPath = fileURLToPath(new URL("../safety_rules.json", import.meta.url));
-  const original = readFileSync(rulesPath, "utf-8");
-  let corrupted = false;
+  // Fourth whole-branch review of the endpoint-identity-hardening branch,
+  // Important finding, fixed here: without this lock, this function's
+  // write-then-restore window could overlap with
+  // safety_rules_loader.test.ts's own tests reading this exact same real
+  // file directly in a separate `node --test` process -- live-reproduced
+  // as a real, reproducible (not theoretical) suite failure: those tests
+  // occasionally saw "not valid JSON" mid-window even though this file is
+  // always correctly restored afterward. See safety_rules_file_lock.ts's
+  // own comment for the full reasoning; that same lock must be held by
+  // every reader of the real file too, not just this writer.
+  await withRealSafetyRulesFileLock(async () => {
+    const rulesPath = fileURLToPath(new URL("../safety_rules.json", import.meta.url));
+    const original = readFileSync(rulesPath, "utf-8");
+    let corrupted = false;
 
-  const restore = () => {
-    if (!corrupted) return;
-    corrupted = false;
-    // Best-effort: an exit hook must not throw, or it masks the real failure.
+    const restore = () => {
+      if (!corrupted) return;
+      corrupted = false;
+      // Best-effort: an exit hook must not throw, or it masks the real failure.
+      try {
+        writeFileSync(rulesPath, original, "utf-8");
+      } catch {
+        // ignored deliberately
+      }
+    };
+    const onSignal = () => {
+      restore();
+      process.exit(1);
+    };
+    // "exit" covers process.exit()/normal teardown; the signal handlers cover
+    // an operator's Ctrl-C, which otherwise terminates without running "exit".
+    process.on("exit", restore);
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
+
+    writeFileSync(rulesPath, replacement, "utf-8");
+    corrupted = true;
     try {
-      writeFileSync(rulesPath, original, "utf-8");
-    } catch {
-      // ignored deliberately
+      await run();
+    } finally {
+      restore();
+      process.off("exit", restore);
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
     }
-  };
-  const onSignal = () => {
-    restore();
-    process.exit(1);
-  };
-  // "exit" covers process.exit()/normal teardown; the signal handlers cover
-  // an operator's Ctrl-C, which otherwise terminates without running "exit".
-  process.on("exit", restore);
-  process.on("SIGINT", onSignal);
-  process.on("SIGTERM", onSignal);
-
-  writeFileSync(rulesPath, replacement, "utf-8");
-  corrupted = true;
-  try {
-    await run();
-  } finally {
-    restore();
-    process.off("exit", restore);
-    process.off("SIGINT", onSignal);
-    process.off("SIGTERM", onSignal);
-  }
+  });
 }
 
 async function startupFailure(): Promise<{ exitCode: number | null; stderr: string }> {

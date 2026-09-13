@@ -10,7 +10,7 @@ import { LauncherRegistry } from "./launcher_registry.ts";
 import { PipelineTracker } from "./pipeline_tracker.ts";
 import { selectPipeline } from "./pipeline_selector.ts";
 import { DemandTracker } from "./demand_tracker.ts";
-import { assertDriverIdentityFree, claimedLauncherIds, isLauncherClaimed, launcherDriverEndpoint, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
+import { assertDriverIdentityFree, claimedLauncherIds, DriverIdentityCollisionError, isLauncherClaimed, launcherDriverEndpoint, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
 import { canonicalizeEndpoint } from "./endpoint_identity.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
@@ -207,11 +207,26 @@ async function readIdentityResponseJson(res: Response, endpoint: string): Promis
 // notion of either), matching the design doc's own per-field table.
 //
 // Deliberately NOT used for the launcher-spawned internal driver
-// registrations in assemblePipeline()/tryAssemble(): the coordinator just
-// told a launcher to spawn that agent, which may not be listening yet, so
-// calling this there would fail spuriously on a live, correct spawn. Only
-// the PUBLIC POST /nodes/register route (an operator registering a node
-// they claim already exists) calls this.
+// registrations in assemblePipeline()/tryAssemble(). Fourth whole-branch
+// review, Minor finding, corrected here: this used to justify the
+// omission by claiming the freshly-spawned agent "may not be listening
+// yet" -- false. POST /pipeline (core/src/launcher_main.cpp) only ever
+// returns success AFTER its own waitForAgentHealthy() confirms the agent
+// is healthy, so by the time assemblePipeline()/tryAssemble() reach their
+// registration step, the agent is provably up. The real reason this call
+// is skipped: deviceTier/servesModel for this one registration are not an
+// untrusted caller's claims needing verification in the first place --
+// deviceTier is hardcoded "desktop" (a launcher is inherently a
+// non-mobile, process-spawning machine, see the registration call site's
+// own comment) and servesModel is the modelId the coordinator itself just
+// requested via this same POST /pipeline call, which the launcher passed
+// to the spawned agent as `--serves-model` (core/src/launcher_main.cpp).
+// Calling /identity here would only re-confirm, at the cost of one more
+// network round-trip per assembly, facts the coordinator already
+// established by driving the spawn itself -- unlike the public route
+// below, where the endpoint's claim is the ONLY thing the coordinator
+// knows about it. Only the PUBLIC POST /nodes/register route (an operator
+// registering a node they claim already exists) calls this.
 //
 // Also deliberately NOT called at all when the caller's request has no
 // servesModel claim -- see this function's own call site for why (a real,
@@ -660,6 +675,23 @@ async function assemblePipeline(
   } catch (err) {
     console.warn(`failed to assemble pipeline for model ${modelId} via launcher ${launcher.endpoint}:`, err);
     pipelineTracker.removeEntry(modelId, reservationId);
+    if (err instanceof DriverIdentityCollisionError) {
+      // Fourth whole-branch review, Important finding, fixed here:
+      // assertDriverIdentityFree() (see its own comment) only throws AFTER
+      // POST /pipeline already returned success -- the launcher genuinely
+      // spawned a real agent, loading real weights into RAM and holding
+      // the launcher's fixed agent port, before this registration was
+      // refused. Without this call that agent was orphaned: never
+      // registered anywhere, never torn down, and the reconciliation loop
+      // (and any other cold-start attempt) would keep finding this same
+      // launcher "idle" and keep respawning over it -- live-verified to
+      // spawn a fresh real agent on every single reconciliation tick
+      // forever while the squat persists, strictly worse in resource terms
+      // than doing nothing. Tearing it down here matches the success
+      // path's own handling a few lines up (replacing a DIFFERENT
+      // launcher's still-running agent already calls this same helper).
+      await stopLauncherPipeline(launcherRegistry, launcher.launcherId, launcher.endpoint);
+    }
     if (tracked) {
       pipelineTracker.markEntryFailed(modelId, tracked.pipelineId);
     }
@@ -819,6 +851,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         const existingServesModel = registry.listActive().find(n => n.nodeId === identityNodeId)?.servesModel;
         let resolvedDeviceTier: DeviceTier;
         let resolvedServesModel: string | undefined;
+        let usedUnreachableFallback = false;
         try {
           const verified = await verifyNodeIdentity(normalizedNodeEndpoint, authToken, catalog, servesModel);
           resolvedDeviceTier = verified.deviceTier;
@@ -827,6 +860,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           if (err instanceof UnreachableEndpointError && servesModel === undefined && existingServesModel === undefined) {
             resolvedDeviceTier = candidate.deviceTier as DeviceTier;
             resolvedServesModel = undefined;
+            usedUnreachableFallback = true;
           } else {
             sendJson(res, 502, { error: err instanceof IdentityVerificationError ? err.message : "failed to verify this registration" });
             return;
@@ -859,6 +893,42 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
             error: `this identity is already registered under a different endpoint (${pinnedEndpointAtCommit}) -- registration refused rather than silently reassigning it`,
           });
           return;
+        }
+        // Fourth whole-branch review, Critical finding, fixed here: round
+        // 3's re-check above closed the TOCTOU for the PINNED ENDPOINT, but
+        // `existingServesModel` a few lines up has the exact same shape --
+        // read BEFORE `await verifyNodeIdentity()`, used AFTER it, with
+        // nothing re-confirming it's still current at commit time. This
+        // reopens round 2's Critical (a real, verified servesModel silently
+        // stripped) whenever two registrations for the SAME endpoint race:
+        // this project's own agent is single-threaded (documented above),
+        // so a burst of registration calls hitting a busy agent is a
+        // plausible, not contrived, way for one call's identity check to
+        // outlast IDENTITY_TIMEOUT_MS while another's succeeds moments
+        // earlier -- no attacker required, though one can force it by
+        // occupying the agent deliberately. Live-reproduced: the loser's
+        // `existingServesModel` read as undefined (nothing had committed
+        // yet), so it took the compute-contributor fallback and proceeded
+        // to overwrite the winner's just-committed, genuinely-verified
+        // servesModel with nothing -- passing round 3's own endpoint
+        // re-check trivially, since both calls target the identical
+        // endpoint string (not a colliding alias), so "the same as pinned"
+        // is true and that check never fires. Re-confirming here,
+        // synchronously, with no `await` before registry.register() below,
+        // that nothing has since committed a real servesModel for this
+        // identity before allowing the fallback's result through applies
+        // the same rule this file has now had to state three times: no
+        // decision this handler already made may reach registry.register()
+        // without being re-confirmed against the CURRENT registry state at
+        // the exact point of commitment.
+        if (usedUnreachableFallback) {
+          const servesModelAtCommit = registry.listActive().find(n => n.nodeId === identityNodeId)?.servesModel;
+          if (servesModelAtCommit !== undefined) {
+            sendJson(res, 502, {
+              error: `${normalizedNodeEndpoint} could not be reached to verify this registration, and this identity already has a verified servesModel (${JSON.stringify(servesModelAtCommit)}) at stake -- registration refused rather than silently overwriting it`,
+            });
+            return;
+          }
         }
         const nodeId = registry.register(normalizedNodeEndpoint, identityKey, resolvedDeviceTier, localityGroup, resolvedServesModel, availableMemoryMb);
         sendJson(res, 200, { nodeId });

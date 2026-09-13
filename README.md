@@ -650,7 +650,16 @@ Endpoints:
   model instead of trying every registered one in turn — this field stays
   caller-supplied and unverified (a launcher has no single fixed answer to
   "what do you serve", unlike an agent's one `servesModel`). Re-registering
-  the same identity refreshes the entry rather than duplicating it. **Also
+  the same identity refreshes the entry rather than duplicating it, exactly
+  like a node re-registration overwrites its own `servesModel` claim — live-verified
+  the same consequence applies here: any token-holder who knows a
+  launcher's exact registered endpoint can silently blank its `servesModels`
+  (e.g. `[]`) with one call, and every model that launcher used to be
+  eligible for stops finding it in `listForModel()` — a targeted
+  availability/denial primitive with the same shape as the node-side
+  overwrite vector documented in "Known gaming vectors" below, not a
+  hijack (it cannot redirect an existing warm pipeline's traffic; a fresh
+  cold-start assembly simply won't consider this launcher anymore). **Also
   covered by Endpoint Identity Hardening**, and — per the whole-branch
   review that shipped it — the *higher*-severity surface of the two: the
   same canonicalize-then-verify-then-409-on-collision mechanism described
@@ -825,6 +834,30 @@ default catalog declares one.
   and a squatter can still register an identity *first*, before the real
   launcher ever tries — proof-of-endpoint-possession, needed to close that,
   remains out of scope (see below).
+- **A squatted DRIVER identity (not the launcher's own) costs a model its
+  availability for as long as the squat persists, with real, repeated
+  resource cost, not just a one-time failure.** Canonicalization also
+  creates a NEW identity collision this phase's own internal
+  driver-registration path (a launcher-spawned agent registering itself,
+  not an operator calling the HTTP route) has to defend against — it calls
+  `registry.register()` directly, bypassing every route-level check, so it
+  guards itself with its own pre-commit check instead
+  (`assertDriverIdentityFree()`), refusing the registration rather than
+  silently inheriting a squatter's pinned endpoint the way an early version
+  of this fix did (live-verified during whole-branch review: a real
+  user's prompt handed to the squatter with a `200`, closed before merge).
+  The residual once a squat IS detected: the launcher was already told to
+  spawn a real agent (`POST /pipeline` succeeded) before the squat is
+  discovered, so refusing the registration now correctly tears that agent
+  down (`DELETE /pipeline`) rather than leaking it — but the model stays
+  unavailable, and the *next* reconciliation tick (10 seconds, in
+  production) tries again: spawn, health-check, discover the same squat,
+  tear down, repeat, indefinitely, for as long as the squat persists. This
+  is real, repeated compute/memory churn on the affected launcher (a fresh
+  multi-GB model load every tick), not a one-time cost — and there is
+  deliberately no backoff added for it, matching this phase's existing
+  disclose-rather-than-engineer-around posture for a mechanism that ships
+  dormant in production.
 - **A hung launcher can cost an unrelated healthy model its pipeline.** The
   reconciliation tick awaits launcher I/O sequentially with a 60-second
   timeout — twice the registry's 30-second node timeout — and the driver
@@ -1113,7 +1146,28 @@ identity by design (this phase deliberately excludes the scheme from the
 key), so an operator moving a node to TLS on the same port gets locked out
 with `409` until the old plaintext entry ages out (≤30s) — a real but
 minor operational surprise, not a security gap, worth knowing when
-migrating a node. Relatedly, an ejected node does not even need to
+migrating a node.
+**DNS rebinding is a real residual, not just a theoretical one:** the
+identity key is resolved once, at registration time, but the *contact*
+URL is deliberately stored and re-resolved by the OS on every later
+`fetch()` (this has to be true — substituting a resolved IP would break
+TLS SNI and name-based virtual hosting, see `POST /nodes/register`
+above). So an attacker who controls a DNS name and points it at a real
+victim's IP:port at the moment of registration passes verification
+genuinely — the callback lands on the real victim, who reports its own
+true `servesModel`/`deviceTier` — and the registration is accepted under
+that name. If the attacker then repoints the DNS record, every future
+`/generate` call resolves the same registered name to the attacker's own
+IP instead, with no further check. The verification callback proves "this
+name resolved to a host that answered correctly at registration time," not
+"the host I will actually contact on every future request is that same
+one" — a gap the design's own Known Risks section already named but this
+README had not yet spelled out. Not fixed here: pinning the resolved
+address for the life of the registration, or re-canonicalizing before
+every forward, is a real design decision with its own tradeoffs (a pinned
+IP breaks a legitimately-moved node until it re-registers), not a
+same-shape patch to the mechanism above.
+Relatedly, an ejected node does not even need to
 re-register to come back: the reputation-mutating routes deliberately
 check the *unfiltered* node list rather than the reputation-filtered one
 (so an already-ejected node stays reachable for legitimate agree/disagree

@@ -831,6 +831,70 @@ test("POST /nodes/register: two registrations racing the same colliding identity
   }
 });
 
+test("POST /nodes/register: a registration that times out mid-race must not overwrite a servesModel another registration for the SAME endpoint just committed", async () => {
+  // Fourth whole-branch review, Critical finding: round 3's re-check above
+  // (pinnedEndpointAtCommit) only re-confirms the ENDPOINT is still free --
+  // `existingServesModel` a few lines up has the exact same stale-read
+  // shape, read BEFORE `await verifyNodeIdentity()` and used AFTER it with
+  // nothing re-confirming it at commit time. This is NOT caught by the
+  // endpoint re-check because it doesn't require colliding aliases at
+  // all -- two registrations of the IDENTICAL endpoint string race each
+  // other, one's identity check succeeds while the other's times out
+  // (this project's own agent is single-threaded, so a busy agent makes
+  // this a plausible, not contrived, interleaving), and the timed-out
+  // one's stale "nothing verified yet" read lets it silently overwrite the
+  // other's just-committed, genuinely-verified servesModel with nothing.
+  // This stub answers the FIRST /identity call instantly with a real
+  // servesModel, and never answers the second at all -- it must genuinely
+  // hit IDENTITY_TIMEOUT_MS to reproduce a real UnreachableEndpointError,
+  // not a contrived shortcut, so this test genuinely takes ~5s.
+  let identityCallCount = 0;
+  const stubServer = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}") as Record<string, unknown>;
+    identityCallCount++;
+    if (identityCallCount === 1) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: body.nonce, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }));
+    }
+    // Second and later calls: deliberately never respond -- the caller's
+    // own AbortSignal.timeout(IDENTITY_TIMEOUT_MS) is what ends this.
+  });
+  await new Promise<void>(resolve => stubServer.listen(0, "127.0.0.1", resolve));
+  const address = stubServer.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected stub to bind to a port");
+  }
+  const endpoint = `http://127.0.0.1:${address.port}`;
+  const { server, baseUrl, registry } = await startTestServer();
+  try {
+    const [resA, resB] = await Promise.all([
+      authFetch(`${baseUrl}/nodes/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ endpoint, deviceTier: "desktop" }),
+      }),
+      authFetch(`${baseUrl}/nodes/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ endpoint, deviceTier: "android" }),
+      }),
+    ]);
+
+    const statuses = [resA.status, resB.status].sort();
+    assert.deepEqual(statuses, [200, 502], "exactly one of the two racing registrations may succeed -- the timed-out one must be refused, never silently absorbed");
+
+    const active = registry.listActive();
+    assert.equal(active.length, 1);
+    assert.equal(active[0].servesModel, "tinyllama-1.1b", "the verified registration's servesModel must survive the other one timing out, never silently cleared");
+    assert.equal(active[0].deviceTier, "desktop", "the timed-out registration's own unverified deviceTier claim must never land on the verified entry either");
+  } finally {
+    server.close();
+    stubServer.close();
+  }
+});
+
 test("POST /nodes/:nodeId/heartbeat returns 204 for a known node and 404 for an unknown one", async () => {
   const { server, baseUrl } = await startTestServer();
   try {
@@ -1699,6 +1763,12 @@ test("POST /generate refuses to let a launcher-spawned driver silently adopt a s
     const squatted = active.find(n => n.endpoint === squatterEndpoint);
     assert.ok(squatted, "the squatter's entry must still exist, completely untouched");
     assert.equal(squatted?.servesModel, "squatted-model", "the squatter's entry must NOT have acquired the driver's servesModel -- this is the exact hijack the fix closes");
+
+    // Fourth whole-branch review, Important finding: the real agent this
+    // stub just spawned (as far as the coordinator is concerned -- POST
+    // /pipeline returned success) must not be left orphaned, running
+    // forever with no registration anywhere.
+    assert.equal(stub.getDeleteCalls(), 1, "the orphaned agent must be torn down immediately when the driver's registration is refused, not left running");
   } finally {
     server.close();
     stub.server.close();
@@ -3306,10 +3376,22 @@ async function startStubNodeAgent(
   handler: (body: unknown) => { status: number; body: unknown },
   identity: { deviceTier?: string; servesModel?: string } = { deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
 ) {
+  // Tracks DELETE /pipeline calls (Phase C's launcher teardown, and now
+  // this phase's own orphaned-agent cleanup on a squatted driver identity
+  // -- see the squat test below) -- exposed via getDeleteCalls() so a test
+  // can assert a real teardown happened, mirroring
+  // pipeline_pool_manager.test.ts's own startStubLauncher() helper.
+  let deleteCalls = 0;
   const server = createHttpServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
     const body = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
+    if (req.method === "DELETE") {
+      deleteCalls++;
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     if (req.url === "/identity") {
       const candidate = body as Record<string, unknown>;
       res.writeHead(200, { "content-type": "application/json" });
@@ -3325,7 +3407,7 @@ async function startStubNodeAgent(
   if (address === null || typeof address === "string") {
     throw new Error("expected stub node agent to bind to a port");
   }
-  return { server, endpoint: `http://127.0.0.1:${address.port}` };
+  return { server, endpoint: `http://127.0.0.1:${address.port}`, getDeleteCalls: () => deleteCalls };
 }
 
 // Minimal stand-in for a real swarm-node-agent/swarm-launcher, used ONLY to

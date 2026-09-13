@@ -652,6 +652,14 @@ export class PipelinePoolManager {
     } catch (err) {
       console.warn(`failed to assemble pipeline for model ${modelId} via launcher ${launcher.endpoint}:`, err);
       this.pipelineTracker.removeEntry(modelId, reservationId);
+      if (err instanceof DriverIdentityCollisionError) {
+        // Fourth whole-branch review, Important finding, fixed here --
+        // same reasoning as server.ts's assemblePipeline() catch block:
+        // assertDriverIdentityFree() only throws after POST /pipeline
+        // already returned success, so refusing the registration must not
+        // orphan the real agent the launcher just spawned.
+        await stopLauncherPipeline(this.launcherRegistry, launcher.launcherId, launcher.endpoint);
+      }
       return false;
     }
   }

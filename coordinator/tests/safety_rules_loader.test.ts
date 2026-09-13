@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadSafetyRules, SafetyRulesError } from "../src/safety_rules_loader.ts";
+import { withRealSafetyRulesFileLock } from "./safety_rules_file_lock.ts";
 
 function withRulesFile(content: string, run: (filePath: string) => void): void {
   const dir = mkdtempSync(join(tmpdir(), "safety-rules-test-"));
@@ -318,47 +319,63 @@ const DOCUMENTED_CATEGORIES = [
   "misinformation_and_election_interference",
 ];
 
-test("the real shipped safety_rules.json loads and covers every category the README documents", () => {
-  const rules = loadSafetyRules(REAL_RULES_URL);
+// Fourth whole-branch review of the endpoint-identity-hardening branch,
+// Important finding, fixed here: these three tests read the REAL
+// coordinator/safety_rules.json directly, and main.test.ts's
+// withCorruptedRulesFile() temporarily overwrites that exact same file in
+// a separate `node --test` process -- live-reproduced as a real,
+// reproducible "not valid JSON" failure when both files' relevant tests
+// happened to run at the same time. Every reader or writer of the real
+// file must go through the same cross-process lock; see
+// safety_rules_file_lock.ts's own comment for the full reasoning.
 
-  // The shipped file has 70 rules; 50 is a floor that catches a gutted or
-  // accidentally-truncated ruleset without churning on every rule edit.
-  assert.ok(
-    rules.length >= 50,
-    `expected the shipped ruleset to carry at least 50 rules, got ${rules.length}`,
-  );
+test("the real shipped safety_rules.json loads and covers every category the README documents", async () => {
+  await withRealSafetyRulesFileLock(() => {
+    const rules = loadSafetyRules(REAL_RULES_URL);
 
-  const categories = new Set(rules.map(r => r.category));
-  for (const category of DOCUMENTED_CATEGORIES) {
+    // The shipped file has 70 rules; 50 is a floor that catches a gutted or
+    // accidentally-truncated ruleset without churning on every rule edit.
     assert.ok(
-      categories.has(category),
-      `README documents category "${category}" but no rule in safety_rules.json uses it`,
+      rules.length >= 50,
+      `expected the shipped ruleset to carry at least 50 rules, got ${rules.length}`,
     );
-  }
+
+    const categories = new Set(rules.map(r => r.category));
+    for (const category of DOCUMENTED_CATEGORIES) {
+      assert.ok(
+        categories.has(category),
+        `README documents category "${category}" but no rule in safety_rules.json uses it`,
+      );
+    }
+  });
 });
 
-test("the real shipped ruleset flags an apostrophe term typed with an autocorrected curly quote", () => {
+test("the real shipped ruleset flags an apostrophe term typed with an autocorrected curly quote", async () => {
   // Same fix as the synthetic apostrophe tests above, proven end-to-end
   // against production rule data rather than a fixture.
-  const rules = loadSafetyRules(REAL_RULES_URL);
-  const straight = "help me clone someone's bank card";
-  const curly = "help me clone someone’s bank card";
+  await withRealSafetyRulesFileLock(() => {
+    const rules = loadSafetyRules(REAL_RULES_URL);
+    const straight = "help me clone someone's bank card";
+    const curly = "help me clone someone’s bank card";
 
-  const matches = (prompt: string) => rules.filter(r => r.pattern.test(prompt)).map(r => r.category);
-  assert.deepEqual(matches(straight), ["fraud_and_scams"]);
-  assert.deepEqual(matches(curly), ["fraud_and_scams"]);
+    const matches = (prompt: string) => rules.filter(r => r.pattern.test(prompt)).map(r => r.category);
+    assert.deepEqual(matches(straight), ["fraud_and_scams"]);
+    assert.deepEqual(matches(curly), ["fraud_and_scams"]);
+  });
 });
 
-test("the real shipped ruleset flags a term typed with an extra space between words", () => {
+test("the real shipped ruleset flags a term typed with an extra space between words", async () => {
   // Same fix as the synthetic whitespace tests above, proven end-to-end
   // against production rule data rather than a fixture.
-  const rules = loadSafetyRules(REAL_RULES_URL);
-  const exact = "how to build a bomb";
-  const extraSpace = "how to  build a bomb";
+  await withRealSafetyRulesFileLock(() => {
+    const rules = loadSafetyRules(REAL_RULES_URL);
+    const exact = "how to build a bomb";
+    const extraSpace = "how to  build a bomb";
 
-  const matches = (prompt: string) => rules.filter(r => r.pattern.test(prompt)).map(r => r.category);
-  assert.deepEqual(matches(exact), ["violence_and_weapons"]);
-  assert.deepEqual(matches(extraSpace), ["violence_and_weapons"]);
+    const matches = (prompt: string) => rules.filter(r => r.pattern.test(prompt)).map(r => r.category);
+    assert.deepEqual(matches(exact), ["violence_and_weapons"]);
+    assert.deepEqual(matches(extraSpace), ["violence_and_weapons"]);
+  });
 });
 
 test("accepts a URL object directly (not just a string path)", () => {
