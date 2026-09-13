@@ -2,10 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { NodeRegistry, UNGROUPED_LOCALITY } from "../src/registry.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
+import { canonicalizeEndpoint } from "../src/endpoint_identity.ts";
 
-test("register returns a nodeId, and the node is immediately active", () => {
+test("register returns a nodeId, and the node is immediately active", async () => {
   const registry = new NodeRegistry();
-  const nodeId = registry.register("127.0.0.1:50052", "desktop");
+  const nodeId = registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
 
   assert.equal(typeof nodeId, "string");
   assert.ok(nodeId.length > 0);
@@ -17,24 +18,24 @@ test("register returns a nodeId, and the node is immediately active", () => {
   assert.equal(active[0].deviceTier, "desktop");
 });
 
-test("heartbeat on a known node returns true", () => {
+test("heartbeat on a known node returns true", async () => {
   const registry = new NodeRegistry();
-  const nodeId = registry.register("127.0.0.1:50052", "desktop");
+  const nodeId = registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
 
   assert.equal(registry.heartbeat(nodeId), true);
 });
 
-test("heartbeat on an unknown node returns false", () => {
+test("heartbeat on an unknown node returns false", async () => {
   const registry = new NodeRegistry();
 
   assert.equal(registry.heartbeat("does-not-exist"), false);
 });
 
-test("a node past the heartbeat timeout is excluded from listActive", () => {
+test("a node past the heartbeat timeout is excluded from listActive", async () => {
   let now = 0;
   const registry = new NodeRegistry(() => now);
 
-  const nodeId = registry.register("127.0.0.1:50052", "desktop");
+  const nodeId = registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
   assert.equal(registry.listActive().length, 1);
 
   now = 30001; // just past the 30s timeout, with no heartbeat in between
@@ -45,11 +46,11 @@ test("a node past the heartbeat timeout is excluded from listActive", () => {
   assert.equal(registry.listActive().length, 0);
 });
 
-test("a node past its timeout cannot be revived by a heartbeat, regardless of whether listActive scanned it first", () => {
+test("a node past its timeout cannot be revived by a heartbeat, regardless of whether listActive scanned it first", async () => {
   let now = 0;
   const registry = new NodeRegistry(() => now);
 
-  const nodeId = registry.register("127.0.0.1:50052", "desktop");
+  const nodeId = registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
 
   now = 30001; // past the timeout; no listActive() call has run since expiry,
   // so the entry is still physically sitting in the map -- but heartbeat()
@@ -61,11 +62,11 @@ test("a node past its timeout cannot be revived by a heartbeat, regardless of wh
   assert.equal(registry.size(), 0);
 });
 
-test("heartbeat still revives a node that is within its timeout window", () => {
+test("heartbeat still revives a node that is within its timeout window", async () => {
   let now = 0;
   const registry = new NodeRegistry(() => now);
 
-  const nodeId = registry.register("127.0.0.1:50052", "desktop");
+  const nodeId = registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
 
   now = 20000; // within the 30s timeout
   assert.equal(registry.heartbeat(nodeId), true); // refreshes lastSeen to `now`
@@ -78,22 +79,22 @@ test("heartbeat still revives a node that is within its timeout window", () => {
   assert.equal(registry.listActive().length, 0);
 });
 
-test("a custom timeout configured on the registry applies to both listActive and heartbeat", () => {
+test("a custom timeout configured on the registry applies to both listActive and heartbeat", async () => {
   let now = 0;
   const registry = new NodeRegistry(() => now, 1000);
 
-  const nodeId = registry.register("127.0.0.1:50052", "desktop");
+  const nodeId = registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
 
   now = 1001; // past the custom 1000ms timeout
   assert.equal(registry.heartbeat(nodeId), false);
   assert.equal(registry.listActive().length, 0);
 });
 
-test("listActive prunes expired nodes from internal state, not just from its return value", () => {
+test("listActive prunes expired nodes from internal state, not just from its return value", async () => {
   let now = 0;
   const registry = new NodeRegistry(() => now);
 
-  registry.register("127.0.0.1:50052", "desktop");
+  registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
   assert.equal(registry.size(), 1);
 
   now = 30001; // just past the 30s timeout, with no heartbeat in between
@@ -102,11 +103,11 @@ test("listActive prunes expired nodes from internal state, not just from its ret
   assert.equal(registry.size(), 0); // genuinely removed, not just filtered out
 });
 
-test("heartbeat prunes an expired node from internal state, not just returns false", () => {
+test("heartbeat prunes an expired node from internal state, not just returns false", async () => {
   let now = 0;
   const registry = new NodeRegistry(() => now);
 
-  const nodeId = registry.register("127.0.0.1:50052", "desktop");
+  const nodeId = registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
   assert.equal(registry.size(), 1);
 
   now = 30001; // just past the 30s timeout
@@ -114,19 +115,19 @@ test("heartbeat prunes an expired node from internal state, not just returns fal
   assert.equal(registry.size(), 0); // genuinely removed by heartbeat itself
 });
 
-test("multiple nodes are tracked independently", () => {
+test("multiple nodes are tracked independently", async () => {
   const registry = new NodeRegistry();
-  const a = registry.register("127.0.0.1:50052", "desktop");
-  const b = registry.register("127.0.0.1:50053", "android");
+  const a = registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
+  const b = registry.register("127.0.0.1:50053", await canonicalizeEndpoint("http://127.0.0.1:50053"), "android");
 
   assert.notEqual(a, b);
   assert.equal(registry.listActive().length, 2);
 });
 
-test("listActive excludes a node the reputation tracker has marked untrusted", () => {
+test("listActive excludes a node the reputation tracker has marked untrusted", async () => {
   const registry = new NodeRegistry();
   const reputation = new ReputationTracker(3, 0.5);
-  const nodeId = registry.register("127.0.0.1:50052", "desktop");
+  const nodeId = registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
 
   assert.equal(registry.listActive(reputation).length, 1);
 
@@ -136,31 +137,31 @@ test("listActive excludes a node the reputation tracker has marked untrusted", (
   assert.equal(registry.listActive(reputation).length, 0);
 });
 
-test("listActive without a reputation tracker argument behaves exactly as before (backward compatible)", () => {
+test("listActive without a reputation tracker argument behaves exactly as before (backward compatible)", async () => {
   const registry = new NodeRegistry();
-  registry.register("127.0.0.1:50052", "desktop");
+  registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
   assert.equal(registry.listActive().length, 1);
 });
 
-test("register accepts an optional localityGroup and it is returned via listActive", () => {
+test("register accepts an optional localityGroup and it is returned via listActive", async () => {
   const registry = new NodeRegistry();
-  registry.register("127.0.0.1:50052", "desktop", "kitchen-mesh");
+  registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop", "kitchen-mesh");
   const [node] = registry.listActive();
   assert.equal(node.localityGroup, "kitchen-mesh");
 });
 
-test("register without a localityGroup leaves it undefined via listActive", () => {
+test("register without a localityGroup leaves it undefined via listActive", async () => {
   const registry = new NodeRegistry();
-  registry.register("127.0.0.1:50052", "desktop");
+  registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
   const [node] = registry.listActive();
   assert.equal(node.localityGroup, undefined);
 });
 
-test("groupByLocality groups nodes that share the same localityGroup together", () => {
+test("groupByLocality groups nodes that share the same localityGroup together", async () => {
   const registry = new NodeRegistry();
-  registry.register("127.0.0.1:50052", "desktop", "kitchen-mesh");
-  registry.register("127.0.0.1:50053", "android", "kitchen-mesh");
-  registry.register("127.0.0.1:50054", "desktop", "office-mesh");
+  registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop", "kitchen-mesh");
+  registry.register("127.0.0.1:50053", await canonicalizeEndpoint("http://127.0.0.1:50053"), "android", "kitchen-mesh");
+  registry.register("127.0.0.1:50054", await canonicalizeEndpoint("http://127.0.0.1:50054"), "desktop", "office-mesh");
 
   const groups = registry.groupByLocality();
 
@@ -168,19 +169,19 @@ test("groupByLocality groups nodes that share the same localityGroup together", 
   assert.equal(groups.get("office-mesh")?.length, 1);
 });
 
-test("groupByLocality buckets nodes with no localityGroup under UNGROUPED_LOCALITY", () => {
+test("groupByLocality buckets nodes with no localityGroup under UNGROUPED_LOCALITY", async () => {
   const registry = new NodeRegistry();
-  registry.register("127.0.0.1:50052", "desktop");
+  registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
 
   const groups = registry.groupByLocality();
 
   assert.equal(groups.get(UNGROUPED_LOCALITY)?.length, 1);
 });
 
-test("groupByLocality excludes a node the reputation tracker has marked untrusted", () => {
+test("groupByLocality excludes a node the reputation tracker has marked untrusted", async () => {
   const registry = new NodeRegistry();
   const reputation = new ReputationTracker(3, 0.5);
-  const nodeId = registry.register("127.0.0.1:50052", "desktop", "kitchen-mesh");
+  const nodeId = registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop", "kitchen-mesh");
 
   assert.equal(registry.groupByLocality(reputation).get("kitchen-mesh")?.length, 1);
 
@@ -190,10 +191,10 @@ test("groupByLocality excludes a node the reputation tracker has marked untruste
   assert.equal(registry.groupByLocality(reputation).has("kitchen-mesh"), false);
 });
 
-test("groupByLocality excludes an expired node, matching listActive's pruning", () => {
+test("groupByLocality excludes an expired node, matching listActive's pruning", async () => {
   let now = 1000;
   const registry = new NodeRegistry(() => now, 30000);
-  registry.register("127.0.0.1:50052", "desktop", "kitchen-mesh");
+  registry.register("127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop", "kitchen-mesh");
 
   now += 30001;
   const groups = registry.groupByLocality();
@@ -201,48 +202,48 @@ test("groupByLocality excludes an expired node, matching listActive's pruning", 
   assert.equal(groups.has("kitchen-mesh"), false);
 });
 
-test("register accepts an optional servesModel and it is returned via listActive", () => {
+test("register accepts an optional servesModel and it is returned via listActive", async () => {
   const registry = new NodeRegistry();
-  registry.register("http://127.0.0.1:50052", "desktop", undefined, "tinyllama-1.1b");
+  registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop", undefined, "tinyllama-1.1b");
   const [node] = registry.listActive();
   assert.equal(node.servesModel, "tinyllama-1.1b");
 });
 
-test("register without a servesModel leaves it undefined via listActive", () => {
+test("register without a servesModel leaves it undefined via listActive", async () => {
   const registry = new NodeRegistry();
-  registry.register("http://127.0.0.1:50052", "desktop");
+  registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
   const [node] = registry.listActive();
   assert.equal(node.servesModel, undefined);
 });
 
-test("register accepts both localityGroup and servesModel together", () => {
+test("register accepts both localityGroup and servesModel together", async () => {
   const registry = new NodeRegistry();
-  registry.register("http://127.0.0.1:50052", "desktop", "kitchen-mesh", "tinyllama-1.1b");
+  registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop", "kitchen-mesh", "tinyllama-1.1b");
   const [node] = registry.listActive();
   assert.equal(node.localityGroup, "kitchen-mesh");
   assert.equal(node.servesModel, "tinyllama-1.1b");
 });
 
-test("register called twice with the same endpoint returns the same nodeId and does not grow size()", () => {
+test("register called twice with the same endpoint returns the same nodeId and does not grow size()", async () => {
   const registry = new NodeRegistry();
-  const first = registry.register("http://127.0.0.1:50052", "desktop");
-  const second = registry.register("http://127.0.0.1:50052", "desktop");
+  const first = registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
+  const second = registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
 
   assert.equal(first, second);
   assert.equal(registry.size(), 1);
 });
 
-test("nodeId is a 64-character lowercase hex string (sha256 of the endpoint), not a UUID", () => {
+test("nodeId is a 64-character lowercase hex string (sha256 of the endpoint), not a UUID", async () => {
   const registry = new NodeRegistry();
-  const nodeId = registry.register("http://127.0.0.1:50052", "desktop");
+  const nodeId = registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
 
   assert.match(nodeId, /^[0-9a-f]{64}$/);
 });
 
-test("re-registering the same endpoint with a different deviceTier/localityGroup/servesModel updates the fields in place under the same nodeId", () => {
+test("re-registering the same endpoint with a different deviceTier/localityGroup/servesModel updates the fields in place under the same nodeId", async () => {
   const registry = new NodeRegistry();
-  const first = registry.register("http://127.0.0.1:50052", "desktop", "kitchen-mesh", "tinyllama-1.1b");
-  const second = registry.register("http://127.0.0.1:50052", "android", "office-mesh", "small-7b");
+  const first = registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop", "kitchen-mesh", "tinyllama-1.1b");
+  const second = registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "android", "office-mesh", "small-7b");
 
   assert.equal(first, second);
   assert.equal(registry.size(), 1);
@@ -252,11 +253,11 @@ test("re-registering the same endpoint with a different deviceTier/localityGroup
   assert.equal(node.servesModel, "small-7b");
 });
 
-test("registering the same endpoint under three different localityGroup values in sequence never produces more than one active node at a time", () => {
+test("registering the same endpoint under three different localityGroup values in sequence never produces more than one active node at a time", async () => {
   const registry = new NodeRegistry();
-  registry.register("http://127.0.0.1:50052", "desktop", "kitchen-mesh");
-  registry.register("http://127.0.0.1:50052", "desktop", "office-mesh");
-  registry.register("http://127.0.0.1:50052", "desktop", "garage-mesh");
+  registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop", "kitchen-mesh");
+  registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop", "office-mesh");
+  registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop", "garage-mesh");
 
   assert.equal(registry.size(), 1);
   const groups = registry.groupByLocality();
@@ -265,29 +266,29 @@ test("registering the same endpoint under three different localityGroup values i
   assert.equal(groups.get("garage-mesh")?.length, 1);
 });
 
-test("nodeId derivation is case-insensitive in the endpoint", () => {
+test("nodeId derivation is case-insensitive in the endpoint", async () => {
   const registry = new NodeRegistry();
-  const lower = registry.register("http://127.0.0.1:50052", "desktop");
-  const upper = registry.register("HTTP://127.0.0.1:50052", "desktop");
+  const lower = registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
+  const upper = registry.register("HTTP://127.0.0.1:50052", await canonicalizeEndpoint("HTTP://127.0.0.1:50052"), "desktop");
 
   assert.equal(lower, upper);
   assert.equal(registry.size(), 1);
 });
 
-test("two different endpoints still produce two different nodeIds", () => {
+test("two different endpoints still produce two different nodeIds", async () => {
   const registry = new NodeRegistry();
-  const a = registry.register("http://127.0.0.1:50052", "desktop");
-  const b = registry.register("http://127.0.0.1:50053", "desktop");
+  const a = registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
+  const b = registry.register("http://127.0.0.1:50053", await canonicalizeEndpoint("http://127.0.0.1:50053"), "desktop");
 
   assert.notEqual(a, b);
 });
 
-test("a node's reputation survives an expire-then-re-register cycle at the same endpoint", () => {
+test("a node's reputation survives an expire-then-re-register cycle at the same endpoint", async () => {
   let now = 0;
   const registry = new NodeRegistry(() => now);
   const reputation = new ReputationTracker(3, 0.5);
 
-  const firstId = registry.register("http://127.0.0.1:50052", "desktop");
+  const firstId = registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
   for (let i = 0; i < 3; i++) {
     reputation.recordDisagreement(firstId);
   }
@@ -297,31 +298,61 @@ test("a node's reputation survives an expire-then-re-register cycle at the same 
   assert.equal(registry.listActive(reputation).length, 0); // pruned from the registry
   assert.equal(registry.size(), 0);
 
-  const secondId = registry.register("http://127.0.0.1:50052", "desktop"); // re-register, same endpoint
+  const secondId = registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop"); // re-register, same endpoint
 
   assert.equal(secondId, firstId);
   assert.equal(reputation.isTrusted(secondId), false); // still untrusted -- history was never reset
   assert.deepEqual(reputation.getStats(secondId), { agreements: 0, disagreements: 3 });
 });
 
-test("register() accepts an optional availableMemoryMb and listActive() reports it", () => {
+// This is the headline regression test for Endpoint Identity Hardening.
+// Before canonicalizeEndpoint() existed, stableNodeId() hashed the raw
+// (lowercased) endpoint string directly, so 127.0.0.1/localhost/[::1]/a
+// trailing-dot FQDN pointed at the same machine each got their own clean
+// nodeId and a fresh, untested reputation record -- live-verified in
+// Security Phase 3 as a free "re-register under an alias to clear an
+// ejection" evasion, and the same root cause behind Phase C's launcher
+// wrong-model-served bug. A node re-registering under an alias must now be
+// recognised as the SAME node: one nodeId, and a reputation history that
+// survives the switch.
+test("a node re-registering under a loopback alias is recognised as the same node, reputation intact", async () => {
   const registry = new NodeRegistry();
-  registry.register("http://127.0.0.1:8081", "desktop", undefined, "tinyllama-1.1b", 16000);
+  const reputation = new ReputationTracker(3, 0.5);
+
+  const firstId = registry.register("http://127.0.0.1:50052", await canonicalizeEndpoint("http://127.0.0.1:50052"), "desktop");
+  for (let i = 0; i < 3; i++) {
+    reputation.recordDisagreement(firstId);
+  }
+  assert.equal(reputation.isTrusted(firstId), false, "precondition: this node is ejected");
+
+  // Same machine, same port, reached by its loopback hostname instead of
+  // its raw IP -- no expiry, no heartbeat gap, an immediate re-register.
+  const secondId = registry.register("http://localhost:50052", await canonicalizeEndpoint("http://localhost:50052"), "desktop");
+
+  assert.equal(secondId, firstId, "an alias must resolve to the SAME nodeId, not a fresh one");
+  assert.equal(registry.size(), 1, "the alias must overwrite the existing entry, not add a second one");
+  assert.equal(reputation.isTrusted(secondId), false, "the ejection must survive the alias switch");
+  assert.deepEqual(reputation.getStats(secondId), { agreements: 0, disagreements: 3 });
+});
+
+test("register() accepts an optional availableMemoryMb and listActive() reports it", async () => {
+  const registry = new NodeRegistry();
+  registry.register("http://127.0.0.1:8081", await canonicalizeEndpoint("http://127.0.0.1:8081"), "desktop", undefined, "tinyllama-1.1b", 16000);
   const [node] = registry.listActive();
   assert.equal(node.availableMemoryMb, 16000);
 });
 
-test("register() without availableMemoryMb leaves it undefined", () => {
+test("register() without availableMemoryMb leaves it undefined", async () => {
   const registry = new NodeRegistry();
-  registry.register("http://127.0.0.1:8081", "desktop", undefined, "tinyllama-1.1b");
+  registry.register("http://127.0.0.1:8081", await canonicalizeEndpoint("http://127.0.0.1:8081"), "desktop", undefined, "tinyllama-1.1b");
   const [node] = registry.listActive();
   assert.equal(node.availableMemoryMb, undefined);
 });
 
-test("re-registering the same endpoint updates availableMemoryMb", () => {
+test("re-registering the same endpoint updates availableMemoryMb", async () => {
   const registry = new NodeRegistry();
-  registry.register("http://127.0.0.1:8081", "desktop", undefined, "tinyllama-1.1b", 8000);
-  registry.register("http://127.0.0.1:8081", "desktop", undefined, "tinyllama-1.1b", 32000);
+  registry.register("http://127.0.0.1:8081", await canonicalizeEndpoint("http://127.0.0.1:8081"), "desktop", undefined, "tinyllama-1.1b", 8000);
+  registry.register("http://127.0.0.1:8081", await canonicalizeEndpoint("http://127.0.0.1:8081"), "desktop", undefined, "tinyllama-1.1b", 32000);
   const [node] = registry.listActive();
   assert.equal(node.availableMemoryMb, 32000);
 });

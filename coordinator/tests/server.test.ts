@@ -12,6 +12,7 @@ import { DemandTracker } from "../src/demand_tracker.ts";
 import { KeywordSafetyClassifier, type SafetyClassifier } from "../src/safety_classifier.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
 import { openApiDocument } from "../src/openapi.ts";
+import { canonicalizeEndpoint } from "../src/endpoint_identity.ts";
 
 const DEFAULT_TEST_CATALOG: CatalogEntry[] = [
   { id: "tinyllama-1.1b", displayName: "TinyLlama 1.1B", minActiveNodes: 0 },
@@ -56,7 +57,7 @@ function authFetch(url: string, options: RequestInit = {}, token: string = TEST_
   });
 }
 
-test("selectNode returns undefined when no candidate matches the requested model", () => {
+test("selectNode returns undefined when no candidate matches the requested model", async () => {
   const reputation = new ReputationTracker();
   const nodes: NodeInfo[] = [
     { nodeId: "a", endpoint: "http://x", deviceTier: "desktop", servesModel: "other-model" },
@@ -67,7 +68,7 @@ test("selectNode returns undefined when no candidate matches the requested model
   assert.equal(result, undefined);
 });
 
-test("selectNode returns the single matching candidate without calling random", () => {
+test("selectNode returns the single matching candidate without calling random", async () => {
   const reputation = new ReputationTracker();
   const nodes: NodeInfo[] = [
     { nodeId: "a", endpoint: "http://x", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
@@ -78,7 +79,7 @@ test("selectNode returns the single matching candidate without calling random", 
   assert.equal(result?.nodeId, "a");
 });
 
-test("selectNode picks the higher-scoring candidate without calling random", () => {
+test("selectNode picks the higher-scoring candidate without calling random", async () => {
   const reputation = new ReputationTracker();
   reputation.recordAgreement("good");
   reputation.recordAgreement("good");
@@ -96,7 +97,7 @@ test("selectNode picks the higher-scoring candidate without calling random", () 
   assert.equal(result?.nodeId, "good");
 });
 
-test("selectNode breaks a tie using the injected random function, low end of the range", () => {
+test("selectNode breaks a tie using the injected random function, low end of the range", async () => {
   const reputation = new ReputationTracker();
   const nodes: NodeInfo[] = [
     { nodeId: "a", endpoint: "http://x", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
@@ -107,7 +108,7 @@ test("selectNode breaks a tie using the injected random function, low end of the
   assert.equal(result?.nodeId, "a");
 });
 
-test("selectNode breaks a tie using the injected random function, high end of the range", () => {
+test("selectNode breaks a tie using the injected random function, high end of the range", async () => {
   const reputation = new ReputationTracker();
   const nodes: NodeInfo[] = [
     { nodeId: "a", endpoint: "http://x", deviceTier: "desktop", servesModel: "tinyllama-1.1b" },
@@ -118,7 +119,7 @@ test("selectNode breaks a tie using the injected random function, high end of th
   assert.equal(result?.nodeId, "c");
 });
 
-test("selectNode ignores candidates that don't match the requested model even when they score higher", () => {
+test("selectNode ignores candidates that don't match the requested model even when they score higher", async () => {
   const reputation = new ReputationTracker();
   reputation.recordAgreement("wrong-model-node");
   reputation.recordAgreement("wrong-model-node");
@@ -233,7 +234,7 @@ test("POST /generate forwards the shared auth token to the node agent", async ()
   // before the server starts) so the stub agent above can be registered
   // into it before createServer is called.
   const registry = new NodeRegistry();
-  registry.register(stubEndpoint, "desktop", undefined, "tinyllama-1.1b");
+  registry.register(stubEndpoint, await canonicalizeEndpoint(stubEndpoint), "desktop", undefined, "tinyllama-1.1b");
   const catalog = new ModelCatalog(DEFAULT_TEST_CATALOG);
   const server = createServer(registry, catalog, new PeerRegistry(), new KeywordSafetyClassifier([]), new ReputationTracker(), TEST_AUTH_TOKEN);
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -833,7 +834,7 @@ test("POST /generate for a requiredNodeCount>1 model with a warm tracked pipelin
   const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
   const { server, baseUrl, registry, pipelineTracker } = await startTestServer(bigCatalog);
   try {
-    const driverNodeId = registry.register(stub.endpoint, "desktop", undefined, "big-model");
+    const driverNodeId = registry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), "desktop", undefined, "big-model");
     pipelineTracker.addEntry("big-model", {
       pipelineId: "test-pipeline-4",
       driverNodeId,
@@ -933,8 +934,8 @@ test("POST /generate assembles a fresh pipeline via a registered launcher when n
   const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
   const { server, baseUrl, launcherRegistry, registry } = await startTestServer(bigCatalog);
   try {
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
 
     const launcherPort = Number(new URL(stub.endpoint).port);
     // A real launcher and its freshly-spawned driver are different
@@ -983,7 +984,7 @@ test("POST /generate for a warm pipeline with an active driver never calls a reg
   const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
   const { server, baseUrl, registry, pipelineTracker, launcherRegistry } = await startTestServer(bigCatalog);
   try {
-    const driverNodeId = registry.register(driverStub.endpoint, "desktop", undefined, "big-model");
+    const driverNodeId = registry.register(driverStub.endpoint, await canonicalizeEndpoint(driverStub.endpoint), "desktop", undefined, "big-model");
     pipelineTracker.addEntry("big-model", {
       pipelineId: "test-pipeline-3",
       driverNodeId,
@@ -999,7 +1000,7 @@ test("POST /generate for a warm pipeline with an active driver never calls a reg
     // coincidence, since selectPipeline() would bail out on too few active
     // nodes before ever reaching the launcher fetch. (Verified live: see
     // this test's mutation-check note in the task report.)
-    registry.register("http://127.0.0.1:1", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
 
     const launcherPort = Number(new URL(launcherStub.endpoint).port);
     launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherPort);
@@ -1054,8 +1055,8 @@ test("POST /generate for a requiredNodeCount>1 model with a stale tracked pipeli
     // active pool before it will pick anything -- see the "assembles a
     // fresh pipeline" test's own comment above for why two generic nodes
     // are registered here.
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
 
     const launcherPort = Number(new URL(stub.endpoint).port);
     launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
@@ -1112,7 +1113,7 @@ test("POST /generate for a warm pipeline heartbeats the driver, keeping it alive
   const baseUrl = `http://127.0.0.1:${address.port}`;
 
   try {
-    const driverNodeId = registry.register(stub.endpoint, "desktop", undefined, "big-model");
+    const driverNodeId = registry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), "desktop", undefined, "big-model");
     pipelineTracker.addEntry("big-model", {
       pipelineId: "test-pipeline-2",
       driverNodeId,
@@ -1204,7 +1205,7 @@ test("POST /generate marks a tracked pipeline failed when its driver's /complete
   const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
   const { server, baseUrl, registry, launcherRegistry, pipelineTracker } = await startTestServer(bigCatalog, undefined, undefined, undefined, undefined, random);
   try {
-    const driverNodeId = registry.register(driverStub.endpoint, "desktop", undefined, "big-model");
+    const driverNodeId = registry.register(driverStub.endpoint, await canonicalizeEndpoint(driverStub.endpoint), "desktop", undefined, "big-model");
     pipelineTracker.addEntry("big-model", {
       pipelineId: "test-pipeline-1",
       driverNodeId,
@@ -1218,8 +1219,8 @@ test("POST /generate marks a tracked pipeline failed when its driver's /complete
     // before it will attempt reassembly -- two generic filler nodes,
     // matching the "stale tracked pipeline... exactly once" test's own
     // setup above (the dead driver above already counts as a third).
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
 
     const launcherPort = Number(new URL(launcherStub.endpoint).port);
     launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherPort);
@@ -1265,8 +1266,8 @@ test("POST /generate spreads requests across a warm pool with more than one entr
   const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 1, maxPipelines: 2 }];
   const { server, baseUrl, registry, pipelineTracker } = await startTestServer(bigCatalog);
   try {
-    const driverA = registry.register(stubA.endpoint, "desktop", undefined, "big-model");
-    const driverB = registry.register(stubB.endpoint, "desktop", undefined, "big-model");
+    const driverA = registry.register(stubA.endpoint, await canonicalizeEndpoint(stubA.endpoint), "desktop", undefined, "big-model");
+    const driverB = registry.register(stubB.endpoint, await canonicalizeEndpoint(stubB.endpoint), "desktop", undefined, "big-model");
     // Deliberately DISTINCT starting timestamps, not two bare Date.now()
     // calls: two entries stamped in the same millisecond leave the LRU
     // reduce with a genuine tie, which it resolves by keeping the first
@@ -1306,7 +1307,7 @@ test("POST /generate updates a pool entry's lastUsedAt when it's used", async ()
   const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 1, maxPipelines: 1 }];
   const { server, baseUrl, registry, pipelineTracker } = await startTestServer(bigCatalog);
   try {
-    const driverNodeId = registry.register(stub.endpoint, "desktop", undefined, "big-model");
+    const driverNodeId = registry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), "desktop", undefined, "big-model");
     pipelineTracker.addEntry("big-model", { pipelineId: "p1", driverNodeId, computeNodeIds: [], launcherId: "l1", state: "warm", lastUsedAt: 0 });
 
     await authFetch(`${baseUrl}/generate`, {
@@ -1333,14 +1334,14 @@ test("POST /generate with a non-empty pool never calls ensurePipelineReady's lau
   const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }];
   const { server, baseUrl, registry, pipelineTracker, launcherRegistry } = await startTestServer(bigCatalog);
   try {
-    const driverNodeId = registry.register(stub.endpoint, "desktop", undefined, "big-model");
+    const driverNodeId = registry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), "desktop", undefined, "big-model");
     pipelineTracker.addEntry("big-model", { pipelineId: "p1", driverNodeId, computeNodeIds: [], launcherId: "l1", state: "warm", lastUsedAt: Date.now() });
     // Two generic filler nodes so selectPipeline's own
     // requiredNodeCount(2)-candidates gate can never be the reason the
     // launcher goes uncalled -- without them this test would still pass
     // with the pool-first check deleted entirely.
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     launcherRegistry.register(launcherStub.endpoint, ["big-model"], Number(new URL(launcherStub.endpoint).port));
 
     const res = await authFetch(`${baseUrl}/generate`, {
@@ -1375,8 +1376,8 @@ test("POST /generate falls back to ensurePipelineReady's cold-start assembly whe
   const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }];
   const { server, baseUrl, launcherRegistry, registry } = await startTestServer(bigCatalog);
   try {
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     launcherRegistry.register(stub.endpoint, ["big-model"], Number(new URL(stub.endpoint).port));
 
     const res = await authFetch(`${baseUrl}/generate`, {
@@ -1468,15 +1469,15 @@ test("POST /generate heartbeats whichever pool entry's driver it routes to, keep
   };
 
   try {
-    const driverA = registry.register(stubA.endpoint, "desktop", undefined, "big-model");
-    const driverB = registry.register(stubB.endpoint, "desktop", undefined, "big-model");
+    const driverA = registry.register(stubA.endpoint, await canonicalizeEndpoint(stubA.endpoint), "desktop", undefined, "big-model");
+    const driverB = registry.register(stubB.endpoint, await canonicalizeEndpoint(stubB.endpoint), "desktop", undefined, "big-model");
     pipelineTracker.addEntry("big-model", { pipelineId: "pa", driverNodeId: driverA, computeNodeIds: [], launcherId: "la", state: "warm", lastUsedAt: 0 });
     pipelineTracker.addEntry("big-model", { pipelineId: "pb", driverNodeId: driverB, computeNodeIds: [], launcherId: "lb", state: "warm", lastUsedAt: 10 });
     // Filler nodes and a registered launcher so a broken pool path has a
     // real cold-start route to fall into (and be caught doing so),
     // instead of bailing out early on selectPipeline's candidate gate.
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     launcherRegistry.register(launcherStub.endpoint, ["big-model"], Number(new URL(launcherStub.endpoint).port));
 
     now = 20000;
@@ -1542,14 +1543,14 @@ test("POST /generate's cold-start assembly never claims a launcher already backi
     // Enough active nodes that selectPipeline's readiness gate passes --
     // so if the launcher goes uncalled below it is because it was
     // correctly seen as claimed, not because assembly bailed out early.
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
 
     const agentPort = Number(new URL(sharedLauncher.endpoint).port);
     const launcherId = launcherRegistry.register(sharedLauncher.endpoint, ["model-a", "model-b"], agentPort);
     // model-a's live pipeline: its driver is the agent this launcher
     // already spawned, at the launcher's own host and agentPort.
-    const driverA = registry.register(`http://127.0.0.1:${agentPort}`, "desktop", undefined, "model-a");
+    const driverA = registry.register(`http://127.0.0.1:${agentPort}`, await canonicalizeEndpoint(`http://127.0.0.1:${agentPort}`), "desktop", undefined, "model-a");
     pipelineTracker.addEntry("model-a", { pipelineId: "pa", driverNodeId: driverA, computeNodeIds: [], launcherId, state: "warm", lastUsedAt: Date.now() });
 
     // model-b has an empty pool, so this request takes the cold-start
@@ -1602,14 +1603,14 @@ test("POST /generate's cold-start assembly skips a claimed launcher and uses an 
   ];
   const { server, baseUrl, registry, pipelineTracker, launcherRegistry } = await startTestServer(bigCatalog);
   try {
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
 
     // Registered FIRST, so findForModel's "first match" would pick it.
     const claimedId = launcherRegistry.register(claimedLauncher.endpoint, ["model-a", "model-b"], Number(new URL(claimedLauncher.endpoint).port));
     launcherRegistry.register(freeLauncher.endpoint, ["model-b"], Number(new URL(freeLauncher.endpoint).port));
 
-    const driverA = registry.register("http://127.0.0.1:3", "desktop", undefined, "model-a");
+    const driverA = registry.register("http://127.0.0.1:3", await canonicalizeEndpoint("http://127.0.0.1:3"), "desktop", undefined, "model-a");
     pipelineTracker.addEntry("model-a", { pipelineId: "pa", driverNodeId: driverA, computeNodeIds: [], launcherId: claimedId, state: "warm", lastUsedAt: Date.now() });
 
     const res = await authFetch(`${baseUrl}/generate`, {
@@ -3730,8 +3731,8 @@ test("concurrent POST /generate on a cold pool assembles exactly one pipeline, n
   const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }];
   const { server, baseUrl, registry, launcherRegistry, pipelineTracker } = await startTestServer(bigCatalog);
   try {
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     const launcherPort = Number(new URL(stub.endpoint).port);
     launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
 
@@ -3763,7 +3764,7 @@ test("POST /v1/chat/completions records demand so OpenAI-API traffic can scale t
   }));
   const { server, baseUrl, registry, demandTracker } = await startTestServer();
   try {
-    registry.register(stub.endpoint, "desktop", undefined, "tinyllama-1.1b");
+    registry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), "desktop", undefined, "tinyllama-1.1b");
     assert.equal(demandTracker.recentDemand("tinyllama-1.1b"), 0);
 
     const res = await authFetch(`${baseUrl}/v1/chat/completions`, {
@@ -3822,8 +3823,8 @@ test("two different models cold-starting at once never share one launcher", asyn
   ];
   const { server, baseUrl, registry, launcherRegistry, pipelineTracker } = await startTestServer(twoModels);
   try {
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     const launcherPort = Number(new URL(stub.endpoint).port);
     // ONE launcher machine serving both models -- servesModels is an array,
     // so a multi-model launcher is exactly the case Phase C exists for.
@@ -3868,13 +3869,16 @@ test("POST /generate does not respawn a driver that is already reputation-ejecte
   const reputation = new ReputationTracker();
   const { server, baseUrl, registry, launcherRegistry } = await startTestServer(bigCatalog, new PeerRegistry(), new KeywordSafetyClassifier([]), reputation);
   try {
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     const launcherPort = Number(new URL(stub.endpoint).port);
     launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
 
+    // Same identity computation production code uses: canonicalize first,
+    // then hash -- stableNodeId() no longer canonicalizes on its own
+    // (Endpoint Identity Hardening).
     const launcherUrl = new URL(stub.endpoint);
-    const driverId = stableNodeId(`${launcherUrl.protocol}//${launcherUrl.hostname}:${launcherPort}`);
+    const driverId = stableNodeId(await canonicalizeEndpoint(`${launcherUrl.protocol}//${launcherUrl.hostname}:${launcherPort}`));
     for (let i = 0; i < 20; i++) reputation.recordDisagreement(driverId);
     assert.equal(reputation.isTrusted(driverId), false, "precondition: the prospective driver is ejected");
 
@@ -3892,8 +3896,8 @@ test("POST /generate does not respawn a driver that is already reputation-ejecte
     const fresh = new ReputationTracker();
     const control = await startTestServer(bigCatalog, new PeerRegistry(), new KeywordSafetyClassifier([]), fresh);
     try {
-      control.registry.register("http://127.0.0.1:1", "desktop");
-      control.registry.register("http://127.0.0.1:2", "desktop");
+      control.registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+      control.registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
       control.launcherRegistry.register(stub.endpoint, ["big-model"], launcherPort);
       await authFetch(`${control.baseUrl}/generate`, {
         method: "POST",

@@ -10,7 +10,8 @@ import { LauncherRegistry } from "./launcher_registry.ts";
 import { PipelineTracker } from "./pipeline_tracker.ts";
 import { selectPipeline } from "./pipeline_selector.ts";
 import { DemandTracker } from "./demand_tracker.ts";
-import { claimedLauncherIds, isLauncherClaimed, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
+import { claimedLauncherIds, isLauncherClaimed, launcherDriverEndpoint, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
+import { canonicalizeEndpoint } from "./endpoint_identity.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
 import { openApiDocument } from "./openapi.ts";
@@ -350,12 +351,18 @@ async function assemblePipeline(
 
   // Same pre-flight check the background loop does: a launcher-spawned
   // driver's endpoint is fully determined by the launcher, and nodeId is
-  // sha256 of that endpoint, so a reputation-ejected driver inherits the
-  // ejection on every respawn. Without this the request path respawned it
-  // on EVERY /generate -- a real multi-GB model load and kill per request,
-  // higher-frequency than the background loop this guard was first added to.
-  const preflightUrl = new URL(launcher.endpoint);
-  const prospectiveDriverId = stableNodeId(`${preflightUrl.protocol}//${preflightUrl.hostname}:${launcher.agentPort}`);
+  // derived from that endpoint's CANONICAL identity key, so a
+  // reputation-ejected driver inherits the ejection on every respawn.
+  // Without this the request path respawned it on EVERY /generate -- a
+  // real multi-GB model load and kill per request, higher-frequency than
+  // the background loop this guard was first added to.
+  //
+  // Computed once and reused below at actual registration time -- both
+  // MUST agree on this driver's identity, and canonicalizing twice would
+  // also mean two DNS lookups per assembly attempt for no benefit.
+  const driverEndpoint = launcherDriverEndpoint(launcher);
+  const driverIdentityKey = await canonicalizeEndpoint(driverEndpoint);
+  const prospectiveDriverId = stableNodeId(driverIdentityKey);
   if (!reputation.isTrusted(prospectiveDriverId)) {
     console.warn(`skipping launcher ${launcher.endpoint} for model ${modelId}: the driver it would spawn is reputation-ejected`);
     return;
@@ -418,9 +425,11 @@ async function assemblePipeline(
     // for itself; the launcher doesn't advertise a localityGroup of its
     // own (LauncherInfo has none), so the fresh driver registers without
     // one too.
-    const launcherUrl = new URL(launcher.endpoint);
-    const driverEndpoint = `${launcherUrl.protocol}//${launcherUrl.hostname}:${launcher.agentPort}`;
-    const driverNodeId = registry.register(driverEndpoint, "desktop", undefined, modelId);
+    // driverEndpoint/driverIdentityKey were already computed above for the
+    // preflight trust check -- reused here, not rebuilt, so this
+    // registration can never derive a different identity than the one
+    // that was actually checked.
+    const driverNodeId = registry.register(driverEndpoint, driverIdentityKey, "desktop", undefined, modelId);
     // Replace whatever was tracked before with the freshly-assembled
     // pipeline rather than appending alongside a stale one. When the
     // replacement landed on a DIFFERENT launcher, the old one's agent must
@@ -539,7 +548,8 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           }
           availableMemoryMb = candidate.availableMemoryMb;
         }
-        const nodeId = registry.register(normalizedNodeEndpoint, candidate.deviceTier as DeviceTier, localityGroup, servesModel, availableMemoryMb);
+        const identityKey = await canonicalizeEndpoint(normalizedNodeEndpoint);
+        const nodeId = registry.register(normalizedNodeEndpoint, identityKey, candidate.deviceTier as DeviceTier, localityGroup, servesModel, availableMemoryMb);
         sendJson(res, 200, { nodeId });
         return;
       }

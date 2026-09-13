@@ -23,16 +23,29 @@ interface StoredNode extends NodeInfo {
   lastSeen: number;
 }
 
-export function stableNodeId(endpoint: string): string {
-  // Deterministic, not random: the same endpoint must always produce the
-  // same nodeId, no matter how many times or how far apart in time it
-  // registers. This is what makes a re-registration below overwrite (not
-  // duplicate) the existing Map entry, closing the "re-register to clear
-  // reputation" and "go quiet 30s then reset" evasions -- identity here
-  // never depends on any prior entry still being present in `nodes`,
-  // unlike a live scan for a matching endpoint (PeerRegistry's approach)
-  // would.
-  return createHash("sha256").update(endpoint.toLowerCase()).digest("hex");
+// `identityKey` must already be a CANONICAL identity key (see
+// endpoint_identity.ts's canonicalizeEndpoint()), not a raw endpoint
+// string. This function itself does no canonicalization -- every caller is
+// responsible for canonicalizing first, per the Endpoint Identity
+// Hardening design's separation of "compute the identity" (async, DNS
+// involved) from "derive the id from it" (sync, pure hashing).
+//
+// Deterministic, not random: the same identity key must always produce the
+// same nodeId, no matter how many times or how far apart in time it
+// registers. This is what makes a re-registration below overwrite (not
+// duplicate) the existing Map entry, closing the "re-register to clear
+// reputation" and "go quiet 30s then reset" evasions -- identity here
+// never depends on any prior entry still being present in `nodes`, unlike
+// a live scan for a matching endpoint (PeerRegistry's approach) would.
+//
+// Before Endpoint Identity Hardening this hashed the raw (lowercased)
+// endpoint string directly, which meant 127.0.0.1/localhost/[::1]/a
+// trailing-dot FQDN pointed at the same machine each got their own clean
+// identity for free -- the gap this whole phase closes. See
+// canonicalizeEndpoint() for how the key passed in here collapses those
+// aliases to one string first.
+export function stableNodeId(identityKey: string): string {
+  return createHash("sha256").update(identityKey).digest("hex");
 }
 
 export class NodeRegistry {
@@ -45,8 +58,14 @@ export class NodeRegistry {
     this.timeoutMs = timeoutMs;
   }
 
-  register(endpoint: string, deviceTier: DeviceTier, localityGroup?: string, servesModel?: string, availableMemoryMb?: number): string {
-    const nodeId = stableNodeId(endpoint);
+  // `identityKey` is the CANONICAL identity (see stableNodeId()'s own
+  // comment) -- the caller has already resolved/canonicalized `endpoint`
+  // before calling this. `endpoint` itself stays the exact contact URL:
+  // POST /generate fetches `${node.endpoint}/complete` verbatim, and
+  // substituting a resolved IP here would break TLS SNI and name-based
+  // virtual hosting for an https endpoint.
+  register(endpoint: string, identityKey: string, deviceTier: DeviceTier, localityGroup?: string, servesModel?: string, availableMemoryMb?: number): string {
+    const nodeId = stableNodeId(identityKey);
     this.nodes.set(nodeId, { nodeId, endpoint, deviceTier, localityGroup, servesModel, availableMemoryMb, lastSeen: this.clock() });
     return nodeId;
   }

@@ -8,6 +8,7 @@ import { LauncherRegistry, type LauncherInfo } from "../src/launcher_registry.ts
 import { NodeRegistry, stableNodeId } from "../src/registry.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
 import { ModelCatalog } from "../src/catalog.ts";
+import { canonicalizeEndpoint } from "../src/endpoint_identity.ts";
 
 // A minimal stand-in for a swarm-launcher's HTTP interface: responds to
 // POST /pipeline with a canned success body and counts calls; responds to
@@ -77,18 +78,18 @@ function launcherFixture(launcherId: string, servesModels: string[]): LauncherIn
 // asks for by name -- inspectable with no network, no timers, no registries.
 // ---------------------------------------------------------------------------
 
-test("desiredPipelineCount is zero for a model that needs only one node", () => {
+test("desiredPipelineCount is zero for a model that needs only one node", async () => {
   assert.equal(desiredPipelineCount(999, 4, 1, 10), 0);
   assert.equal(desiredPipelineCount(0, 4, 1, 10), 0);
 });
 
-test("desiredPipelineCount floors at one warm pipeline even with zero demand", () => {
+test("desiredPipelineCount floors at one warm pipeline even with zero demand", async () => {
   assert.equal(desiredPipelineCount(0, 4, 2, 10), 1);
   assert.equal(desiredPipelineCount(1, 4, 2, 10), 1);
   assert.equal(desiredPipelineCount(10, 4, 2, 10), 1);
 });
 
-test("desiredPipelineCount grows one pipeline per requestsPerPipeline of demand", () => {
+test("desiredPipelineCount grows one pipeline per requestsPerPipeline of demand", async () => {
   assert.equal(desiredPipelineCount(11, 4, 2, 10), 2);
   assert.equal(desiredPipelineCount(20, 4, 2, 10), 2);
   assert.equal(desiredPipelineCount(21, 4, 2, 10), 3);
@@ -96,12 +97,12 @@ test("desiredPipelineCount grows one pipeline per requestsPerPipeline of demand"
   assert.equal(desiredPipelineCount(6, 4, 2, 5), 2);
 });
 
-test("desiredPipelineCount never exceeds the catalog's maxPipelines cap", () => {
+test("desiredPipelineCount never exceeds the catalog's maxPipelines cap", async () => {
   assert.equal(desiredPipelineCount(1000, 2, 2, 10), 2);
   assert.equal(desiredPipelineCount(1000, 1, 2, 10), 1);
 });
 
-test("planAllocations gives a single contested launcher to the higher-demand model and never double-claims it", () => {
+test("planAllocations gives a single contested launcher to the higher-demand model and never double-claims it", async () => {
   const launcher = launcherFixture("L1", ["low", "high"]);
   const claims = planAllocations(
     [
@@ -116,7 +117,7 @@ test("planAllocations gives a single contested launcher to the higher-demand mod
   ]);
 });
 
-test("planAllocations never claims a launcher already backing a live pipeline", () => {
+test("planAllocations never claims a launcher already backing a live pipeline", async () => {
   const claims = planAllocations(
     [{ modelId: "a", demand: 50, currentCount: 0, desiredCount: 1 }],
     () => [launcherFixture("L1", ["a"])],
@@ -125,7 +126,7 @@ test("planAllocations never claims a launcher already backing a live pipeline", 
   assert.deepEqual(claims, []);
 });
 
-test("planAllocations claims one launcher per missing pipeline, up to the model's deficit", () => {
+test("planAllocations claims one launcher per missing pipeline, up to the model's deficit", async () => {
   const launchers = [launcherFixture("L1", ["a"]), launcherFixture("L2", ["a"]), launcherFixture("L3", ["a"])];
   const claims = planAllocations(
     [{ modelId: "a", demand: 30, currentCount: 1, desiredCount: 3 }],
@@ -135,7 +136,7 @@ test("planAllocations claims one launcher per missing pipeline, up to the model'
   assert.deepEqual(claims.map(c => c.launcher.launcherId), ["L1", "L2"]);
 });
 
-test("planAllocations skips models that already have their desired count and does not mutate its inputs", () => {
+test("planAllocations skips models that already have their desired count and does not mutate its inputs", async () => {
   const claimed = new Set(["L9"]);
   const snapshots = [
     { modelId: "satisfied", demand: 100, currentCount: 2, desiredCount: 2 },
@@ -156,8 +157,8 @@ test("runOnce assembles a fresh pipeline for a model with demand, an idle launch
   try {
     const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }]);
     const registry = new NodeRegistry();
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     const launcherRegistry = new LauncherRegistry();
     launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
     const demandTracker = new DemandTracker();
@@ -209,8 +210,8 @@ test("runOnce never claims a launcher already backing a live pool entry for a DI
     // Putting an endpoint here instead would make the health check below
     // treat this entry as dead and free the launcher, quietly turning this
     // no-preemption test into a no-op that passes for the wrong reason.
-    const driverNodeId = registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    const driverNodeId = registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     const pipelineTracker = new PipelineTracker();
     // Pre-populate model-a's pool with an entry already claiming this launcher.
     pipelineTracker.addEntry("model-a", {
@@ -263,7 +264,7 @@ test("runOnce removes a pool entry another code path already marked failed, even
   try {
     const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
     const registry = new NodeRegistry();
-    const driverNodeId = registry.register("http://127.0.0.1:1", "desktop", undefined, "big-model");
+    const driverNodeId = registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop", undefined, "big-model");
     const launcherRegistry = new LauncherRegistry();
     const launcherId = launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
     const pipelineTracker = new PipelineTracker();
@@ -301,7 +302,7 @@ test("runOnce scales down a pool entry idle past the grace period, calling DELET
     const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
     const registry = new NodeRegistry();
     const driverEndpoint = "http://127.0.0.1:1";
-    const driverNodeId = registry.register(driverEndpoint, "desktop", undefined, "big-model");
+    const driverNodeId = registry.register(driverEndpoint, await canonicalizeEndpoint(driverEndpoint), "desktop", undefined, "big-model");
     const launcherRegistry = new LauncherRegistry();
     const launcherId = launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
     const pipelineTracker = new PipelineTracker();
@@ -338,7 +339,7 @@ test("runOnce leaves a recently-used pool entry alone, and idleGraceMs is a real
   try {
     const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
     const registry = new NodeRegistry();
-    const driverNodeId = registry.register("http://127.0.0.1:1", "desktop", undefined, "big-model");
+    const driverNodeId = registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop", undefined, "big-model");
     const launcherRegistry = new LauncherRegistry();
     const launcherId = launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
     const pipelineTracker = new PipelineTracker();
@@ -375,8 +376,8 @@ test("runOnce heartbeats a healthy entry's launcher-spawned driver so it doesn't
   // this it ages out of listActive() between two consecutive ticks and a
   // perfectly healthy warm pipeline gets torn down and rebuilt forever.
   const registry = new NodeRegistry(() => fakeNow, 30000);
-  const driverNodeId = registry.register("http://127.0.0.1:1", "desktop", undefined, "big-model");
-  const contributorNodeId = registry.register("http://127.0.0.1:2", "desktop");
+  const driverNodeId = registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop", undefined, "big-model");
+  const contributorNodeId = registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
   const pipelineTracker = new PipelineTracker();
   pipelineTracker.addEntry("big-model", {
     pipelineId: "warm-entry",
@@ -422,8 +423,8 @@ test("runOnce allocates a single idle launcher to the higher-demand of two compe
       { id: "model-high", displayName: "High", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
     ]);
     const registry = new NodeRegistry();
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     const launcherRegistry = new LauncherRegistry();
     // ONE launcher declares it can serve BOTH models -- only one of them
     // can actually get it this tick.
@@ -448,8 +449,8 @@ test("runOnce scales one model up to several pipelines when demand justifies it,
   try {
     const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }]);
     const registry = new NodeRegistry();
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     const launcherRegistry = new LauncherRegistry();
     for (const stub of stubs) launcherRegistry.register(stub.endpoint, ["big-model"], stub.port);
     const demandTracker = new DemandTracker();
@@ -480,7 +481,7 @@ test("runOnce does not claim a launcher when the swarm has too few active nodes 
   try {
     const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 3, maxPipelines: 1 }]);
     const registry = new NodeRegistry();
-    registry.register("http://127.0.0.1:1", "desktop"); // only 1 of the 3 needed
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop"); // only 1 of the 3 needed
     const launcherRegistry = new LauncherRegistry();
     launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
     const pipelineTracker = new PipelineTracker();
@@ -507,8 +508,8 @@ test("runOnce tolerates a launcher that rejects the assembly request, leaving th
   try {
     const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
     const registry = new NodeRegistry();
-    registry.register("http://127.0.0.1:1", "desktop");
-    registry.register("http://127.0.0.1:2", "desktop");
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
     const launcherRegistry = new LauncherRegistry();
     launcherRegistry.register(`http://127.0.0.1:${address.port}`, ["big-model"], address.port);
     const pipelineTracker = new PipelineTracker();
@@ -526,8 +527,8 @@ test("start() drives runOnce on its interval and stop() ends it", async () => {
   const launcherStub = await startStubLauncher();
   const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
   const registry = new NodeRegistry();
-  registry.register("http://127.0.0.1:1", "desktop");
-  registry.register("http://127.0.0.1:2", "desktop");
+  registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+  registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
   const launcherRegistry = new LauncherRegistry();
   launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
   const pipelineTracker = new PipelineTracker();
@@ -584,8 +585,8 @@ test("a launcher is claimed for the whole assembly window, not just after it suc
 
   const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
   const registry = new NodeRegistry();
-  registry.register("http://127.0.0.1:1", "desktop");
-  registry.register("http://127.0.0.1:2", "desktop");
+  registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+  registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
   const pipelineTracker = new PipelineTracker();
   const launcherRegistry = new LauncherRegistry();
   const launcherId = launcherRegistry.register(endpoint, ["big-model"], address.port as number);
@@ -669,16 +670,20 @@ test("a launcher whose prospective driver is reputation-ejected is not spawned o
   const launcherStub = await startStubLauncher();
   const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
   const registry = new NodeRegistry();
-  registry.register("http://127.0.0.1:1", "desktop");
-  registry.register("http://127.0.0.1:2", "desktop");
+  registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+  registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
   const launcherRegistry = new LauncherRegistry();
   launcherRegistry.register(launcherStub.endpoint, ["big-model"], launcherStub.port);
   const pipelineTracker = new PipelineTracker();
   const reputation = new ReputationTracker();
 
-  // Eject the exact driver this launcher would spawn, by its deterministic id.
+  // Eject the exact driver this launcher would spawn, by its deterministic
+  // id -- computed the same way production code does: canonicalize the
+  // driver's endpoint first, THEN hash. stableNodeId() itself no longer
+  // canonicalizes (Endpoint Identity Hardening) -- it hashes whatever
+  // identity key it's handed verbatim.
   const launcherUrl = new URL(launcherStub.endpoint);
-  const driverId = stableNodeId(`${launcherUrl.protocol}//${launcherUrl.hostname}:${launcherStub.port}`);
+  const driverId = stableNodeId(await canonicalizeEndpoint(`${launcherUrl.protocol}//${launcherUrl.hostname}:${launcherStub.port}`));
   for (let i = 0; i < 20; i++) reputation.recordDisagreement(driverId);
   assert.equal(reputation.isTrusted(driverId), false, "precondition: the prospective driver is ejected");
 
@@ -751,8 +756,8 @@ test("a plan that goes stale across an await does not claim a launcher the reque
     { id: "model-b", displayName: "B", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
   ]);
   const registry = new NodeRegistry();
-  registry.register("http://127.0.0.1:1", "desktop");
-  registry.register("http://127.0.0.1:2", "desktop");
+  registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+  registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
   const pipelineTracker = new PipelineTracker();
   const launcherRegistry = new LauncherRegistry();
 

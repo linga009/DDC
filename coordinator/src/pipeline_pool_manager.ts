@@ -7,6 +7,7 @@ import type { LauncherInfo, LauncherRegistry } from "./launcher_registry.ts";
 import type { PooledPipeline, PipelineTracker } from "./pipeline_tracker.ts";
 import type { DemandTracker } from "./demand_tracker.ts";
 import { selectPipeline } from "./pipeline_selector.ts";
+import { canonicalizeEndpoint } from "./endpoint_identity.ts";
 
 // Deliberately naive per the design doc's own explicit instruction not to
 // over-engineer a scaling function without real load data: one pipeline
@@ -193,6 +194,25 @@ export function claimedLauncherIds(
 // claimedLauncherIds() for why the endpoint has to be checked too.
 export function isLauncherClaimed(claimed: Set<string>, launcher: LauncherInfo): boolean {
   return claimed.has(launcher.launcherId) || claimed.has(launcher.endpoint);
+}
+
+// The endpoint a launcher-spawned driver is reachable at: the launcher's
+// own host, on its fixed --agent-port -- never anything from the pipeline
+// selection that chose this launcher, since the driver isn't a
+// pre-existing registered node, it's whatever fresh swarm-node-agent the
+// launcher spawns in response to POST /pipeline.
+//
+// Exported (rather than inlined at each call site) because it has two
+// callers that MUST agree on the exact string: this module's own
+// tryAssemble() and server.ts's synchronous cold-start assemblePipeline().
+// Before this existed, both files independently rebuilt the same
+// concatenation -- exactly the kind of duplicated identity computation
+// this project's own history (see CLAUDE.md's Phase C section) has three
+// times let drift out of step between the background loop and the request
+// path. One function that both sides call can't diverge.
+export function launcherDriverEndpoint(launcher: LauncherInfo): string {
+  const launcherUrl = new URL(launcher.endpoint);
+  return `${launcherUrl.protocol}//${launcherUrl.hostname}:${launcher.agentPort}`;
 }
 
 // Background reconciliation loop: keeps each multi-node model's pool of
@@ -477,15 +497,23 @@ export class PipelinePoolManager {
 
     // A launcher-spawned driver's endpoint is fully determined by the
     // launcher (its own host plus its fixed agentPort), and nodeId is
-    // sha256 of that endpoint -- so a driver that has been
-    // reputation-ejected inherits the ejection on every respawn, forever.
+    // derived from that endpoint's CANONICAL identity key -- so a driver
+    // that has been reputation-ejected inherits the ejection on every
+    // respawn, forever, even across a launcher restart or an alias change.
     // Without this check the loop was unbreakable: assemble (the POST
     // succeeds), next tick's health check sees the driver missing from
     // listActive(reputation) and tears it down, allocate re-claims the same
     // launcher, repeat -- one real multi-GB model load and kill every tick,
     // plus one more per /generate, none of which can ever succeed.
-    const launcherUrlForId = new URL(launcher.endpoint);
-    const prospectiveDriverId = stableNodeId(`${launcherUrlForId.protocol}//${launcherUrlForId.hostname}:${launcher.agentPort}`);
+    //
+    // Computed once here and reused below at actual registration time
+    // (rather than recomputed) -- both the preflight check and the real
+    // registration MUST agree on this driver's identity, and canonicalizing
+    // it twice would also mean two DNS lookups per assembly attempt for no
+    // benefit.
+    const driverEndpoint = launcherDriverEndpoint(launcher);
+    const driverIdentityKey = await canonicalizeEndpoint(driverEndpoint);
+    const prospectiveDriverId = stableNodeId(driverIdentityKey);
     if (!this.reputation.isTrusted(prospectiveDriverId)) {
       console.warn(`skipping launcher ${launcher.endpoint} for model ${modelId}: the driver it would spawn is reputation-ejected`);
       return false;
@@ -550,9 +578,11 @@ export class PipelinePoolManager {
         return false;
       }
 
-      const launcherUrl = new URL(launcher.endpoint);
-      const driverEndpoint = `${launcherUrl.protocol}//${launcherUrl.hostname}:${launcher.agentPort}`;
-      const driverNodeId = this.registry.register(driverEndpoint, "desktop", undefined, modelId);
+      // driverEndpoint/driverIdentityKey were already computed above for
+      // the preflight trust check -- reused here, not rebuilt, so this
+      // registration can never derive a different identity than the one
+      // that was actually checked.
+      const driverNodeId = this.registry.register(driverEndpoint, driverIdentityKey, "desktop", undefined, modelId);
       // Swap the reservation for the real entry: same launcher, so the
       // claim is continuous and never briefly drops.
       this.pipelineTracker.removeEntry(modelId, reservationId);
