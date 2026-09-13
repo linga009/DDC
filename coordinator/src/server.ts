@@ -69,6 +69,16 @@ class JsonParseError extends Error {}
 // call sites in the two register routes.
 class IdentityVerificationError extends Error {}
 
+// A specific IdentityVerificationError: the fetch to POST /identity did
+// not even get a response -- the endpoint refused the connection, isn't
+// speaking HTTP at all (e.g. a raw swarm-rpc-server), or otherwise never
+// answered. Distinguished from every other verification failure (a real
+// HTTP server that answered but with a bad status/body/nonce/mismatch)
+// because it is the ONLY signal /nodes/register's compute-contributor
+// fallback may act on -- see that route's own comment for why a non-2xx
+// response must NOT get the same leniency.
+class UnreachableEndpointError extends IdentityVerificationError {}
+
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
@@ -231,10 +241,16 @@ async function verifyNodeIdentity(endpoint: string, authToken: string, catalog: 
       signal: AbortSignal.timeout(IDENTITY_TIMEOUT_MS),
     });
   } catch (err) {
-    throw new IdentityVerificationError(
+    throw new UnreachableEndpointError(
       `could not reach ${endpoint}/identity to verify this registration: ${err instanceof Error ? err.message : String(err)}`);
   }
   if (!res.ok) {
+    // Deliberately the base IdentityVerificationError, not
+    // UnreachableEndpointError: a non-2xx status means a real HTTP server
+    // answered -- e.g. a genuine 404 from an old-shaped swarm-node-agent
+    // that predates this route -- which is a different fact than "nothing
+    // is speaking HTTP here at all". Only the latter is eligible for
+    // /nodes/register's compute-contributor fallback below.
     throw new IdentityVerificationError(`${endpoint}/identity responded with status ${res.status} -- registration could not be verified`);
   }
   const candidate = await readIdentityResponseJson(res, endpoint);
@@ -251,18 +267,26 @@ async function verifyNodeIdentity(endpoint: string, authToken: string, catalog: 
   // a reason to make the node entirely unregisterable. This leniency only
   // applies when the CALLER made no claim of its own (see below for what
   // happens when they did).
-  const reportedServesModel = typeof candidate.servesModel === "string" && catalog.hasModel(candidate.servesModel)
-    ? candidate.servesModel
+  const rawReportedServesModel = typeof candidate.servesModel === "string" ? candidate.servesModel : undefined;
+  const reportedServesModel = rawReportedServesModel !== undefined && catalog.hasModel(rawReportedServesModel)
+    ? rawReportedServesModel
     : undefined;
   if (claimedServesModel !== undefined && claimedServesModel !== reportedServesModel) {
     // The caller asserted a specific model; the endpoint's own answer does
-    // not confirm it (wrong model, or none at all -- e.g. an agent started
-    // without --serves-model). Reject loudly here rather than silently
-    // registering a node that will look perfectly healthy in GET
-    // /nodes/GET /catalog forever while never being routable for the
-    // model the caller actually wanted it registered for.
+    // not confirm it (wrong model, an unrecognised one, or none at all --
+    // e.g. an agent started without --serves-model). Reject loudly here
+    // rather than silently registering a node that will look perfectly
+    // healthy in GET /nodes/GET /catalog forever while never being
+    // routable for the model the caller actually wanted it registered
+    // for. The message reports the RAW value the endpoint sent, not the
+    // catalog-filtered `reportedServesModel` -- Whole-branch review,
+    // Minor finding: an operator diagnosing why their agent's real
+    // --serves-model value isn't taking effect (e.g. a catalog id typo,
+    // or the coordinator's catalog genuinely not knowing that model yet)
+    // needs to see what the agent ACTUALLY said, not "undefined" for
+    // every unrecognised value indiscriminately.
     throw new IdentityVerificationError(
-      `${endpoint}/identity reported servesModel ${JSON.stringify(reportedServesModel)}, not the claimed ${JSON.stringify(claimedServesModel)} -- registration could not be verified`);
+      `${endpoint}/identity reported servesModel ${JSON.stringify(rawReportedServesModel)}, not the claimed ${JSON.stringify(claimedServesModel)} -- registration could not be verified`);
   }
   return { deviceTier: candidate.deviceTier as DeviceTier, servesModel: reportedServesModel };
 }
@@ -727,58 +751,85 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         const identityKey = await canonicalizeEndpoint(normalizedNodeEndpoint);
         // Endpoint Identity Hardening: everything above this line validates
         // the CALLER's request shape, unchanged from before this phase --
-        // still 400 on a malformed body. What happens next is new: when
-        // the caller claims a servesModel, deviceTier/servesModel are
-        // verified against the endpoint itself instead of trusted
-        // outright, closing the griefing primitive where any token-holder
-        // who knows a node's endpoint could silently strip its servesModel
-        // by re-registering it with none.
+        // still 400 on a malformed body.
         //
-        // Whole-branch review, Critical finding, fixed here: verification
-        // used to run unconditionally, but a real, documented registration
-        // shape -- a raw swarm-rpc-server compute contributor, registered
-        // with NO servesModel (README's own instructions for this role) --
-        // has categorically no HTTP /identity route to answer it, being
-        // llama.cpp's raw RPC backend, not even an HTTP server. Every such
-        // registration failed with a 502 "fetch failed", live-verified to
-        // silently disable Phase B/C's entire multi-node pipeline
-        // machinery (no compute contributor could ever register, so no
-        // requiredNodeCount > 1 pipeline could ever be assembled). deviceTier
-        // for that role was already purely caller-asserted before this
-        // phase existed -- this restores exactly that, and only that.
-        // The skip-verification exemption above only applies while there is
-        // nothing already-verified at stake: if an ACTIVE entry for this
-        // exact identity already has a servesModel (meaning some earlier
-        // registration DID go through full verification), a new
-        // registration that simply omits the field must not be allowed to
-        // silently clear it via the exemption -- that would reopen the
-        // very griefing primitive this phase closes, just via a different
-        // door (claim nothing, rather than claim falsely). Requiring full
-        // verification here is safe for the genuine "this node's role
-        // changed to compute-only" case too: if the endpoint's own
-        // /identity answer confirms it truly serves nothing now, that
-        // clears the field through the normal verified path, exactly as
-        // intended; if the endpoint cannot answer /identity at all (e.g.
-        // it is now a bare, non-HTTP swarm-rpc-server), the registration
-        // is rejected rather than silently trusted, and converting an
-        // existing agent-role node into a compute-only one needs some
-        // other path -- disclosed, not solved, here.
-        const existingServesModel = registry.listActive().find(n => n.nodeId === stableNodeId(identityKey))?.servesModel;
+        // Second whole-branch review, Critical finding, fixed here: the
+        // FIRST fix round pinned an existing identity's `endpoint` against
+        // a colliding registration, but never stopped a COLLIDING
+        // registration (a different endpoint string, same canonical
+        // identity) from reaching verifyNodeIdentity()/registry.register()
+        // at all. That call verifies whatever endpoint the CALLER
+        // submitted -- which, on a collision, is NOT the endpoint the
+        // pinned entry actually points at -- and then writes the result
+        // onto the PINNED entry regardless. Live-verified before this fix:
+        // an attacker pre-registers a placeholder under an alias of a
+        // victim's identity (e.g. the victim's real agent will later use
+        // 127.0.0.1, the attacker registers [::1] first), pinning their
+        // OWN endpoint. The victim's own later, genuinely-successful,
+        // correctly-verified registration then has ITS verified
+        // deviceTier/servesModel written onto the ATTACKER's pinned
+        // endpoint -- /generate keeps routing to the attacker, who
+        // captures real prompts, and the victim's own repeated
+        // registrations report 200 forever with no error. Verifying the
+        // submitted endpoint can only ever establish facts about THAT
+        // endpoint; it establishes nothing about a DIFFERENT one a prior
+        // registration happened to pin. The only safe rule, absent a
+        // proof-of-endpoint-possession mechanism (explicitly out of scope
+        // -- see the design doc's Non-Goals): a registration whose
+        // endpoint does not match an already-ACTIVE entry for the same
+        // identity is rejected outright, loudly, naming the pinned
+        // endpoint -- never silently absorbed. This does not prevent a
+        // squatter from claiming an identity FIRST (a disclosed residual,
+        // matching this phase's already-accepted non-goals), but it turns
+        // that into a loud, diagnosable registration conflict instead of a
+        // silent security breach: the legitimate owner gets a 409 naming
+        // exactly what's pinned, rather than a 200 that quietly routes
+        // their traffic elsewhere.
+        const identityNodeId = stableNodeId(identityKey);
+        const pinnedEndpoint = registry.listActive().find(n => n.nodeId === identityNodeId)?.endpoint;
+        if (pinnedEndpoint !== undefined && pinnedEndpoint !== normalizedNodeEndpoint) {
+          sendJson(res, 409, {
+            error: `this identity is already registered under a different endpoint (${pinnedEndpoint}) -- registration refused rather than silently reassigning it`,
+          });
+          return;
+        }
+        // Second whole-branch review, Critical finding, fixed here too:
+        // verification used to be SKIPPED whenever the caller claimed no
+        // servesModel, based purely on the shape of THIS request -- so a
+        // real agent that DOES serve a model, started correctly with
+        // --serves-model, still ended up registered with no servesModel
+        // at all whenever the registering script simply forgot to repeat
+        // the claim, permanently unroutable with no error anywhere
+        // (live-reproduced as a regression this branch's own prior fix
+        // introduced). Verification is now ALWAYS attempted regardless of
+        // what the caller claims; the compute-contributor exemption is
+        // decided from the OUTCOME instead -- only a genuine
+        // UnreachableEndpointError (the endpoint isn't speaking HTTP at
+        // all, e.g. a raw swarm-rpc-server) falls back to the caller's
+        // bare claim, and only when nothing already-verified is at stake
+        // for this identity (an existing verified servesModel is not
+        // silently cleared by a transient blip -- that registration is
+        // rejected instead, disclosed as a narrow residual rather than
+        // engineered around further). A non-2xx response (e.g. a genuine
+        // 404 from an old-shaped agent that predates this route) is a
+        // real HTTP server answering, not "no HTTP identity here at all",
+        // so it does NOT get this leniency -- see verifyNodeIdentity()'s
+        // own comment for why that distinction matters.
+        const existingServesModel = registry.listActive().find(n => n.nodeId === identityNodeId)?.servesModel;
         let resolvedDeviceTier: DeviceTier;
         let resolvedServesModel: string | undefined;
-        if (servesModel === undefined && existingServesModel === undefined) {
-          resolvedDeviceTier = candidate.deviceTier as DeviceTier;
-          resolvedServesModel = undefined;
-        } else {
-          let verified: { deviceTier: DeviceTier; servesModel?: string };
-          try {
-            verified = await verifyNodeIdentity(normalizedNodeEndpoint, authToken, catalog, servesModel);
-          } catch (err) {
+        try {
+          const verified = await verifyNodeIdentity(normalizedNodeEndpoint, authToken, catalog, servesModel);
+          resolvedDeviceTier = verified.deviceTier;
+          resolvedServesModel = verified.servesModel;
+        } catch (err) {
+          if (err instanceof UnreachableEndpointError && servesModel === undefined && existingServesModel === undefined) {
+            resolvedDeviceTier = candidate.deviceTier as DeviceTier;
+            resolvedServesModel = undefined;
+          } else {
             sendJson(res, 502, { error: err instanceof IdentityVerificationError ? err.message : "failed to verify this registration" });
             return;
           }
-          resolvedDeviceTier = verified.deviceTier;
-          resolvedServesModel = verified.servesModel;
         }
         const nodeId = registry.register(normalizedNodeEndpoint, identityKey, resolvedDeviceTier, localityGroup, resolvedServesModel, availableMemoryMb);
         sendJson(res, 200, { nodeId });
@@ -944,6 +995,25 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           return;
         }
         const launcherIdentityKey = await canonicalizeEndpoint(normalizedLauncherEndpoint);
+        // Second whole-branch review, Minor finding, applied here too:
+        // the SAME collision-rejection rule POST /nodes/register now
+        // enforces (see its own, much longer comment for the full
+        // reasoning and the live-verified attack it closes) -- a
+        // registration whose endpoint does not match an already-ACTIVE
+        // launcher entry for the same identity is rejected outright,
+        // never silently absorbed. This surface is the higher-severity
+        // one to get right: a launcher's POST /pipeline is this project's
+        // own documented RCE-shaped surface (see the design doc's Open
+        // Questions), so silently letting a colliding registration attach
+        // verified-but-irrelevant fields to a squatter's pinned launcher
+        // identity is a worse outcome here than for a plain node.
+        const pinnedLauncherEndpoint = launcherRegistry.listActive().find(l => l.identityKey === launcherIdentityKey)?.endpoint;
+        if (pinnedLauncherEndpoint !== undefined && pinnedLauncherEndpoint !== normalizedLauncherEndpoint) {
+          sendJson(res, 409, {
+            error: `this identity is already registered under a different endpoint (${pinnedLauncherEndpoint}) -- registration refused rather than silently reassigning it`,
+          });
+          return;
+        }
         // Only agentPort is confirmed against the launcher itself --
         // servesModels stays exactly as the caller supplied it above,
         // unverified, since a launcher has no fixed answer to "what do you

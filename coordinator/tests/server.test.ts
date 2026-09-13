@@ -485,10 +485,13 @@ test("POST /nodes/register returns 502 when the endpoint never answers /identity
 // Live-verified before this fix: every such registration failed with a
 // 502 "fetch failed", silently disabling Phase B/C's entire multi-node
 // pipeline machinery (no compute contributor could ever register).
-test("POST /nodes/register registers a node with no servesModel claim without ever contacting it -- the swarm-rpc-server compute-contributor case", async () => {
-  // No stub server at all -- if this registration tried to call
-  // POST /identity on this address, it would fail (nothing is listening),
-  // proving the callback genuinely isn't invoked for this case.
+test("POST /nodes/register registers a node with no servesModel claim when the endpoint genuinely cannot answer /identity -- the swarm-rpc-server compute-contributor case", async () => {
+  // No stub server at all. Verification IS still attempted (second
+  // whole-branch review, Critical finding: it must be, or a real agent's
+  // own reported servesModel gets missed whenever the caller simply
+  // forgets to repeat the claim -- see the sibling test below) -- it just
+  // genuinely fails to connect here, which is exactly the signal this
+  // fallback exists for.
   const { server, baseUrl } = await startTestServer();
   try {
     const res = await authFetch(`${baseUrl}/nodes/register`, {
@@ -503,6 +506,38 @@ test("POST /nodes/register registers a node with no servesModel claim without ev
     assert.equal(nodes[0].servesModel, undefined);
   } finally {
     server.close();
+  }
+});
+
+// Second whole-branch review, Critical finding, fixed here: this
+// branch's own prior fix (the compute-contributor exemption above)
+// SKIPPED verification whenever the caller's request omitted servesModel,
+// based purely on this request's own shape -- so a real agent that DOES
+// serve a model (started correctly with --serves-model) still ended up
+// registered with none whenever the registering script simply forgot to
+// repeat the claim: 200, visible in GET /nodes, available:true in
+// GET /catalog, yet permanently unroutable with no error anywhere.
+// Live-reproduced against this repo's own generate_e2e.ts before this
+// fix. Verification must be ATTEMPTED regardless of the caller's claim;
+// only a genuine connection failure (proven by the sibling test above)
+// gets the compute-contributor fallback.
+test("POST /nodes/register picks up a real agent's own reported servesModel even when the caller's request omits the claim", async () => {
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: {} }), { deviceTier: "desktop", servesModel: "tinyllama-1.1b" });
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "android" }), // no servesModel claimed
+    });
+    assert.equal(res.status, 200);
+    const nodes = await (await authFetch(`${baseUrl}/nodes`)).json();
+    assert.equal(nodes.length, 1);
+    assert.equal(nodes[0].deviceTier, "desktop", "the endpoint's own verified answer wins even for a field the caller also claimed");
+    assert.equal(nodes[0].servesModel, "tinyllama-1.1b", "a real agent's own reported servesModel must not be missed just because the caller's request didn't repeat it");
+  } finally {
+    server.close();
+    stub.server.close();
   }
 });
 
@@ -571,6 +606,30 @@ test("POST /nodes/register rejects a claimed servesModel the endpoint's own /ide
   }
 });
 
+// Second whole-branch review, Minor finding, fixed here: the 502's message
+// used to report the CATALOG-FILTERED value (always "undefined" for any
+// unrecognised servesModel, indistinguishable from the endpoint reporting
+// nothing at all), not what the endpoint actually said. An operator
+// diagnosing a catalog-id typo or genuine catalog drift needs to see the
+// real reported value.
+test("POST /nodes/register's mismatch error reports the endpoint's RAW reported servesModel, not just 'undefined', when it reports an unrecognised one", async () => {
+  const stub = await startStubNodeAgent(() => ({ status: 200, body: {} }), { deviceTier: "desktop", servesModel: "not-a-catalog-model" });
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const res = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: stub.endpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.match(body.error, /not-a-catalog-model/, "the error must show what the endpoint actually reported, not a generic 'undefined'");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
 test("POST /nodes/register cannot be used to strip a live node's servesModel -- the endpoint's own answer wins", async () => {
   // The griefing primitive this phase narrows (not fully closes -- see the
   // dedicated endpoint-pinning tests just below, and README's Known
@@ -611,30 +670,31 @@ test("POST /nodes/register cannot be used to strip a live node's servesModel -- 
   }
 });
 
-// Whole-branch review, Critical finding, fixed in NodeRegistry.register():
-// canonicalization widened what counts as a colliding registration (an
-// alias, or an attacker-chosen DNS name resolving to a victim's real IP)
-// without NodeRegistry also being taught that a DIFFERENT endpoint string
-// can now legitimately collide -- so it kept doing what it always safely
-// did when the only way to collide was the exact same string: overwrite
-// `endpoint` unconditionally. That silently redirected every future
-// /generate call for the victim's identity to the attacker, who could
-// then repoint DNS at will with zero further coordinator interaction.
-// verifyNodeIdentity() genuinely contacts whoever answers at the endpoint
-// submitted and gets truthful fields back -- that was never the gap. Using
-// "truthful fields from whoever answered" to justify overwriting WHERE
-// FUTURE REQUESTS GO was.
-test("POST /nodes/register: a registration whose identity genuinely collides with an active entry never overwrites that entry's endpoint", async () => {
+// Second whole-branch review, Critical finding, fixed here: the FIRST fix
+// round pinned an existing identity's `endpoint` against a colliding
+// registration inside NodeRegistry.register(), but never stopped a
+// colliding registration from REACHING verifyNodeIdentity()/register() at
+// all. That call verifies whatever endpoint the CALLER submitted -- on a
+// collision, NOT the endpoint the pinned entry actually points at -- and
+// then wrote the result onto the PINNED entry regardless, returning a
+// bare 200 to the caller. Live-verified before this fix: an attacker
+// pre-registers a placeholder under an alias of a victim's identity,
+// pinning their OWN endpoint; the victim's own later, genuinely
+// successful, correctly-verified registration then had ITS verified
+// fields written onto the ATTACKER's pinned endpoint, and /generate kept
+// routing real prompts to the attacker -- with the victim's own repeated
+// registrations reporting 200 forever, no error anywhere. A colliding
+// registration under a DIFFERENT endpoint string is now rejected outright
+// (409), before ever calling verifyNodeIdentity or register() -- never
+// silently absorbed.
+test("POST /nodes/register rejects a registration whose identity genuinely collides with an active entry under a DIFFERENT endpoint", async () => {
   // Constructs an actual identityKey collision (two different endpoint
   // strings that really do canonicalize to the same key) by registering
-  // the SAME physical stub agent under two different loopback aliases,
-  // and proves the endpoint stored for that identity is pinned to
-  // whichever was registered FIRST while that entry is still active --
-  // not silently replaced by the second registration's own claimed
-  // endpoint string. A real DNS-based collision (a name an attacker
-  // controls resolving to a victim's real IP) exercises the exact same
-  // code path in production; this test forces the collision
-  // deterministically, without depending on real DNS.
+  // the SAME physical stub agent under two different loopback aliases. A
+  // real DNS-based collision (a name an attacker controls resolving to a
+  // victim's real IP) exercises the exact same code path in production;
+  // this test forces the collision deterministically, without depending
+  // on real DNS.
   const stub = await startStubNodeAgent(() => ({ status: 200, body: {} }), { deviceTier: "desktop", servesModel: "tinyllama-1.1b" });
   const port = Number(new URL(stub.endpoint).port);
   const firstEndpoint = `http://127.0.0.1:${port}`;
@@ -653,16 +713,75 @@ test("POST /nodes/register: a registration whose identity genuinely collides wit
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: secondEndpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
     });
-    assert.equal(second.status, 200);
-    const { nodeId: secondId } = await second.json();
-    assert.equal(secondId, firstId, "precondition: these two endpoints must genuinely collide onto one identity");
+    assert.equal(second.status, 409, "a colliding registration under a different endpoint must be REJECTED, never silently absorbed");
+    const secondBody = await second.json();
+    assert.match(secondBody.error, new RegExp(firstEndpoint.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "the rejection must name the endpoint that is actually pinned");
 
     const nodes = await (await authFetch(`${baseUrl}/nodes`)).json();
     assert.equal(nodes.length, 1);
+    assert.equal(nodes[0].nodeId, firstId, "the original entry must be completely untouched by the rejected collision");
     assert.equal(nodes[0].endpoint, firstEndpoint, "the FIRST-registered endpoint must remain the contact URL while that entry is still active");
   } finally {
     server.close();
     stub.server.close();
+  }
+});
+
+test("POST /nodes/register: a squatter's pre-registration cannot be armed by the real owner's later, honest registration", async () => {
+  // The full attack this phase closes, played out exactly as whole-branch
+  // review demonstrated it live: an attacker registers a placeholder
+  // FIRST under an alias of the identity the real victim will later use,
+  // pinning the ATTACKER's endpoint. Before this fix, the victim's own
+  // subsequent, genuinely successful, correctly-verified registration
+  // (from the REAL endpoint) had its verified deviceTier/servesModel
+  // written onto the attacker's PINNED endpoint -- arming the hijack with
+  // the victim's own honest data, and /generate then routed real prompts
+  // to the attacker. The victim's registration must now be rejected
+  // instead, and the attacker's entry must be left exactly as it was.
+  const attacker = await startStubNodeAgent(() => ({ status: 200, body: { text: "ATTACKER-CONTROLLED" } }), { deviceTier: "android" }); // no servesModel of its own
+  const victim = await startStubNodeAgent(() => ({ status: 200, body: { text: "real victim response" } }), { deviceTier: "desktop", servesModel: "tinyllama-1.1b" });
+  const port = Number(new URL(attacker.endpoint).port); // same port both aliases below share
+  const attackerEndpoint = `http://127.0.0.1:${port}`;
+  const victimAliasEndpoint = `http://localhost:${port}`; // collides with attackerEndpoint's identity
+  const { server, baseUrl } = await startTestServer();
+  try {
+    // The attacker squats FIRST -- a real, disclosed residual (a race to
+    // register first is not solved by this phase; see README). What must
+    // no longer happen is what comes next.
+    const squat = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: attackerEndpoint, deviceTier: "android" }),
+    });
+    assert.equal(squat.status, 200);
+
+    // The victim, using an alias that collides with the same identity,
+    // registers honestly -- this must be REJECTED, not silently applied
+    // to the attacker's pinned entry.
+    const victimAttempt = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: victimAliasEndpoint, deviceTier: "desktop", servesModel: "tinyllama-1.1b" }),
+    });
+    assert.equal(victimAttempt.status, 409, "the victim's registration under a colliding alias must be rejected, not silently armed onto the squatter's entry");
+
+    const nodes = await (await authFetch(`${baseUrl}/nodes`)).json();
+    assert.equal(nodes.length, 1);
+    assert.equal(nodes[0].endpoint, attackerEndpoint);
+    assert.equal(nodes[0].servesModel, undefined, "the attacker's entry must NOT have acquired the victim's verified servesModel");
+
+    // And /generate must never be armed to route to the attacker for the
+    // model the victim actually serves.
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "tinyllama-1.1b" }),
+    });
+    assert.equal(res.status, 503, "no node should be routable for tinyllama-1.1b -- the attacker's entry never claims it, and the victim was never registered");
+  } finally {
+    server.close();
+    attacker.server.close();
+    victim.server.close();
   }
 });
 
@@ -1178,6 +1297,43 @@ test("POST /launchers/register rejects a launcher whose /identity reports an out
     assert.equal(res.status, 502);
     const body = await res.json();
     assert.match(body.error, /agentPort/i);
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
+// Second whole-branch review, Minor finding, fixed here: the same
+// collision-rejection rule POST /nodes/register enforces now applies to
+// launchers too -- a swarm-launcher's POST /pipeline is this project's
+// own documented RCE-shaped surface, so silently letting a colliding
+// registration attach a caller's claims to a squatter's pinned launcher
+// identity is a worse outcome here than for a plain node.
+test("POST /launchers/register rejects a registration whose identity genuinely collides with an active launcher under a DIFFERENT endpoint", async () => {
+  const stub = await startIdentityStub("launcher", { agentPort: 8090 });
+  const port = Number(new URL(stub.endpoint).port);
+  const firstEndpoint = `http://127.0.0.1:${port}`;
+  const secondEndpoint = `http://localhost:${port}`;
+  const { server, baseUrl, launcherRegistry } = await startTestServer();
+  try {
+    const first = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: firstEndpoint, servesModels: ["mixtral-8x7b"], agentPort: 8090 }),
+    });
+    assert.equal(first.status, 200);
+
+    const second = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: secondEndpoint, servesModels: ["mixtral-8x22b"], agentPort: 8090 }),
+    });
+    assert.equal(second.status, 409, "a colliding launcher registration under a different endpoint must be REJECTED, never silently absorbed");
+
+    const launchers = launcherRegistry.listActive();
+    assert.equal(launchers.length, 1);
+    assert.equal(launchers[0].endpoint, firstEndpoint, "the FIRST-registered endpoint must remain pinned");
+    assert.deepEqual(launchers[0].servesModels, ["mixtral-8x7b"], "the rejected collision must not overwrite servesModels either");
   } finally {
     server.close();
     stub.server.close();

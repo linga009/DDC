@@ -72,20 +72,23 @@ export const openApiDocument = {
       post: {
         summary: "Register a node",
         description:
-          "If servesModel is claimed, verifies this registration by calling POST /identity on the endpoint itself " +
-          "with a single-use nonce: deviceTier/servesModel in the request body are validated for shape but then " +
-          "REPLACED with whatever the endpoint's own /identity response reports, and a claimed servesModel the " +
-          "endpoint does not confirm is rejected outright (502), not silently downgraded. If servesModel is omitted " +
-          "(the swarm-rpc-server compute-contributor pattern -- see README), verification is skipped entirely and " +
-          "deviceTier is trusted as claimed, since a bare RPC backend has no HTTP /identity route to answer it -- " +
-          "unless an ACTIVE entry for this identity already has a verified servesModel, in which case omitting the " +
-          "field does not silently clear it; full verification still runs. This narrows, but does not fully close, " +
-          "the griefing vector where a token-holder who knew a node's endpoint could overwrite its claims by " +
-          "re-registering it: the identity's contact URL (endpoint) is now pinned against a colliding registration " +
-          "and cannot be hijacked this way, and servesModel/deviceTier are endpoint-verified when claimed, but " +
-          "localityGroup and availableMemoryMb are NOT verified this way and remain exactly as supplied here, " +
-          "unchanged -- still overwritable by anyone who can trigger a registration for this identity. See README's " +
-          "Known gaming vectors.",
+          "A registration whose canonical identity (see README's Endpoint identity section) is already ACTIVE " +
+          "under a DIFFERENT endpoint is rejected outright (409, naming the pinned endpoint) before anything is " +
+          "verified or stored -- registering under an alias of a machine someone else already registered never " +
+          "silently reassigns or refreshes that entry. Otherwise, verification is ALWAYS attempted by calling " +
+          "POST /identity on the submitted endpoint with a single-use nonce: deviceTier/servesModel in the request " +
+          "body are validated for shape but then REPLACED with whatever the endpoint's own /identity response " +
+          "reports, and a claimed servesModel the endpoint does not confirm is rejected outright (502), not " +
+          "silently downgraded. Only when the endpoint is genuinely unreachable (not merely a non-2xx response -- " +
+          "the swarm-rpc-server compute-contributor pattern, see README) AND no servesModel was claimed AND no " +
+          "already-verified servesModel is on record for this identity does registration fall back to trusting " +
+          "the caller's bare deviceTier claim, since a raw RPC backend has no HTTP /identity route to answer at " +
+          "all. This narrows, but does not fully close, the trust model around node identity: it does not stop a " +
+          "squatter from registering an identity FIRST (a disclosed residual -- proof-of-endpoint-possession is out " +
+          "of scope for this phase), only from having a later, legitimate owner's verified data silently attached " +
+          "to the squatter's pinned entry. localityGroup and availableMemoryMb are NOT verified this way and remain " +
+          "exactly as supplied here, unchanged, for whichever endpoint is already pinned. See README's Known gaming " +
+          "vectors.",
         requestBody: {
           content: {
             "application/json": {
@@ -107,6 +110,12 @@ export const openApiDocument = {
           "200": { description: "Registered", content: { "application/json": { schema: { type: "object", properties: { nodeId: { type: "string" } } } } } },
           "400": {
             description: "Invalid request body",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+          "409": {
+            description:
+              "This identity is already registered under a different endpoint -- the pinned endpoint is named in " +
+              "the error message. Registration is refused rather than silently reassigning it.",
             content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
           },
           "502": {
@@ -217,13 +226,16 @@ export const openApiDocument = {
       post: {
         summary: "Register a swarm-launcher",
         description:
-          "Verifies this registration by calling POST /identity on the endpoint itself with a single-use nonce " +
-          "(no Authorization header -- a swarm-launcher's /identity route deliberately has none, matching its own " +
-          "127.0.0.1-only trust boundary). agentPort in the request body is validated for shape but then DISCARDED: " +
-          "the value actually stored is whatever the launcher's own /identity response reports. servesModels is NOT " +
-          "verified this way and remains exactly as supplied here, unchanged -- a launcher can spawn any model " +
-          "present under its own --models-dir, so it has no fixed answer to \"what do you serve\" the way a running " +
-          "node agent does.",
+          "A registration whose canonical identity is already ACTIVE under a DIFFERENT endpoint is rejected " +
+          "outright (409, naming the pinned endpoint) before anything is verified or stored -- the same rule " +
+          "POST /nodes/register enforces, applied here too since a swarm-launcher's POST /pipeline is this " +
+          "project's own documented RCE-shaped surface. Otherwise, verifies this registration by calling " +
+          "POST /identity on the endpoint itself with a single-use nonce (no Authorization header -- a " +
+          "swarm-launcher's /identity route deliberately has none, matching its own 127.0.0.1-only trust " +
+          "boundary). agentPort in the request body is validated for shape but then DISCARDED: the value actually " +
+          "stored is whatever the launcher's own /identity response reports. servesModels is NOT verified this way " +
+          "and remains exactly as supplied here, unchanged -- a launcher can spawn any model present under its own " +
+          "--models-dir, so it has no fixed answer to \"what do you serve\" the way a running node agent does.",
         requestBody: {
           content: {
             "application/json": {
@@ -244,6 +256,12 @@ export const openApiDocument = {
           "200": { description: "Registered", content: { "application/json": { schema: { type: "object", properties: { launcherId: { type: "string" } } } } } },
           "400": {
             description: "Invalid request body",
+            content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          },
+          "409": {
+            description:
+              "This identity is already registered under a different endpoint -- the pinned endpoint is named in " +
+              "the error message. Registration is refused rather than silently reassigning it.",
             content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
           },
           "502": {

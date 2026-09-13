@@ -65,42 +65,45 @@ export class NodeRegistry {
   // substituting a resolved IP here would break TLS SNI and name-based
   // virtual hosting for an https endpoint.
   //
-  // Whole-branch review finding, Critical, fixed here: before Endpoint
-  // Identity Hardening, the only way to collide with an existing nodeId
-  // was to submit the exact same (lowercased) endpoint STRING, so
-  // overwriting `endpoint` with a value identical to what it already held
-  // was a no-op by construction -- Security Phase 3 never had to think
-  // about this. Canonicalization widened what counts as a collision
-  // (aliases, and any two endpoints an attacker can make resolve
-  // together) without this method also being taught that a DIFFERENT
-  // endpoint string can now legitimately collide. Live-verified before
-  // this fix: registering a DNS name an attacker controls that resolves
-  // to a trusted node's IP -- or simply a different loopback address, if
-  // the loopback range collapsed as broadly as canonicalizeEndpoint()
-  // used to -- silently overwrote the victim's `endpoint`, redirecting
-  // every future /generate call for that identity to the attacker, who
-  // could then repoint DNS at will with zero further coordinator
-  // interaction. verifyNodeIdentity() genuinely contacts the machine
-  // behind the SUBMITTED endpoint and gets truthful fields back from it --
-  // that was never the gap. The gap was that "truthful fields from
-  // whoever answered" was then used to justify overwriting WHERE FUTURE
-  // REQUESTS GO, which is a different and stronger claim than anything the
-  // callback actually establishes.
+  // Before Endpoint Identity Hardening, the only way to collide with an
+  // existing nodeId was to submit the exact same (lowercased) endpoint
+  // STRING, so overwriting `endpoint` with a value identical to what it
+  // already held was a no-op by construction -- Security Phase 3 never
+  // had to think about this. Canonicalization widened what counts as a
+  // collision (aliases, and any two endpoints an attacker can make
+  // resolve together) without this method also being taught that a
+  // DIFFERENT endpoint string can now legitimately collide.
   //
-  // The fix matches the pattern LauncherRegistry.register() and
-  // PeerRegistry.register() already established (their own refresh
-  // branches never touch `endpoint` either) instead of inventing a new
-  // rule: while an ACTIVE entry already exists for this identity, its
-  // endpoint is never replaced by a colliding registration, no matter what
-  // that registration claims or how its own /identity call resolved.
-  // deviceTier/servesModel still refresh from the newly-verified answer
-  // (harmless even under attack, since verifyNodeIdentity() always
-  // contacts whoever is really listening at the identity's stable
-  // endpoint once one exists) -- only the contact URL itself is pinned.
+  // This pinning is defense-in-depth, not the primary defense.
+  // Two whole-branch review rounds are the reason for that split:
+  // - Round 1 pinned `endpoint` here (this code) so a colliding
+  //   registration could never overwrite it directly, matching the
+  //   pattern LauncherRegistry.register()/PeerRegistry.register() already
+  //   established (their own refresh branches never touch `endpoint`
+  //   either).
+  // - Round 2 found that pinning alone was not enough: server.ts's
+  //   /nodes/register route still let a colliding registration reach
+  //   verifyNodeIdentity() and this method at all. verifyNodeIdentity()
+  //   verifies whichever endpoint the CALLER submitted -- on a collision,
+  //   NOT the endpoint already pinned here -- and its result was then
+  //   written onto the PINNED entry regardless. Live-verified: an
+  //   attacker pre-registers a placeholder under an alias, pinning their
+  //   OWN endpoint; the real owner's later, genuinely successful,
+  //   correctly-verified registration then had ITS verified fields
+  //   written onto the ATTACKER's pinned endpoint, arming a full
+  //   prompt-capture hijack with the victim's own honest data. The real
+  //   fix is in server.ts's route handler: a registration whose endpoint
+  //   does not match an already-ACTIVE entry for the same identity is now
+  //   rejected outright (409) BEFORE it ever reaches verifyNodeIdentity()
+  //   or this method -- see that route's own, much longer comment. This
+  //   method's own pinning below remains as a second layer for any other
+  //   caller of register() (the launcher-spawned internal driver
+  //   registrations in assemblePipeline()/tryAssemble() call this
+  //   directly, bypassing the HTTP route's check entirely).
+  //
   // localityGroup/availableMemoryMb remain exactly as disclosed already
   // (Security Phase 3): still overwritable by anyone who can trigger a
-  // collision, now reachable via alias/DNS collision and not only an
-  // exact endpoint-string match -- see README.
+  // collision -- see README.
   //
   // An EXPIRED existing entry does not pin anything: that is the
   // legitimate "this identity's node moved / came back under a new
