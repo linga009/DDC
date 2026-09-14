@@ -65,6 +65,34 @@ implementation paused" before assuming a plan needs scoping from scratch.
   sign-off to begin execution, unless the user's own pause instruction said
   otherwise.
 
+## Resuming a Plan Paused Mid-Review-Cycle
+
+Distinct from an unexecuted plan (above): implementation is done, one or
+more fix rounds have already been applied and committed to the worktree
+branch, but whole-branch review has not yet come back clean — the user
+paused deliberately (e.g. "good enough for this weekend") rather than
+letting the review→fix→re-review loop run to convergence. Check
+`CLAUDE.md`'s own per-phase paragraph for language like "paused here,
+mid-review-cycle... not because review converged" before assuming a phase
+with lots of commits and passing tests is close to done.
+
+- **Do not treat "many review rounds already happened" as evidence the
+  branch is nearly clean.** This project's own history (Phase C: 3 rounds;
+  Endpoint Identity Hardening: 7 rounds, 6 of which found a real issue) is
+  the opposite signal — a security/concurrency-sensitive coordinator
+  branch that has needed several rounds tends to need another one, not
+  fewer. Read the CLAUDE.md paragraph for the LAST round's actual findings
+  before assuming anything about the current state.
+- **The explicit next step is another whole-branch review**, not a docs
+  pass or a merge — re-read this skill's own live-adversarial-probing
+  requirement below and dispatch it before writing any more code, unless
+  the user has asked for something else specifically.
+- **Do not merge** a phase whose CLAUDE.md paragraph says it's paused
+  mid-cycle, even if all tests currently pass — passing tests has not
+  once, across this project's history, been sufficient evidence a
+  concurrency-sensitive branch is done; only a review round that
+  genuinely finds nothing has been.
+
 ## Task Dispatch Defaults for This Repo
 
 - **Worktree location:** `.worktrees/<plan-name>`, branch name matches.
@@ -132,3 +160,18 @@ implementation paused" before assuming a plan needs scoping from scratch.
   suggested code and shipped through task-level review; only the
   live-probing whole-branch review caught it. Suggested code in a brief is
   a starting point, not a guarantee.
+- Fixing a TOCTOU (time-of-check-to-time-of-use) race, or a latency
+  problem caused by an awaited call on a hot path, by patching the ONE
+  spot the finding pointed at, instead of restating the actual rule and
+  checking every place it applies. Endpoint Identity Hardening hit this
+  shape five separate times across its 7 review rounds: a collision-check
+  re-added before one `await` but not a sibling variable spanning the
+  same `await`; a detached "don't block the caller" fix that left
+  state-machine bookkeeping (a reservation's `state`) stuck in a way a
+  DIFFERENT, unrelated gate then misread; a newly-added verified-identity
+  tracking set that recorded writes from one code path but not a second,
+  equally-trusted writer. Each was a real regression a genuinely
+  independent whole-branch review caught, not a missed edge case in the
+  same review. When fixing this class of bug, explicitly ask "what ELSE
+  reads or writes this same state, across an `await` or a detach point,
+  that this fix doesn't touch" before considering it done.
