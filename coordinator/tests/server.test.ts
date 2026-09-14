@@ -562,6 +562,50 @@ test("POST /nodes/register: re-registering the SAME still-unreachable compute-co
   }
 });
 
+test("POST /nodes/register: a registration stalled mid-verification must not overwrite a servesModel the internal driver-registration path commits in the meantime", async () => {
+  // Seventh whole-branch review, Critical finding: `verifiedIdentities`
+  // (see its own comment above) is written ONLY by this route -- it has
+  // no way to know about the launcher-spawned internal driver
+  // registrations in assemblePipeline()/tryAssemble(), which call
+  // registry.register() directly and never touch this set, even though
+  // their data is just as endpoint-authoritative (the launcher spawned
+  // the agent with the requested --serves-model, and POST /pipeline only
+  // returns success after its own health check). Reproduced here by
+  // racing an attacker's stalled registration against a direct
+  // registry.register() call -- standing in for the internal driver path,
+  // which does exactly this -- that commits WHILE the attacker's own
+  // identity check is still pending. Before this fix, `verifiedIdentities`
+  // alone had no record of the driver's write and let the attacker's
+  // unreachable-fallback claim silently strip it.
+  const stub = await startGatedIdentityStub("node", "127.0.0.1");
+  const driverEndpoint = `http://127.0.0.1:${stub.port}`;
+  const { server, baseUrl, registry } = await startTestServer();
+  try {
+    const attackPromise = authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: driverEndpoint, deviceTier: "ios" }),
+    });
+    await stub.gateReached; // the attacker's own identity check is now genuinely stalled, nothing registered yet
+
+    registry.register(driverEndpoint, await canonicalizeEndpoint(driverEndpoint), "desktop", undefined, "big-model");
+
+    // Resolves once the attacker's own fetch genuinely times out
+    // (IDENTITY_TIMEOUT_MS) -- deliberately never released, so this is a
+    // real ~5s wait, not a shortcut.
+    const attackRes = await attackPromise;
+    assert.equal(attackRes.status, 502, "a registration that could not be verified must not silently overwrite a servesModel the internal driver path just committed");
+
+    const active = registry.listActive();
+    assert.equal(active.length, 1);
+    assert.equal(active[0].servesModel, "big-model", "the driver's servesModel must survive -- this is round 4's Critical, reopened for a writer verifiedIdentities alone doesn't know about");
+    assert.equal(active[0].deviceTier, "desktop");
+  } finally {
+    server.close();
+    stub.server.close();
+  }
+});
+
 // Second whole-branch review, Critical finding, fixed here: this
 // branch's own prior fix (the compute-contributor exemption above)
 // SKIPPED verification whenever the caller's request omitted servesModel,
@@ -1984,6 +2028,99 @@ test("POST /generate makes a genuinely fresh assembly attempt after a squat, wit
   } finally {
     server.close();
     launcherStub.close();
+  }
+});
+
+test("POST /generate is not permanently blocked by accumulated 'failed' reservations counting against maxPipelines", async () => {
+  // Seventh whole-branch review, Important finding: round 6's fix left the
+  // "assembling" gate closed but the maxPipelines CEILING check
+  // (`pool.length - (tracked ? 1 : 0) >= catalog.maxPipelines(modelId)`)
+  // still counted every pool entry, "failed" ones included -- and only
+  // pool[0] is ever excluded from that count. With the default
+  // maxPipelines of 1, TWO pending "failed" reservations (each one's own
+  // detached teardown not yet settled) already meet the ceiling, so this
+  // function returned before even looking at a launcher again --
+  // live-verified by the review: from the THIRD /generate call on, every
+  // one got an instant 503 with ZERO further launcher attempts, including
+  // against a second, completely healthy, idle launcher that was never
+  // even considered. Fixed by counting only non-"failed" pool entries
+  // toward the ceiling. This test keeps TWO failed reservations pending
+  // (both DELETEs gated open) and proves a third attempt still reaches a
+  // second, healthy, non-squatted launcher instead of being blocked by
+  // the ceiling check.
+  let squattedPipelineCalls = 0;
+  let releaseDelete: () => void;
+  const deleteGate = new Promise<void>(resolve => { releaseDelete = resolve; });
+  const squattedLauncherStub = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    if (req.method === "DELETE") {
+      await deleteGate; // held open for the whole test -- never released
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
+    squattedPipelineCalls++;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "ready" }));
+  });
+  await new Promise<void>(resolve => squattedLauncherStub.listen(0, "127.0.0.1", resolve));
+  const squattedAddress = squattedLauncherStub.address();
+  if (squattedAddress === null || typeof squattedAddress === "string") {
+    throw new Error("expected squatted launcher stub to bind to a port");
+  }
+  const squattedEndpoint = `http://127.0.0.1:${squattedAddress.port}`;
+
+  let cleanPipelineCalls = 0;
+  const cleanLauncher = await startStubNodeAgent((body) => {
+    const candidate = body as Record<string, unknown>;
+    if (candidate.model !== undefined) {
+      cleanPipelineCalls++;
+      return { status: 200, body: { status: "ready" } };
+    }
+    return { status: 200, body: { text: "from the clean launcher" } };
+  });
+
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
+  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(bigCatalog);
+  try {
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+
+    const squatterEndpoint = `http://localhost:${squattedAddress.port}`;
+    registry.register(squatterEndpoint, await canonicalizeEndpoint(squatterEndpoint), "desktop", undefined, "squatted-model");
+
+    launcherRegistry.register(squattedEndpoint, await canonicalizeEndpoint(squattedEndpoint), ["big-model"], squattedAddress.port);
+    launcherRegistry.register(cleanLauncher.endpoint, await canonicalizeEndpoint(cleanLauncher.endpoint), ["big-model"], Number(new URL(cleanLauncher.endpoint).port));
+
+    for (let i = 0; i < 2; i++) {
+      const res = await authFetch(`${baseUrl}/generate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompt: `attempt ${i}`, modelId: "big-model" }),
+      });
+      assert.equal(res.status, 503);
+    }
+    // Two "failed" reservations for the squatted launcher are now pending
+    // in the pool, both DELETEs held open -- exactly the accumulated state
+    // the review found blocking the ceiling check.
+    assert.ok(squattedPipelineCalls >= 1, "the squatted launcher was genuinely attempted");
+
+    const res3 = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "attempt 2", modelId: "big-model" }),
+    });
+    assert.equal(res3.status, 200, "a fresh attempt must not be blocked by accumulated 'failed' reservations counting against maxPipelines -- it must reach the healthy launcher");
+    assert.deepEqual(await res3.json(), { text: "from the clean launcher" });
+    assert.equal(cleanPipelineCalls, 1);
+
+    releaseDelete();
+  } finally {
+    server.close();
+    squattedLauncherStub.close();
+    cleanLauncher.server.close();
   }
 });
 

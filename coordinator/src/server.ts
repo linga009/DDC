@@ -537,7 +537,27 @@ async function assemblePipeline(
   // the tally; adding alongside a full pool is what must be refused. The
   // background pool manager already respected maxPipelines -- this path
   // never consulted it at all.
-  if (pool.length - (tracked ? 1 : 0) >= catalog.maxPipelines(modelId)) {
+  //
+  // Seventh whole-branch review, Important finding, fixed here: this used
+  // to count every pool ENTRY, including ones in state "failed" -- a
+  // squatted driver identity's own reservation, now correctly left in the
+  // pool (marked failed, not removed) until its detached teardown settles
+  // (see the DriverIdentityCollisionError catch block's own comment). A
+  // "failed" entry represents nothing usable, only cleanup in progress, so
+  // counting it toward the ceiling is wrong -- live-verified: with the
+  // default maxPipelines of 1, TWO pending failed reservations (one per
+  // squatted attempt, since each one's own detached teardown hadn't yet
+  // removed the PREVIOUS one) already put this ceiling check at its limit,
+  // so it returned before this function ever looked at a launcher again --
+  // every /generate call from the third one on got an instant 503 with
+  // ZERO launcher attempts, including against a second, completely
+  // healthy, idle launcher that was never even considered. Counting only
+  // non-"failed" entries fixes this; `tracked` is excluded from THIS
+  // count only when it is itself still live (not already "failed"), since
+  // an already-failed `tracked` is already excluded by the filter and
+  // subtracting it again would double-count.
+  const liveCount = pool.filter(entry => entry.state !== "failed").length;
+  if (liveCount - (tracked && tracked.state !== "failed" ? 1 : 0) >= catalog.maxPipelines(modelId)) {
     return;
   }
 
@@ -653,7 +673,29 @@ async function assemblePipeline(
     // port and the model's weights until some unrelated model happens to
     // claim it. (Same launcher needs no call -- POST /pipeline already
     // replaced that agent in place.)
-    if (tracked) {
+    //
+    // Seventh whole-branch review: a "failed" `tracked` entry is left
+    // alone here entirely, not just exempted from the teardown call.
+    // Its launcher is ALREADY being torn down by whatever marked it
+    // failed (this function's own DriverIdentityCollisionError catch
+    // branch, or one of /generate's other forward-failure sites), and
+    // that same code already owns removing it -- either directly once its
+    // own teardown settles, or via the background pool manager's routine
+    // reaping of any "failed" entry on its next tick regardless of cause.
+    // Live-verified this mattered, not just for tidiness: reaching this
+    // point after a genuinely successful assembly on a SECOND, healthy
+    // launcher, with a "failed" `tracked` entry still sitting on the
+    // FIRST, squatted one, used to redundantly re-await that first
+    // launcher's own already-in-flight teardown here, synchronously,
+    // for the full PIPELINE_ASSEMBLY_TIMEOUT_MS -- stalling THIS
+    // unrelated, otherwise-successful request for up to a minute despite
+    // nothing about its own success depending on that other teardown
+    // finishing. Removing the entry early here (before its own teardown
+    // has actually confirmed the agent stopped) would also reopen the
+    // exact "never free a launcherId while its old agent might still be
+    // running" race round 5 closed elsewhere -- leaving it alone avoids
+    // that too, not just the stall.
+    if (tracked && tracked.state !== "failed") {
       if (tracked.launcherId !== launcher.launcherId) {
         await stopLauncherPipeline(launcherRegistry, tracked.launcherId, tracked.launcherEndpoint);
       }
@@ -1020,7 +1062,32 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         // registration, stays exactly as permissive as it always was.
         if (usedUnreachableFallback) {
           const activeAtCommit = registry.listActive().find(n => n.nodeId === identityNodeId);
-          if (activeAtCommit !== undefined && verifiedIdentities.has(identityNodeId)) {
+          // Seventh whole-branch review, Critical finding, fixed here:
+          // `verifiedIdentities` is written ONLY by this route -- it has
+          // no way to know about the launcher-spawned internal driver
+          // registrations in assemblePipeline()/tryAssemble(), which call
+          // registry.register() directly and never touch this set, even
+          // though their data is just as endpoint-authoritative (the
+          // launcher spawned the agent with the requested --serves-model,
+          // and POST /pipeline only returns success after its own health
+          // check). Live-reproduced: with only `verifiedIdentities.has()`
+          // as the guard, an attacker who registers a driver's own
+          // endpoint string while its identity check happens to be
+          // unreachable (this project's agent is single-threaded, so
+          // "busy" is enough, no attacker capability required beyond
+          // knowing the driver's address) silently stripped a real,
+          // freshly-assembled driver's servesModel and deviceTier -- round
+          // 4's Critical, reopened for exactly the one writer round 4's
+          // own fix was chiefly worried about. `verifiedIdentities.has()`
+          // alone is therefore not sufficient; `activeAtCommit.servesModel
+          // !== undefined` closes the gap for both writers at once,
+          // because it is true precisely when it needs to be: the
+          // fallback branch above only EVER writes `servesModel:
+          // undefined` (see its own comment), so any entry that DOES
+          // carry a servesModel was written by a real verification or by
+          // the internal driver path -- never by this fallback -- making
+          // it authoritative regardless of which of those two wrote it.
+          if (activeAtCommit !== undefined && (verifiedIdentities.has(identityNodeId) || activeAtCommit.servesModel !== undefined)) {
             sendJson(res, 502, {
               error: `${normalizedNodeEndpoint} could not be reached to verify this registration, and this identity already has endpoint-verified data (deviceTier ${JSON.stringify(activeAtCommit.deviceTier)}${activeAtCommit.servesModel !== undefined ? `, servesModel ${JSON.stringify(activeAtCommit.servesModel)}` : ""}) at stake -- registration refused rather than silently overwriting it with an unverified claim`,
             });

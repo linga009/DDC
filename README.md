@@ -864,37 +864,92 @@ default catalog declares one.
   round 5 fixed an earlier version of this that did) rather than leaking
   it — but the model stays unavailable, and the *next* attempt (either the
   background reconciliation tick, 10 seconds in production, or the very
-  next `/generate` call, which is deliberately NOT blocked from retrying
-  immediately — round 6 fixed an earlier version of this fix that left a
-  stale reservation blocking every subsequent `/generate` call outright,
-  even for launchers that were never squatted) tries again: spawn,
+  next `/generate` call — see below for why that call genuinely retries
+  rather than bouncing off stale bookkeeping) tries again: spawn,
   health-check, discover the same squat, tear down, repeat, for as long as
-  the squat persists. That retry deliberately prefers the SAME
-  just-failed launcher over trying a different, idle one first (the
-  existing "maybe the driver merely died and this launcher recovered"
-  heuristic Phase C already applies to any tracked failure — reasonable
-  for a transient death, but a squatted identity is a persistent property
-  of that launcher's own driver endpoint and will fail identically every
-  time), so an idle, non-squatted launcher can sit untried while the
-  squatted one keeps getting retried — a real availability nuisance, not
-  fixed here, on a mechanism that ships dormant in production. This is
-  real, repeated compute/memory churn on the affected launcher (a fresh
-  multi-GB model load every retry), not a one-time cost — and there is
-  deliberately no backoff added for it, matching this phase's existing
-  disclose-rather-than-engineer-around posture for a mechanism that ships
-  dormant in production.
+  the squat persists. This is real, repeated compute/memory churn on the
+  affected launcher (a fresh multi-GB model load every retry), not a
+  one-time cost — and there is deliberately no backoff added for it,
+  matching this phase's existing disclose-rather-than-engineer-around
+  posture for a mechanism that ships dormant in production.
+  **Getting a fresh `/generate` call to actually retry, rather than
+  bouncing off stale bookkeeping from the previous failed attempt, took
+  three more review rounds to get right** — worth recording precisely,
+  since each of the first two fixes' own regression tests passed for the
+  wrong reason before a live, gated reproduction caught the gap: round 6
+  found a failed attempt's reservation stuck marking the whole model
+  `"assembling"` (an unrelated dedup gate meant for a real in-flight
+  attempt) for as long as its own teardown took, blocking every
+  subsequent call outright with **zero** launcher attempts; round 7 found
+  round 6's own fix hit a second wall two calls later — the assembly
+  ceiling (`maxPipelines`, default 1) counted PENDING, already-failed
+  reservations as if they were live pipelines, so from the third call on,
+  every one bounced off the ceiling before ever looking at a launcher
+  again, live-verified even with a second, completely idle, non-squatted
+  launcher registered and never touched — and, once that was fixed,
+  uncovered a THIRD, compounding stall in the success path's own
+  (pre-existing, Phase B) launcher-replacement logic, which redundantly
+  re-awaited the squatted launcher's already-in-flight teardown a second
+  time before returning an otherwise-already-successful response on a
+  completely different, healthy launcher. All three are now fixed
+  together. The retry does still prefer the SAME just-failed launcher for
+  its first one or two attempts (the existing "maybe the driver merely
+  died and this launcher recovered" heuristic Phase C already applies to
+  any tracked failure — reasonable for a transient death, not for a
+  squatted identity, which is a persistent property of that launcher's own
+  driver endpoint and will fail identically every time it's retried) — but
+  a registered, idle, non-squatted launcher is NOT permanently starved: it
+  gets tried once the squatted launcher's own accumulated failed
+  reservations stop qualifying it for that same-launcher preference.
+  Distinguishing a persistent squat from a transient death on the first
+  retry, rather than relying on this accumulation to eventually move on,
+  would need `PooledPipeline`'s state model to record *why* an entry
+  failed, not just that it did — judged out of proportion for this phase,
+  left as a disclosed, narrower residual than the "permanently blocked
+  outright" bugs the same review rounds also found and fixed.
 - **A hung launcher can cost an unrelated healthy model its pipeline.** The
   reconciliation tick awaits launcher I/O sequentially with a 60-second
   timeout — twice the registry's 30-second node timeout — and the driver
   heartbeat pre-pass sits inside that same tick, whose overlapping runs are
   dropped by a re-entrancy guard. One unresponsive launcher can therefore
   starve a healthy model's driver of heartbeats until it ages out and its
-  pipeline is torn down and rebuilt.
+  pipeline is torn down and rebuilt. On the request path specifically, this
+  extends to one more case than the squat/teardown one above (which is
+  fixed): when a fresh assembly succeeds on a DIFFERENT launcher than a
+  STALE, still-`"warm"`-tracked entry's own (a legitimately dead driver,
+  not a squat — a squat's own "failed" entry is exempted from this,
+  fixed alongside the churn above), the caller still `await`s that old
+  launcher's `DELETE /pipeline` synchronously before its own,
+  already-successful response is sent — pre-existing Phase B behavior,
+  bounded by the same 60-second ceiling, not touched by this phase's own
+  fix rounds since it's a different code path than the one those rounds
+  were scoped to.
 - Scale-down does not deregister the torn-down driver from `NodeRegistry`,
   so it stays selectable for up to 30 seconds and can yield a `502`.
 - The demand-to-pipeline-count function and both constants (10s interval,
   5-minute idle grace, 10 requests/minute per pipeline) are starting points
   chosen without real load data, not tuned figures.
+- The background reconciliation loop's own version of the squat-collision
+  path (`tryAssemble()`) still leaves its reservation at `"assembling"` for
+  the whole duration of its (awaited, not detached) teardown call, the same
+  gate that used to block the request path outright before that was fixed —
+  deliberately NOT mirrored here: marking it `"failed"` early here would let
+  a concurrent request claim the same launcher before its old agent is
+  confirmed stopped, the exact race a different fix elsewhere was written
+  to prevent. Named as an asymmetry rather than patched, since the two
+  paths' constraints genuinely differ (the background loop already awaits
+  its own assemblies/teardowns sequentially by design).
+- `verifiedIdentities` (the in-memory set backing the
+  endpoint-verified-data guard above) is never pruned — a long-running
+  coordinator accumulates one entry per distinct identity ever verified,
+  for the life of the process, matching this project's already-accepted
+  posture for `ReputationTracker`'s own unbounded-growth history. Also,
+  since it's read from `registry.listActive()` (which prunes on a
+  30-second timeout) but that same 30-second window is what the guard's
+  own read happens inside, an identity that ages out in the last
+  `IDENTITY_TIMEOUT_MS` (5 seconds) of its life briefly loses this
+  specific protection — real, but narrow enough (the final 5 seconds of a
+  30-second window) that it wasn't judged worth a further fix.
 - `POST /v1/chat/completions` records demand but does not consult the warm
   pool — it still selects a single already-registered node, as it did before
   this phase.
