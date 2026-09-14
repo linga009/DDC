@@ -11,11 +11,15 @@ export interface NodeInfo {
   deviceTier: DeviceTier;
   localityGroup?: string;
   servesModel?: string;
-  // Self-reported, unverified -- exactly like deviceTier/localityGroup/
-  // servesModel above (this project's established posture: self-reported
-  // fields answer "who may talk to the service", never "is what they
-  // claim true"). Used only as a soft preference when picking a pipeline
-  // driver (coordinator/src/pipeline_selector.ts), never a hard gate.
+  // Self-reported, unverified -- like localityGroup above, but NOT like
+  // deviceTier/servesModel anymore: Endpoint Identity Hardening made those
+  // two endpoint-verified (server.ts's POST /nodes/register calls the
+  // endpoint's own POST /identity and stores what it reports), while
+  // localityGroup and this field were deliberately left caller-supplied
+  // (the design doc's own per-field table -- neither has an analogous
+  // "ask the endpoint" verification the way "what model do you serve"
+  // does). Used only as a soft preference when picking a pipeline driver
+  // (coordinator/src/pipeline_selector.ts), never a hard gate.
   availableMemoryMb?: number;
 }
 

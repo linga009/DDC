@@ -651,15 +651,29 @@ export class PipelinePoolManager {
       return true;
     } catch (err) {
       console.warn(`failed to assemble pipeline for model ${modelId} via launcher ${launcher.endpoint}:`, err);
-      this.pipelineTracker.removeEntry(modelId, reservationId);
       if (err instanceof DriverIdentityCollisionError) {
         // Fourth whole-branch review, Important finding, fixed here --
         // same reasoning as server.ts's assemblePipeline() catch block:
         // assertDriverIdentityFree() only throws after POST /pipeline
         // already returned success, so refusing the registration must not
         // orphan the real agent the launcher just spawned.
+        //
+        // Fifth whole-branch review, Important finding: the ordering here
+        // used to be removeEntry() FIRST, then await the teardown --
+        // freeing this launcherId before its old agent was confirmed
+        // stopped, exactly the harmful case stopLauncherPipeline()'s own
+        // comment names ("freeing a launcherId without calling this...").
+        // Stopped first, removed second, matching this class's own
+        // TearDown() method a few lines below. Kept awaited (unlike
+        // server.ts's request-path version, which detaches this same call
+        // to avoid stalling a live caller) since this background tick
+        // already awaits its assemblies/teardowns sequentially by design
+        // (see DEFAULT_INTERVAL_MS's own comment on that tradeoff) -- one
+        // more awaited call here changes nothing about that already-
+        // disclosed behavior.
         await stopLauncherPipeline(this.launcherRegistry, launcher.launcherId, launcher.endpoint);
       }
+      this.pipelineTracker.removeEntry(modelId, reservationId);
       return false;
     }
   }

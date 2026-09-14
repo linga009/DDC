@@ -57,6 +57,23 @@ function authFetch(url: string, options: RequestInit = {}, token: string = TEST_
   });
 }
 
+// Fifth whole-branch review: assemblePipeline()'s squat-cleanup teardown
+// is now deliberately DETACHED from the /generate response (see
+// server.ts's own comment on why -- awaiting it there used to stall an
+// already-failing caller by up to a minute), so a test can no longer
+// assert on its result immediately after awaiting that response. Polls a
+// real, observable side effect instead of a fixed sleep, so this stays
+// fast in the common case and only slow if something is actually wrong.
+async function waitUntil(check: () => boolean, timeoutMs = 2000, intervalMs = 10): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() > deadline) {
+      throw new Error(`condition did not become true within ${timeoutMs}ms`);
+    }
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  }
+}
+
 // Endpoint Identity Hardening: POST /nodes/register and POST
 // /launchers/register now verify a registration by calling the endpoint's
 // own POST /identity, so a caller-supplied endpoint must genuinely be
@@ -889,6 +906,62 @@ test("POST /nodes/register: a registration that times out mid-race must not over
     assert.equal(active.length, 1);
     assert.equal(active[0].servesModel, "tinyllama-1.1b", "the verified registration's servesModel must survive the other one timing out, never silently cleared");
     assert.equal(active[0].deviceTier, "desktop", "the timed-out registration's own unverified deviceTier claim must never land on the verified entry either");
+  } finally {
+    server.close();
+    stubServer.close();
+  }
+});
+
+test("POST /nodes/register: a registration that times out mid-race must not overwrite an endpoint-verified deviceTier either, even with no servesModel at stake", async () => {
+  // Fifth whole-branch review, Important finding: round 4's commit-time
+  // guard only re-checked `servesModel`, leaving `deviceTier` exposed to
+  // the identical bug -- the fallback branch unconditionally writes the
+  // CALLER's own claimed deviceTier, with nothing stopping it from
+  // silently overwriting a deviceTier an earlier registration already had
+  // genuinely endpoint-verified. This scenario deliberately has NO
+  // servesModel on either side -- round 4's narrower guard (which only
+  // fires when a servesModel is at stake) would have let this exact race
+  // through, which is why the fix had to widen to "any active entry
+  // blocks the fallback," not just "one with a servesModel."
+  let identityCallCount = 0;
+  const stubServer = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}") as Record<string, unknown>;
+    identityCallCount++;
+    if (identityCallCount === 1) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: body.nonce, deviceTier: "android" })); // no servesModel claimed or reported
+    }
+    // Second and later calls: deliberately never respond.
+  });
+  await new Promise<void>(resolve => stubServer.listen(0, "127.0.0.1", resolve));
+  const address = stubServer.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected stub to bind to a port");
+  }
+  const endpoint = `http://127.0.0.1:${address.port}`;
+  const { server, baseUrl, registry } = await startTestServer();
+  try {
+    const [resA, resB] = await Promise.all([
+      authFetch(`${baseUrl}/nodes/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ endpoint, deviceTier: "desktop" }),
+      }),
+      authFetch(`${baseUrl}/nodes/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ endpoint, deviceTier: "ios" }),
+      }),
+    ]);
+
+    const statuses = [resA.status, resB.status].sort();
+    assert.deepEqual(statuses, [200, 502], "exactly one of the two racing registrations may succeed -- the timed-out one must be refused, never silently absorbed");
+
+    const active = registry.listActive();
+    assert.equal(active.length, 1);
+    assert.equal(active[0].deviceTier, "android", "the endpoint-verified deviceTier must survive the other registration timing out, never silently overwritten by its own unverified claim");
   } finally {
     server.close();
     stubServer.close();
@@ -1767,8 +1840,13 @@ test("POST /generate refuses to let a launcher-spawned driver silently adopt a s
     // Fourth whole-branch review, Important finding: the real agent this
     // stub just spawned (as far as the coordinator is concerned -- POST
     // /pipeline returned success) must not be left orphaned, running
-    // forever with no registration anywhere.
-    assert.equal(stub.getDeleteCalls(), 1, "the orphaned agent must be torn down immediately when the driver's registration is refused, not left running");
+    // forever with no registration anywhere. Fifth whole-branch review:
+    // this teardown is now deliberately detached from the /generate
+    // response (see server.ts's own comment), so it may not have landed
+    // yet at this exact point -- poll for it instead of asserting
+    // immediately.
+    await waitUntil(() => stub.getDeleteCalls() === 1);
+    assert.equal(stub.getDeleteCalls(), 1, "the orphaned agent must be torn down after the driver's registration is refused, not left running");
   } finally {
     server.close();
     stub.server.close();

@@ -674,7 +674,6 @@ async function assemblePipeline(
     });
   } catch (err) {
     console.warn(`failed to assemble pipeline for model ${modelId} via launcher ${launcher.endpoint}:`, err);
-    pipelineTracker.removeEntry(modelId, reservationId);
     if (err instanceof DriverIdentityCollisionError) {
       // Fourth whole-branch review, Important finding, fixed here:
       // assertDriverIdentityFree() (see its own comment) only throws AFTER
@@ -690,7 +689,29 @@ async function assemblePipeline(
       // than doing nothing. Tearing it down here matches the success
       // path's own handling a few lines up (replacing a DIFFERENT
       // launcher's still-running agent already calls this same helper).
-      await stopLauncherPipeline(launcherRegistry, launcher.launcherId, launcher.endpoint);
+      //
+      // Fifth whole-branch review, Important finding, fixed here too:
+      // this used to `await` the teardown directly on the request path --
+      // live-measured to stall the CALLER's already-failing /generate
+      // request by however long the launcher's DELETE /pipeline takes (up
+      // to PIPELINE_ASSEMBLY_TIMEOUT_MS, the same bound as the POST that
+      // spawned it), for a cleanup operation that has nothing to do with
+      // this caller. Detached instead: the reservation entry is kept in
+      // the tracker (not removed) for exactly as long as the real teardown
+      // takes, so claimedLauncherIds() keeps correctly treating this
+      // launcher as busy in the meantime -- stopLauncherPipeline()'s own
+      // comment states the rule this now follows: never free a launcherId
+      // while its old agent might still be running. removeEntry() only
+      // runs once the teardown has actually settled (stopLauncherPipeline
+      // swallows its own fetch errors, so this can't reject), not before
+      // it as the previous ordering did -- reversing which order the two
+      // calls happened in was itself an inconsistency review found: a
+      // second, concurrent assembly attempt could see this launcher freed
+      // (removeEntry already ran) before the real DELETE had landed.
+      void stopLauncherPipeline(launcherRegistry, launcher.launcherId, launcher.endpoint)
+        .finally(() => pipelineTracker.removeEntry(modelId, reservationId));
+    } else {
+      pipelineTracker.removeEntry(modelId, reservationId);
     }
     if (tracked) {
       pipelineTracker.markEntryFailed(modelId, tracked.pipelineId);
@@ -921,11 +942,31 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         // decision this handler already made may reach registry.register()
         // without being re-confirmed against the CURRENT registry state at
         // the exact point of commitment.
+        // Fifth whole-branch review, Important finding, fixed here: the
+        // check above only re-read `servesModel`, leaving `deviceTier`
+        // exposed to the identical bug -- the fallback branch a few lines
+        // up unconditionally writes `candidate.deviceTier` (the CALLER's
+        // own unverified claim), with nothing stopping it from silently
+        // overwriting a deviceTier an earlier registration already had
+        // ENDPOINT-verified. Live-reproduced: kill an endpoint after its
+        // real, verified deviceTier ("android") is on record, then have
+        // any token-holder re-register the same endpoint with no
+        // servesModel claim -- the fallback fires, and the entry's real
+        // "android" silently became the new caller's own guessed "ios",
+        // contradicting this project's own README claim that
+        // endpoint-verified fields "cannot be stripped" this way. Rather
+        // than re-deriving a second, narrower per-field guard (the same
+        // "patch the instance, not the mechanism" mistake this file has
+        // now made three times), this refuses the fallback outright
+        // whenever ANY active entry already exists for this identity, not
+        // only one with a servesModel -- the fallback's caller-supplied
+        // claim is only ever safe to trust for a genuinely first-ever
+        // registration, when there is nothing yet to protect.
         if (usedUnreachableFallback) {
-          const servesModelAtCommit = registry.listActive().find(n => n.nodeId === identityNodeId)?.servesModel;
-          if (servesModelAtCommit !== undefined) {
+          const activeAtCommit = registry.listActive().find(n => n.nodeId === identityNodeId);
+          if (activeAtCommit !== undefined) {
             sendJson(res, 502, {
-              error: `${normalizedNodeEndpoint} could not be reached to verify this registration, and this identity already has a verified servesModel (${JSON.stringify(servesModelAtCommit)}) at stake -- registration refused rather than silently overwriting it`,
+              error: `${normalizedNodeEndpoint} could not be reached to verify this registration, and this identity is already registered (deviceTier ${JSON.stringify(activeAtCommit.deviceTier)}${activeAtCommit.servesModel !== undefined ? `, servesModel ${JSON.stringify(activeAtCommit.servesModel)}` : ""}) -- registration refused rather than silently overwriting it with an unverified claim`,
             });
             return;
           }
