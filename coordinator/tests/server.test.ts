@@ -526,6 +526,42 @@ test("POST /nodes/register registers a node with no servesModel claim when the e
   }
 });
 
+test("POST /nodes/register: re-registering the SAME still-unreachable compute-contributor endpoint, sequentially, stays idempotent", async () => {
+  // Sixth whole-branch review, Important finding: round 5's commit-time
+  // guard ("refuse the fallback whenever ANY active entry already exists")
+  // over-corrected and broke this ordinary, no-race-involved case --
+  // live-reproduced as a 502 on the second, purely sequential call, for an
+  // endpoint that never did anything wrong. This predates the whole
+  // Endpoint Identity Hardening phase: Security Phase 3 established that
+  // re-registering the identical endpoint string is always a safe,
+  // idempotent refresh, and this exact scenario is what
+  // verifiedIdentities exists to keep working -- an identity may freely
+  // re-confirm its OWN prior UNVERIFIED fallback claim; only overwriting
+  // someone else's ENDPOINT-VERIFIED data is refused.
+  const { server, baseUrl, registry } = await startTestServer();
+  try {
+    const first = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:1", deviceTier: "desktop" }),
+    });
+    assert.equal(first.status, 200);
+
+    const second = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: "http://127.0.0.1:1", deviceTier: "desktop" }),
+    });
+    assert.equal(second.status, 200, "re-registering the same still-unreachable endpoint must stay idempotent, not be refused as though it were a collision");
+
+    const active = registry.listActive();
+    assert.equal(active.length, 1);
+    assert.equal(active[0].deviceTier, "desktop");
+  } finally {
+    server.close();
+  }
+});
+
 // Second whole-branch review, Critical finding, fixed here: this
 // branch's own prior fix (the compute-contributor exemption above)
 // SKIPPED verification whenever the caller's request omitted servesModel,
@@ -1850,6 +1886,104 @@ test("POST /generate refuses to let a launcher-spawned driver silently adopt a s
   } finally {
     server.close();
     stub.server.close();
+  }
+});
+
+test("POST /generate makes a genuinely fresh assembly attempt after a squat, without waiting for the failed attempt's detached teardown to settle", async () => {
+  // Sixth whole-branch review, Important finding: round 5's detached
+  // teardown (see the assertDriverIdentityFree catch block's own comment)
+  // left the failed reservation's state stuck at "assembling" for exactly
+  // as long as the detached stopLauncherPipeline() call took --
+  // assemblePipeline()'s own dedup gate treats ANY "assembling" entry as
+  // "a real assembly is already in flight, don't race it", so a SECOND,
+  // unrelated /generate call for this model got an instant 503 with ZERO
+  // launcher attempts, live-verified by the review (0 POSTs to any
+  // launcher on the second call). Fixed by marking the reservation
+  // "failed" immediately, synchronously, before detaching the teardown --
+  // "failed" doesn't match the "assembling" gate, so a fresh attempt is
+  // no longer blocked outright.
+  //
+  // This test proves that narrower, provable claim -- a second call,
+  // issued WHILE the first attempt's teardown DELETE is still genuinely
+  // in flight (not just "immediately after", which a fast localhost
+  // round-trip could race past even without the fix -- confirmed by
+  // mutation-testing an earlier version of this test that didn't force
+  // the window open and passed regardless), genuinely attempts assembly
+  // again (a real second POST /pipeline), not that it necessarily reaches
+  // a DIFFERENT launcher: assemblePipeline()'s own pool[0]-as-`tracked`
+  // mechanism (see claimedLauncherIds()'s own comment) deliberately
+  // excludes the just-failed entry's launcher from the claimed tally, on
+  // the assumption a failure might be transient and worth retrying the
+  // same launcher for -- a reasonable assumption for a driver that merely
+  // died, but not for one whose failure is a persistent identity
+  // collision that will recur identically every time. That's a separate,
+  // narrower, pre-existing preference this fix doesn't change (disclosed
+  // in README/CLAUDE.md, not engineered around here) -- what this fix
+  // guarantees is that SOME attempt happens, not zero.
+  let pipelineCalls = 0;
+  let releaseDelete: () => void;
+  const deleteGate = new Promise<void>(resolve => { releaseDelete = resolve; });
+  let markDeleteGateReached: () => void;
+  const deleteGateReached = new Promise<void>(resolve => { markDeleteGateReached = resolve; });
+  const launcherStub = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    if (req.method === "DELETE") {
+      markDeleteGateReached();
+      await deleteGate; // held open until the test explicitly releases it
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
+    pipelineCalls++;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "ready" }));
+  });
+  await new Promise<void>(resolve => launcherStub.listen(0, "127.0.0.1", resolve));
+  const address = launcherStub.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected launcher stub to bind to a port");
+  }
+  const launcherEndpoint = `http://127.0.0.1:${address.port}`;
+  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
+  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(bigCatalog);
+  try {
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+
+    // Squat the launcher's driver identity FIRST, under an alias colliding
+    // with what launcherDriverEndpoint() will compute for it.
+    const squatterEndpoint = `http://localhost:${address.port}`;
+    registry.register(squatterEndpoint, await canonicalizeEndpoint(squatterEndpoint), "desktop", undefined, "squatted-model");
+
+    launcherRegistry.register(launcherEndpoint, await canonicalizeEndpoint(launcherEndpoint), ["big-model"], address.port);
+
+    const res1 = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+    assert.equal(res1.status, 503);
+    assert.equal(pipelineCalls, 1, "the first attempt genuinely tries the launcher and fails at registration, after spawning");
+
+    // The failed attempt's detached teardown DELETE is now genuinely
+    // in-flight and stalled on our gate -- exactly the window the review
+    // found blocked every subsequent /generate call outright.
+    await deleteGateReached;
+
+    const res2 = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi again", modelId: "big-model" }),
+    });
+    assert.equal(res2.status, 503, "still fails -- the squat persists -- but that must come from a genuine second attempt, not a phantom reservation blocking it outright");
+    assert.equal(pipelineCalls, 2, "a real second POST /pipeline call must have been made even while the first attempt's teardown DELETE is still pending -- before this fix, the stale 'assembling' reservation blocked this call from attempting ANY launcher at all");
+
+    releaseDelete();
+  } finally {
+    server.close();
+    launcherStub.close();
   }
 });
 

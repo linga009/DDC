@@ -696,18 +696,36 @@ async function assemblePipeline(
       // request by however long the launcher's DELETE /pipeline takes (up
       // to PIPELINE_ASSEMBLY_TIMEOUT_MS, the same bound as the POST that
       // spawned it), for a cleanup operation that has nothing to do with
-      // this caller. Detached instead: the reservation entry is kept in
-      // the tracker (not removed) for exactly as long as the real teardown
-      // takes, so claimedLauncherIds() keeps correctly treating this
-      // launcher as busy in the meantime -- stopLauncherPipeline()'s own
-      // comment states the rule this now follows: never free a launcherId
-      // while its old agent might still be running. removeEntry() only
-      // runs once the teardown has actually settled (stopLauncherPipeline
-      // swallows its own fetch errors, so this can't reject), not before
-      // it as the previous ordering did -- reversing which order the two
-      // calls happened in was itself an inconsistency review found: a
-      // second, concurrent assembly attempt could see this launcher freed
-      // (removeEntry already ran) before the real DELETE had landed.
+      // this caller. Detached instead -- stopLauncherPipeline() swallows
+      // its own fetch errors, so this can't reject.
+      //
+      // Sixth whole-branch review, Important finding, fixed here too:
+      // detaching the teardown alone left the reservation's `state`
+      // stuck at "assembling" for as long as the detached call took,
+      // because removeEntry() ran only in its `.finally()`. This function's
+      // OWN gate a few lines up (`pool.some(entry => entry.state ===
+      // "assembling")`) treats any such entry as "a real assembly is
+      // already in flight, don't race it" -- correct for the background
+      // pool manager's genuine in-flight reservations, but wrong for one
+      // that has already definitively failed. Live-reproduced: after one
+      // squatted collision, every /generate for that model -- including
+      // ones with no relation to the original request -- got an instant
+      // 503 without even attempting a second, idle, non-squatted
+      // launcher, for as long as the teardown took. Marking the
+      // reservation `"failed"` immediately, synchronously, before
+      // detaching anything, fixes this at the mechanism: the
+      // "assembling" gate no longer matches it, so a fresh attempt can
+      // proceed against a different launcher right away, while
+      // claimedLauncherIds() (which tallies every pool entry regardless
+      // of state) still correctly treats the launcher as busy until the
+      // entry is actually removed -- preserving the exact "never free a
+      // launcherId while its old agent might still be running" invariant
+      // the detach was written to uphold. If this detached call is ever
+      // somehow lost (it shouldn't be -- stopLauncherPipeline never
+      // hangs, its own fetch is timeout-bounded), the background loop's
+      // own reaping of "failed" entries (pipeline_pool_manager.ts) is an
+      // existing backstop that removes it on the next tick regardless.
+      pipelineTracker.markEntryFailed(modelId, reservationId);
       void stopLauncherPipeline(launcherRegistry, launcher.launcherId, launcher.endpoint)
         .finally(() => pipelineTracker.removeEntry(modelId, reservationId));
     } else {
@@ -724,6 +742,33 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
   // flight for that model, if any. Lives here rather than module scope so
   // two servers in one process (the test suite runs many) never share it.
   const coldStartsInFlight = new Map<string, Promise<void>>();
+  // Sixth whole-branch review, Important finding, fixed here: round 5's
+  // commit-time guard for the RPC compute-contributor fallback (see
+  // "activeAtCommit" below) refused the fallback whenever ANY active entry
+  // already existed for the identity -- closing the deviceTier/servesModel
+  // TOCTOU, but also breaking a case that predates this whole phase and is
+  // documented as safe: sequentially re-registering the SAME still-unreachable
+  // endpoint (the ordinary swarm-rpc-server pattern) now got a 502 on the
+  // second call, with no race involved at all, because an active entry from
+  // the FIRST call already existed. The two cases need different answers and
+  // the registry alone can't distinguish them -- NodeInfo has no notion of
+  // "was this data verified" -- so this set tracks it here, scoped to what
+  // THIS route's own verification step established, by canonical identity
+  // (stableNodeId) rather than by nodeId's derived string, since the two are
+  // interchangeable here (register() derives nodeId deterministically from
+  // the same identityKey every caller already computes). A fallback is only
+  // ever refused when it would overwrite an identity this set says is
+  // currently VERIFIED; refreshing an identity's own prior UNVERIFIED
+  // fallback claim, or writing a genuinely first-ever registration, stays
+  // exactly as permissive as before this phase. Deliberately not threaded
+  // through NodeRegistry itself -- "was this write endpoint-verified" is a
+  // fact about this one route's verification step, not a property every
+  // caller of the general-purpose registry needs to reason about (the
+  // launcher-spawned internal driver registrations in assemblePipeline()/
+  // tryAssemble() have their own, separate, already-verified-by-construction
+  // trust basis and don't consult this set at all -- see the comment above
+  // verifyNodeIdentity() for why that path needs no callback of its own).
+  const verifiedIdentities = new Set<string>();
   return createHttpServer(async (req, res) => {
     try {
       const method = req.method ?? "GET";
@@ -954,24 +999,40 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         // servesModel claim -- the fallback fires, and the entry's real
         // "android" silently became the new caller's own guessed "ios",
         // contradicting this project's own README claim that
-        // endpoint-verified fields "cannot be stripped" this way. Rather
-        // than re-deriving a second, narrower per-field guard (the same
-        // "patch the instance, not the mechanism" mistake this file has
-        // now made three times), this refuses the fallback outright
-        // whenever ANY active entry already exists for this identity, not
-        // only one with a servesModel -- the fallback's caller-supplied
-        // claim is only ever safe to trust for a genuinely first-ever
-        // registration, when there is nothing yet to protect.
+        // endpoint-verified fields "cannot be stripped" this way.
+        //
+        // Sixth whole-branch review, Important finding, fixed here too:
+        // round 5's own fix for the above ("refuse whenever ANY active
+        // entry already exists") over-corrected -- it also refused the
+        // exact scenario Security Phase 3 established as safe and this
+        // phase's own README still documents as unchanged: sequentially
+        // re-registering the SAME still-unreachable endpoint (the ordinary
+        // swarm-rpc-server pattern), with no race at all. Live-reproduced:
+        // register a genuinely unreachable compute contributor once (200),
+        // then register the exact same endpoint again, sequentially,
+        // moments later -- 502, "already registered", for doing nothing
+        // wrong. The two cases need different answers and NodeInfo alone
+        // can't distinguish them (it has no notion of "was this verified"),
+        // which is what `verifiedIdentities` above exists to track: refuse
+        // the fallback only when it would overwrite an identity that set
+        // says is currently VERIFIED -- an identity refreshing its own
+        // prior UNVERIFIED fallback claim, or a genuinely first-ever
+        // registration, stays exactly as permissive as it always was.
         if (usedUnreachableFallback) {
           const activeAtCommit = registry.listActive().find(n => n.nodeId === identityNodeId);
-          if (activeAtCommit !== undefined) {
+          if (activeAtCommit !== undefined && verifiedIdentities.has(identityNodeId)) {
             sendJson(res, 502, {
-              error: `${normalizedNodeEndpoint} could not be reached to verify this registration, and this identity is already registered (deviceTier ${JSON.stringify(activeAtCommit.deviceTier)}${activeAtCommit.servesModel !== undefined ? `, servesModel ${JSON.stringify(activeAtCommit.servesModel)}` : ""}) -- registration refused rather than silently overwriting it with an unverified claim`,
+              error: `${normalizedNodeEndpoint} could not be reached to verify this registration, and this identity already has endpoint-verified data (deviceTier ${JSON.stringify(activeAtCommit.deviceTier)}${activeAtCommit.servesModel !== undefined ? `, servesModel ${JSON.stringify(activeAtCommit.servesModel)}` : ""}) at stake -- registration refused rather than silently overwriting it with an unverified claim`,
             });
             return;
           }
         }
         const nodeId = registry.register(normalizedNodeEndpoint, identityKey, resolvedDeviceTier, localityGroup, resolvedServesModel, availableMemoryMb);
+        if (usedUnreachableFallback) {
+          verifiedIdentities.delete(identityNodeId);
+        } else {
+          verifiedIdentities.add(identityNodeId);
+        }
         sendJson(res, 200, { nodeId });
         return;
       }

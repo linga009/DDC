@@ -519,7 +519,17 @@ Endpoints:
   registration that genuinely cannot be reached (connection failure, not a
   real HTTP server answering an error) and claims no `servesModel` is still
   accepted on the caller's bare claim, exactly as before this phase, so
-  Phase B/C's compute-contributor registration path is unaffected. Before
+  Phase B/C's compute-contributor registration path is unaffected —
+  including re-registering the exact same still-unreachable endpoint
+  sequentially (no race involved), which stays idempotent, matching
+  Security Phase 3's own long-established contract for re-registering an
+  identical endpoint string. What's actually refused is narrower and only
+  matters under real concurrency: a registration landing in this same
+  bare-claim fallback may NOT overwrite an identity whose currently-stored
+  `deviceTier`/`servesModel` came from a genuine `/identity` verification —
+  see "Known gaming vectors" below for the live-reproduced race this
+  closes and the two-round history of getting that distinction right
+  without breaking the ordinary case above. Before
   storing anything, the endpoint is also **canonicalized** to a
   `resolvedHost:port` identity key — `127.0.0.1`, `::1`, `0.0.0.0`, and
   `localhost` (plus IPv4-mapped-IPv6 spellings of `127.0.0.1`) all collapse
@@ -849,12 +859,27 @@ default catalog declares one.
   The residual once a squat IS detected: the launcher was already told to
   spawn a real agent (`POST /pipeline` succeeded) before the squat is
   discovered, so refusing the registration now correctly tears that agent
-  down (`DELETE /pipeline`) rather than leaking it — but the model stays
-  unavailable, and the *next* reconciliation tick (10 seconds, in
-  production) tries again: spawn, health-check, discover the same squat,
-  tear down, repeat, indefinitely, for as long as the squat persists. This
-  is real, repeated compute/memory churn on the affected launcher (a fresh
-  multi-GB model load every tick), not a one-time cost — and there is
+  down (`DELETE /pipeline`, detached from the caller's own `/generate`
+  response so a squat never stalls an unrelated request waiting on it —
+  round 5 fixed an earlier version of this that did) rather than leaking
+  it — but the model stays unavailable, and the *next* attempt (either the
+  background reconciliation tick, 10 seconds in production, or the very
+  next `/generate` call, which is deliberately NOT blocked from retrying
+  immediately — round 6 fixed an earlier version of this fix that left a
+  stale reservation blocking every subsequent `/generate` call outright,
+  even for launchers that were never squatted) tries again: spawn,
+  health-check, discover the same squat, tear down, repeat, for as long as
+  the squat persists. That retry deliberately prefers the SAME
+  just-failed launcher over trying a different, idle one first (the
+  existing "maybe the driver merely died and this launcher recovered"
+  heuristic Phase C already applies to any tracked failure — reasonable
+  for a transient death, but a squatted identity is a persistent property
+  of that launcher's own driver endpoint and will fail identically every
+  time), so an idle, non-squatted launcher can sit untried while the
+  squatted one keeps getting retried — a real availability nuisance, not
+  fixed here, on a mechanism that ships dormant in production. This is
+  real, repeated compute/memory churn on the affected launcher (a fresh
+  multi-GB model load every retry), not a one-time cost — and there is
   deliberately no backoff added for it, matching this phase's existing
   disclose-rather-than-engineer-around posture for a mechanism that ships
   dormant in production.

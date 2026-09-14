@@ -51,6 +51,19 @@ const TIMEOUT_MS = 15000;
 // deadline, and reclaimed on the spot regardless of how long THIS caller
 // has been waiting, rather than waiting out the full deadline just to
 // throw the same diagnostic anyway.
+//
+// Sixth whole-branch review, Minor finding, disclosed rather than
+// engineered around here (test-infrastructure only, no production code
+// touches this file): this reclaim has no fencing token, so a genuine
+// holder that somehow ran past STALE_MS (not plausible today -- every
+// hold in this file's own tests completes in well under a second) could
+// have its lock stolen by a reclaimer and then, on release, delete
+// whatever the new holder had since created. A crash landing in the
+// narrow window between mkdirSync and the marker write below also leaves
+// a lock with no marker, which reads as "indeterminate" (never stale),
+// not reclaimable until deleted by hand. Both are real but narrow; worth
+// a real fencing token (a unique id written and re-checked before
+// deleting) if this pattern is ever reused for anything higher-stakes.
 const STALE_MS = 60000;
 
 function lockAgeMs(): number | undefined {
