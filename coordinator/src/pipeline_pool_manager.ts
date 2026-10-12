@@ -7,7 +7,6 @@ import type { LauncherInfo, LauncherRegistry } from "./launcher_registry.ts";
 import type { PooledPipeline, PipelineTracker } from "./pipeline_tracker.ts";
 import type { DemandTracker } from "./demand_tracker.ts";
 import { selectPipeline } from "./pipeline_selector.ts";
-import { canonicalizeEndpoint } from "./endpoint_identity.ts";
 
 // Deliberately naive per the design doc's own explicit instruction not to
 // over-engineer a scaling function without real load data: one pipeline
@@ -215,9 +214,56 @@ export function isLauncherClaimed(claimed: Set<string>, launcher: LauncherInfo):
 // this project's own history (see CLAUDE.md's Phase C section) has three
 // times let drift out of step between the background loop and the request
 // path. One function that both sides call can't diverge.
+//
+// Eighth whole-branch review, Minor finding, fixed here: the result is now
+// normalized through URL the same way POST /nodes/register normalizes an
+// endpoint (`href` minus a trailing slash), so a default port (agentPort 80
+// on http, 443 on https) is dropped from BOTH spellings. Built as a bare
+// template string it kept ":80", and assertDriverIdentityFree()'s string
+// comparison then saw "http://h:80" vs the route's "http://h" as two
+// different endpoints -- a spurious collision between two spellings of one.
 export function launcherDriverEndpoint(launcher: LauncherInfo): string {
   const launcherUrl = new URL(launcher.endpoint);
-  return `${launcherUrl.protocol}//${launcherUrl.hostname}:${launcher.agentPort}`;
+  return new URL(`${launcherUrl.protocol}//${launcherUrl.hostname}:${launcher.agentPort}`).href.replace(/\/$/, "");
+}
+
+// The CANONICAL identity key of the driver this launcher would spawn,
+// derived SYNCHRONOUSLY from the launcher's own already-canonical
+// identityKey ("host:port", see endpoint_identity.ts) by swapping its port
+// for the fixed agentPort -- equal to
+// `await canonicalizeEndpoint(launcherDriverEndpoint(launcher))` (the
+// launcher's host is the driver's host; only the port differs), without the
+// await.
+//
+// Eighth whole-branch review, Critical finding, fixed here: both assembly
+// paths used to `await canonicalizeEndpoint(driverEndpoint)` between
+// choosing a launcher (claimedLauncherIds) and reserving it (addEntry). For
+// a launcher registered under a DNS name that await is a real lookup (up to
+// 3s), and the cold-start dedup Map is keyed per MODEL, so a concurrent
+// cold start for a different model could choose the same launcher inside
+// that window -- live-reproduced 3/3: two models, one launcher registered
+// by hostname, two concurrent /generate calls, BOTH answered 200 with model
+// B's weights. Phase C's headline bug, reintroduced by this phase's own
+// canonicalization (on master the identity was computed synchronously
+// here). Deriving the key from launcher.identityKey makes the claim-to-
+// reserve window await-free again. DO NOT reintroduce an await between
+// `claimedLauncherIds(...)` and `addEntry(...)` in either assembly path:
+// "nothing may commit to a launcher without re-confirming it is still
+// free" is the rule Phase C's third review round established.
+export function launcherDriverIdentityKey(launcher: LauncherInfo): string {
+  const key = launcher.identityKey;
+  return `${key.slice(0, key.lastIndexOf(":"))}:${launcher.agentPort}`;
+}
+
+// True when two pool entries / launchers are the same physical launcher,
+// under either identity (launcherId rotates on re-registration of a lapsed
+// launcher; the canonical identity key survives it).
+export function sameLauncher(
+  a: { launcherId: string; launcherIdentityKey?: string },
+  b: { launcherId: string; launcherIdentityKey?: string },
+): boolean {
+  return a.launcherId === b.launcherId ||
+    (a.launcherIdentityKey !== undefined && a.launcherIdentityKey === b.launcherIdentityKey);
 }
 
 // Thrown by assertDriverIdentityFree() below -- caught by each caller's
@@ -253,11 +299,43 @@ export class DriverIdentityCollisionError extends Error {}
 // fix, for the same reason: no concurrent registration can land inside a
 // gap that doesn't exist.
 export function assertDriverIdentityFree(registry: NodeRegistry, driverIdentityKey: string, driverEndpoint: string): void {
-  const pinnedEndpoint = registry.listActive().find(n => n.nodeId === stableNodeId(driverIdentityKey))?.endpoint;
-  if (pinnedEndpoint !== undefined && pinnedEndpoint !== driverEndpoint) {
+  const pinnedEndpoint = findDriverIdentityConflict(registry, driverIdentityKey, driverEndpoint);
+  if (pinnedEndpoint !== undefined) {
     throw new DriverIdentityCollisionError(
       `driver identity ${driverIdentityKey} is already registered under a different endpoint (${pinnedEndpoint}) -- refusing to let this pipeline assembly silently inherit it`);
   }
+}
+
+// The one place that decides "is this driver identity squatted": the
+// endpoint an ACTIVE registry entry for this identity is pinned to, when it
+// differs from the endpoint the driver would register under; undefined when
+// the identity is free (no entry, or the entry already IS this driver's own
+// endpoint). Shared by the commit-time assertion above and the preflight
+// below so the two can never disagree about what a squat is.
+function findDriverIdentityConflict(registry: NodeRegistry, driverIdentityKey: string, driverEndpoint: string): string | undefined {
+  const pinnedEndpoint = registry.listActive().find(n => n.nodeId === stableNodeId(driverIdentityKey))?.endpoint;
+  return pinnedEndpoint !== undefined && pinnedEndpoint !== driverEndpoint ? pinnedEndpoint : undefined;
+}
+
+// PREFLIGHT, synchronous: would spawning on this launcher end in a
+// DriverIdentityCollisionError? Both assembly paths skip a launcher for
+// which this is true BEFORE calling POST /pipeline.
+//
+// Eighth whole-branch review, Important finding, fixed here: the squat was
+// previously discovered only AFTER the launcher had spawned a real,
+// multi-GB agent, and a failed attempt left the squatted launcher first in
+// registration order -- so every retry (request path AND the background
+// loop's planAllocations, which walks launchers in registration order and
+// drops the model for the tick on the first failure) picked it again.
+// Live-reproduced over 8 calls: one squat, kept alive with heartbeats, took
+// the model fully down at one model load + kill per request, while a
+// second, idle, perfectly healthy launcher registered for the same model
+// was never once tried. README had claimed otherwise. Skipping a squatted
+// launcher up front fixes both halves: no wasted spawn, and the next
+// launcher gets its turn. The commit-time assertDriverIdentityFree() stays
+// as the safety net for a squat that lands DURING a spawn.
+export function isDriverIdentitySquatted(registry: NodeRegistry, launcher: LauncherInfo): boolean {
+  return findDriverIdentityConflict(registry, launcherDriverIdentityKey(launcher), launcherDriverEndpoint(launcher)) !== undefined;
 }
 
 // Background reconciliation loop: keeps each multi-node model's pool of
@@ -432,6 +510,19 @@ export class PipelinePoolManager {
           // pipeline that is still being built.
           continue;
         }
+        // Eighth whole-branch review: an entry that shares its launcher with
+        // an in-flight "assembling" reservation is the stale occupant that
+        // reservation's POST /pipeline is replacing IN PLACE (the request
+        // path deliberately lets a model's replacement reuse the launcher
+        // of the entry it replaces). Reaping it now sends DELETE /pipeline
+        // to a launcher that is mid-spawn -- and the real launcher is
+        // single-threaded, so that DELETE queues behind the POST and then
+        // kills the agent the POST just built. Leave it for the assembly's
+        // own success path to remove (or, if the assembly fails, for the
+        // next tick to reap).
+        if (this.pipelineTracker.getPool(modelId).some(other => other.state === "assembling" && sameLauncher(other, entry))) {
+          continue;
+        }
         const allNodesActive = [entry.driverNodeId, ...entry.computeNodeIds].every(id => activeNodeIds.has(id));
         if (!allNodesActive) {
           // A heartbeat timeout or a reputation ejection anywhere in the
@@ -500,7 +591,20 @@ export class PipelinePoolManager {
     // Nothing is excluded: every entry standing at this point is live.
     const claims = planAllocations(
       snapshots,
-      modelId => this.launcherRegistry.listForModel(modelId),
+      // Squatted launchers are filtered out of the plan up front (eighth
+      // whole-branch review): planAllocations() walks launchers in
+      // registration order and this loop drops a model for the rest of the
+      // tick on its first failed assembly, so a squatted launcher
+      // registered first used to be re-picked, spawned on, failed and torn
+      // down every tick while a healthy launcher behind it was never
+      // reached. See isDriverIdentitySquatted().
+      modelId => this.launcherRegistry.listForModel(modelId).filter(launcher => {
+        if (isDriverIdentitySquatted(this.registry, launcher)) {
+          console.warn(`skipping launcher ${launcher.endpoint} for model ${modelId}: the driver identity it would spawn is already registered under a different endpoint`);
+          return false;
+        }
+        return true;
+      }),
       claimedLauncherIds(this.catalog, this.pipelineTracker),
     );
 
@@ -553,11 +657,13 @@ export class PipelinePoolManager {
     //
     // Computed once here and reused below at actual registration time
     // (rather than recomputed) -- both the preflight check and the real
-    // registration MUST agree on this driver's identity, and canonicalizing
-    // it twice would also mean two DNS lookups per assembly attempt for no
-    // benefit.
+    // registration MUST agree on this driver's identity. Derived
+    // synchronously from the launcher's own canonical identityKey (see
+    // launcherDriverIdentityKey()), not via canonicalizeEndpoint(): that is
+    // a real DNS lookup for a hostname-registered launcher, and an await
+    // here sat between choosing the launcher and reserving it.
     const driverEndpoint = launcherDriverEndpoint(launcher);
-    const driverIdentityKey = await canonicalizeEndpoint(driverEndpoint);
+    const driverIdentityKey = launcherDriverIdentityKey(launcher);
     const prospectiveDriverId = stableNodeId(driverIdentityKey);
     if (!this.reputation.isTrusted(prospectiveDriverId)) {
       console.warn(`skipping launcher ${launcher.endpoint} for model ${modelId}: the driver it would spawn is reputation-ejected`);
@@ -589,7 +695,14 @@ export class PipelinePoolManager {
     // This is the rule the two reservations above only half-express:
     // nothing may commit to a launcher without confirming it is STILL free
     // at commit time. assemblePipeline() in server.ts needs no equivalent
-    // because it picks and reserves with no await in between.
+    // because it picks and reserves with no await in between -- which is
+    // only TRUE while nothing in that window awaits. It stopped being true
+    // for a stretch of this branch (eighth whole-branch review): an
+    // `await canonicalizeEndpoint(driverEndpoint)` sat between its
+    // claimedLauncherIds() read and its addEntry(), a real DNS lookup for a
+    // hostname-registered launcher, reintroducing Phase C's "model A served
+    // model B's weights with a 200". launcherDriverIdentityKey() is
+    // synchronous precisely so both paths can keep honouring this.
     if (isLauncherClaimed(claimedLauncherIds(this.catalog, this.pipelineTracker), launcher)) {
       return false; // the plan went stale; the next tick re-derives it
     }

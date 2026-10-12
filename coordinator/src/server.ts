@@ -10,7 +10,7 @@ import { LauncherRegistry } from "./launcher_registry.ts";
 import { PipelineTracker } from "./pipeline_tracker.ts";
 import { selectPipeline } from "./pipeline_selector.ts";
 import { DemandTracker } from "./demand_tracker.ts";
-import { assertDriverIdentityFree, claimedLauncherIds, DriverIdentityCollisionError, isLauncherClaimed, launcherDriverEndpoint, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
+import { assertDriverIdentityFree, claimedLauncherIds, DriverIdentityCollisionError, isDriverIdentitySquatted, isLauncherClaimed, launcherDriverEndpoint, launcherDriverIdentityKey, sameLauncher, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
 import { canonicalizeEndpoint } from "./endpoint_identity.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
@@ -562,7 +562,22 @@ async function assemblePipeline(
   }
 
   const claimed = claimedLauncherIds(catalog, pipelineTracker, tracked);
-  const launcher = launcherRegistry.listForModel(modelId).find(l => !isLauncherClaimed(claimed, l));
+  // Eighth whole-branch review, Important finding: a launcher whose driver
+  // identity is already squatted is skipped HERE, before any spawn, rather
+  // than discovered after one (see isDriverIdentitySquatted()). Without
+  // this, the squatted launcher stayed first in registration order and was
+  // re-picked, spawned on and torn down by every single /generate, while a
+  // healthy second launcher for the same model was never tried.
+  const launcher = launcherRegistry.listForModel(modelId).find(l => {
+    if (isLauncherClaimed(claimed, l)) {
+      return false;
+    }
+    if (isDriverIdentitySquatted(registry, l)) {
+      console.warn(`skipping launcher ${l.endpoint} for model ${modelId}: the driver identity it would spawn is already registered under a different endpoint`);
+      return false;
+    }
+    return true;
+  });
   if (!launcher) {
     return;
   }
@@ -591,10 +606,18 @@ async function assemblePipeline(
   // the background loop this guard was first added to.
   //
   // Computed once and reused below at actual registration time -- both
-  // MUST agree on this driver's identity, and canonicalizing twice would
-  // also mean two DNS lookups per assembly attempt for no benefit.
+  // MUST agree on this driver's identity. Derived SYNCHRONOUSLY from the
+  // launcher's own canonical identityKey, never via an `await
+  // canonicalizeEndpoint(...)` (eighth whole-branch review, Critical
+  // finding): this runs between the claimedLauncherIds() read above and the
+  // addEntry() reservation below, and for a hostname-registered launcher
+  // that await was a real DNS lookup during which a concurrent cold start
+  // for a DIFFERENT model (the dedup Map is per-model) could choose the same
+  // launcher -- live-reproduced 3/3 as model A's request answered with model
+  // B's weights and a 200. Nothing between the claim read and the
+  // reservation may await.
   const driverEndpoint = launcherDriverEndpoint(launcher);
-  const driverIdentityKey = await canonicalizeEndpoint(driverEndpoint);
+  const driverIdentityKey = launcherDriverIdentityKey(launcher);
   const prospectiveDriverId = stableNodeId(driverIdentityKey);
   if (!reputation.isTrusted(prospectiveDriverId)) {
     console.warn(`skipping launcher ${launcher.endpoint} for model ${modelId}: the driver it would spawn is reputation-ejected`);
@@ -666,40 +689,41 @@ async function assemblePipeline(
     assertDriverIdentityFree(registry, driverIdentityKey, driverEndpoint);
     const driverNodeId = registry.register(driverEndpoint, driverIdentityKey, "desktop", undefined, modelId);
     // Replace whatever was tracked before with the freshly-assembled
-    // pipeline rather than appending alongside a stale one. When the
-    // replacement landed on a DIFFERENT launcher, the old one's agent must
-    // actually be stopped: dropping the entry alone frees the launcherId
-    // for reallocation while its agent keeps running, holding the agent
-    // port and the model's weights until some unrelated model happens to
-    // claim it. (Same launcher needs no call -- POST /pipeline already
-    // replaced that agent in place.)
+    // pipeline rather than appending alongside a stale one.
     //
-    // Seventh whole-branch review: a "failed" `tracked` entry is left
-    // alone here entirely, not just exempted from the teardown call.
-    // Its launcher is ALREADY being torn down by whatever marked it
-    // failed (this function's own DriverIdentityCollisionError catch
-    // branch, or one of /generate's other forward-failure sites), and
-    // that same code already owns removing it -- either directly once its
-    // own teardown settles, or via the background pool manager's routine
-    // reaping of any "failed" entry on its next tick regardless of cause.
-    // Live-verified this mattered, not just for tidiness: reaching this
-    // point after a genuinely successful assembly on a SECOND, healthy
-    // launcher, with a "failed" `tracked` entry still sitting on the
-    // FIRST, squatted one, used to redundantly re-await that first
-    // launcher's own already-in-flight teardown here, synchronously,
-    // for the full PIPELINE_ASSEMBLY_TIMEOUT_MS -- stalling THIS
-    // unrelated, otherwise-successful request for up to a minute despite
-    // nothing about its own success depending on that other teardown
-    // finishing. Removing the entry early here (before its own teardown
-    // has actually confirmed the agent stopped) would also reopen the
-    // exact "never free a launcherId while its old agent might still be
-    // running" race round 5 closed elsewhere -- leaving it alone avoids
-    // that too, not just the stall.
-    if (tracked && tracked.state !== "failed") {
-      if (tracked.launcherId !== launcher.launcherId) {
+    // SAME launcher (by launcherId OR canonical identity key -- launcherId
+    // rotates when a lapsed registration re-registers): POST /pipeline has
+    // already replaced that launcher's agent in place, so `tracked`
+    // describes an agent that no longer exists. It is removed whatever its
+    // state. Eighth whole-branch review, Critical finding: round 7 made
+    // this branch leave a "failed" `tracked` alone, which for the SAME
+    // launcher is exactly wrong -- the stale entry stayed in the pool, the
+    // background reaper then did its routine job for a failed entry (DELETE
+    // /pipeline on its launcher) and killed the freshly re-assembled agent
+    // the NEW warm entry points at. Live-reproduced: after any single
+    // forward failure, every other request failed from then on, each
+    // recovery a full model load, under steady traffic indefinitely.
+    //
+    // DIFFERENT launcher: the old one's agent must actually be stopped
+    // (dropping the entry alone frees the launcherId for reallocation while
+    // its agent keeps running, holding the agent port and the model's
+    // weights until some unrelated model happens to claim it) -- unless
+    // `tracked` is already "failed", in which case its launcher is ALREADY
+    // being torn down by whatever marked it failed (this function's own
+    // DriverIdentityCollisionError catch branch, or one of /generate's
+    // forward-failure sites) and that code, or the background pool
+    // manager's routine reaping of any "failed" entry, owns removing it.
+    // Re-awaiting that teardown here used to stall this otherwise-
+    // successful request for up to PIPELINE_ASSEMBLY_TIMEOUT_MS, and
+    // removing the entry early would free its launcherId before the agent
+    // is confirmed stopped.
+    if (tracked) {
+      if (sameLauncher(tracked, { launcherId: launcher.launcherId, launcherIdentityKey: launcher.identityKey })) {
+        pipelineTracker.removeEntry(modelId, tracked.pipelineId);
+      } else if (tracked.state !== "failed") {
         await stopLauncherPipeline(launcherRegistry, tracked.launcherId, tracked.launcherEndpoint);
+        pipelineTracker.removeEntry(modelId, tracked.pipelineId);
       }
-      pipelineTracker.removeEntry(modelId, tracked.pipelineId);
     }
     // Swap the reservation for the real entry: same launcher, so the claim
     // is continuous and never briefly drops.

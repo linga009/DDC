@@ -2,12 +2,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer as createHttpServer } from "node:http";
 import net from "node:net";
+import os from "node:os";
+import { promises as dns } from "node:dns";
 import { createServer, selectNode } from "../src/server.ts";
 import { NodeRegistry, stableNodeId, type NodeInfo } from "../src/registry.ts";
 import { ModelCatalog, type CatalogEntry } from "../src/catalog.ts";
 import { PeerRegistry } from "../src/peer_registry.ts";
 import { LauncherRegistry } from "../src/launcher_registry.ts";
 import { PipelineTracker } from "../src/pipeline_tracker.ts";
+import { PipelinePoolManager } from "../src/pipeline_pool_manager.ts";
 import { DemandTracker } from "../src/demand_tracker.ts";
 import { KeywordSafetyClassifier, type SafetyClassifier } from "../src/safety_classifier.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
@@ -1861,43 +1864,70 @@ test("POST /generate assembles a fresh pipeline via a registered launcher when n
   }
 });
 
-test("POST /generate refuses to let a launcher-spawned driver silently adopt a squatter's pinned endpoint", async () => {
-  // Third whole-branch review, Critical finding -- the request-path
-  // (cold-start) counterpart of pipeline_pool_manager.test.ts's own
-  // regression test for the background loop; see that test's comment for
-  // the full reasoning. Live-verified via this exact route: the
-  // coordinator told an honest launcher to spawn a real agent, then
-  // registered the driver under an identity a squatter had already pinned
-  // under a colliding alias -- and registry.register()'s own
-  // endpoint-pinning kept the SQUATTER's endpoint on the entry, so a real
-  // user's prompt for big-model went to the attacker with a 200. Not
-  // possible on `master` (raw endpoint-string identity meant no collision
-  // could exist here at all) -- canonicalization creates the collision;
-  // the old pinning converted it into a hijack.
-  let capturedLauncherRequest: Record<string, unknown> | undefined;
-  const stub = await startStubNodeAgent((body) => {
-    const candidate = body as Record<string, unknown>;
-    if (candidate.model !== undefined) {
-      capturedLauncherRequest = candidate;
-      return { status: 200, body: { status: "ready" } };
+// Minimal swarm-launcher stand-in for the launcher-squat tests below.
+// `onPipeline` runs inside POST /pipeline -- i.e. AFTER the coordinator's
+// synchronous squat preflight has already approved this launcher and while
+// the "spawn" is in flight -- which is the only moment a squat can still
+// reach the commit-time assertDriverIdentityFree() guard now that squatted
+// launchers are skipped up front (eighth whole-branch review). `deleteGate`
+// holds every DELETE /pipeline open until the test releases it, to keep a
+// teardown genuinely in flight.
+async function startSquatTestLauncher(opts: { onPipeline?: () => void; deleteGate?: Promise<void> } = {}) {
+  const calls = { post: 0, del: 0 };
+  const server = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    if (req.method === "DELETE") {
+      calls.del++;
+      if (opts.deleteGate) {
+        await opts.deleteGate;
+      }
+      res.writeHead(204);
+      res.end();
+      return;
     }
-    return { status: 200, body: { text: "ATTACKER-CONTROLLED-OR-DRIVER" } };
+    calls.post++;
+    opts.onPipeline?.();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "ready" }));
   });
-  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
-  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(bigCatalog);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected squat-test launcher stub to bind to a port");
+  }
+  return { server, endpoint: `http://127.0.0.1:${address.port}`, port: address.port, calls };
+}
+
+// A squatter registration colliding with the driver identity of a launcher
+// on `port`: `localhost` and `127.0.0.1` canonicalize to the same identity,
+// but are different endpoint strings -- the exact shape the collision
+// guards exist for.
+async function squatterFor(port: number) {
+  const endpoint = `http://localhost:${port}`;
+  return { endpoint, key: await canonicalizeEndpoint(endpoint) };
+}
+
+const SQUAT_CATALOG = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
+
+test("POST /generate refuses to let a launcher-spawned driver silently adopt a squatter that lands during the spawn", async () => {
+  // Third whole-branch review, Critical finding: registry.register()'s own
+  // endpoint-pinning kept a squatter's endpoint on the driver's entry, so a
+  // real user's prompt went to the attacker with a 200 even though the
+  // launcher really did spawn an honest agent. Eighth whole-branch review:
+  // a squat that exists BEFORE the attempt is now skipped by the synchronous
+  // preflight (see the next test), so this commit-time guard is exercised by
+  // the only case that still reaches it -- a squat that lands while
+  // POST /pipeline is in flight, planted here from inside the launcher stub.
+  let plant: (() => void) | undefined;
+  const launcher = await startSquatTestLauncher({ onPipeline: () => plant?.() });
+  const squatter = await squatterFor(launcher.port);
+  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(SQUAT_CATALOG);
   try {
     registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
-
-    const launcherPort = Number(new URL(stub.endpoint).port);
-    // Squat the driver's identity FIRST, under an alias colliding with what
-    // launcherDriverEndpoint() will compute for this launcher
-    // (127.0.0.1:launcherPort, since this stub's own port doubles as its
-    // registered agentPort, same convention the test above uses).
-    const squatterEndpoint = `http://localhost:${launcherPort}`;
-    registry.register(squatterEndpoint, await canonicalizeEndpoint(squatterEndpoint), "desktop", undefined, "squatted-model");
-
-    launcherRegistry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), ["big-model"], launcherPort);
+    launcherRegistry.register(launcher.endpoint, await canonicalizeEndpoint(launcher.endpoint), ["big-model"], launcher.port);
+    plant = () => registry.register(squatter.endpoint, squatter.key, "desktop", undefined, "squatted-model");
 
     const res = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
@@ -1905,173 +1935,153 @@ test("POST /generate refuses to let a launcher-spawned driver silently adopt a s
       body: JSON.stringify({ prompt: "secret user prompt", modelId: "big-model" }),
     });
 
-    // The launcher WAS called -- a real agent really did spawn -- but the
-    // squat must make this request fail rather than silently route to the
-    // squatter's endpoint.
-    assert.equal(capturedLauncherRequest?.model, "big-model");
+    assert.equal(launcher.calls.post, 1, "the squat landed mid-spawn, so the launcher was genuinely asked to spawn");
     assert.equal(res.status, 503, "no pipeline may be usable when the driver's identity was squatted, and the squatter never claims big-model itself");
 
     const active = registry.listActive();
     assert.equal(active.length, 3, "no new entry may have been registered under the squatter's identity");
-    const squatted = active.find(n => n.endpoint === squatterEndpoint);
+    const squatted = active.find(n => n.endpoint === squatter.endpoint);
     assert.ok(squatted, "the squatter's entry must still exist, completely untouched");
-    assert.equal(squatted?.servesModel, "squatted-model", "the squatter's entry must NOT have acquired the driver's servesModel -- this is the exact hijack the fix closes");
+    assert.equal(squatted?.servesModel, "squatted-model", "the squatter's entry must NOT have acquired the driver's servesModel -- this is the exact hijack the guard closes");
 
-    // Fourth whole-branch review, Important finding: the real agent this
-    // stub just spawned (as far as the coordinator is concerned -- POST
-    // /pipeline returned success) must not be left orphaned, running
-    // forever with no registration anywhere. Fifth whole-branch review:
-    // this teardown is now deliberately detached from the /generate
-    // response (see server.ts's own comment), so it may not have landed
-    // yet at this exact point -- poll for it instead of asserting
-    // immediately.
-    await waitUntil(() => stub.getDeleteCalls() === 1);
-    assert.equal(stub.getDeleteCalls(), 1, "the orphaned agent must be torn down after the driver's registration is refused, not left running");
+    // The just-spawned agent must not be left orphaned (fourth review). The
+    // teardown is detached from the response (fifth review), so poll.
+    await waitUntil(() => launcher.calls.del === 1);
   } finally {
     server.close();
-    stub.server.close();
+    launcher.server.close();
   }
 });
 
-test("POST /generate makes a genuinely fresh assembly attempt after a squat, without waiting for the failed attempt's detached teardown to settle", async () => {
-  // Sixth whole-branch review, Important finding: round 5's detached
-  // teardown (see the assertDriverIdentityFree catch block's own comment)
-  // left the failed reservation's state stuck at "assembling" for exactly
-  // as long as the detached stopLauncherPipeline() call took --
-  // assemblePipeline()'s own dedup gate treats ANY "assembling" entry as
-  // "a real assembly is already in flight, don't race it", so a SECOND,
-  // unrelated /generate call for this model got an instant 503 with ZERO
-  // launcher attempts, live-verified by the review (0 POSTs to any
-  // launcher on the second call). Fixed by marking the reservation
-  // "failed" immediately, synchronously, before detaching the teardown --
-  // "failed" doesn't match the "assembling" gate, so a fresh attempt is
-  // no longer blocked outright.
-  //
-  // This test proves that narrower, provable claim -- a second call,
-  // issued WHILE the first attempt's teardown DELETE is still genuinely
-  // in flight (not just "immediately after", which a fast localhost
-  // round-trip could race past even without the fix -- confirmed by
-  // mutation-testing an earlier version of this test that didn't force
-  // the window open and passed regardless), genuinely attempts assembly
-  // again (a real second POST /pipeline), not that it necessarily reaches
-  // a DIFFERENT launcher: assemblePipeline()'s own pool[0]-as-`tracked`
-  // mechanism (see claimedLauncherIds()'s own comment) deliberately
-  // excludes the just-failed entry's launcher from the claimed tally, on
-  // the assumption a failure might be transient and worth retrying the
-  // same launcher for -- a reasonable assumption for a driver that merely
-  // died, but not for one whose failure is a persistent identity
-  // collision that will recur identically every time. That's a separate,
-  // narrower, pre-existing preference this fix doesn't change (disclosed
-  // in README/CLAUDE.md, not engineered around here) -- what this fix
-  // guarantees is that SOME attempt happens, not zero.
-  let pipelineCalls = 0;
-  let releaseDelete: () => void;
-  const deleteGate = new Promise<void>(resolve => { releaseDelete = resolve; });
-  let markDeleteGateReached: () => void;
-  const deleteGateReached = new Promise<void>(resolve => { markDeleteGateReached = resolve; });
-  const launcherStub = createHttpServer(async (req, res) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    if (req.method === "DELETE") {
-      markDeleteGateReached();
-      await deleteGate; // held open until the test explicitly releases it
-      res.writeHead(204);
-      res.end();
-      return;
+test("POST /generate skips a launcher whose driver identity is already squatted, before spawning on it, and uses a healthy one", async () => {
+  // Eighth whole-branch review, Important finding: the squat used to be
+  // discovered only AFTER the launcher had spawned a real, multi-GB agent,
+  // and the squatted launcher stayed first in registration order -- so every
+  // retry picked it again. Live-reproduced over 8 calls: the model stayed
+  // 100% down at one model load + kill per request while a second, idle,
+  // healthy launcher registered for it was never once tried (README had
+  // claimed the opposite).
+  const squattedLauncher = await startSquatTestLauncher();
+  let healthyPipelineCalls = 0;
+  const healthyLauncher = await startStubNodeAgent((body) => {
+    const candidate = body as Record<string, unknown>;
+    if (candidate.model !== undefined) {
+      healthyPipelineCalls++;
+      return { status: 200, body: { status: "ready" } };
     }
-    JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
-    pipelineCalls++;
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ status: "ready" }));
+    return { status: 200, body: { text: "from the healthy launcher's driver" } };
   });
-  await new Promise<void>(resolve => launcherStub.listen(0, "127.0.0.1", resolve));
-  const address = launcherStub.address();
-  if (address === null || typeof address === "string") {
-    throw new Error("expected launcher stub to bind to a port");
-  }
-  const launcherEndpoint = `http://127.0.0.1:${address.port}`;
-  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
-  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(bigCatalog);
+  const squatter = await squatterFor(squattedLauncher.port);
+  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(SQUAT_CATALOG);
   try {
     registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+    registry.register(squatter.endpoint, squatter.key, "desktop", undefined, "squatted-model");
+    // Registration order matters: the squatted launcher is first, which is
+    // what starved the healthy one.
+    launcherRegistry.register(squattedLauncher.endpoint, await canonicalizeEndpoint(squattedLauncher.endpoint), ["big-model"], squattedLauncher.port);
+    launcherRegistry.register(healthyLauncher.endpoint, await canonicalizeEndpoint(healthyLauncher.endpoint), ["big-model"], Number(new URL(healthyLauncher.endpoint).port));
 
-    // Squat the launcher's driver identity FIRST, under an alias colliding
-    // with what launcherDriverEndpoint() will compute for it.
-    const squatterEndpoint = `http://localhost:${address.port}`;
-    registry.register(squatterEndpoint, await canonicalizeEndpoint(squatterEndpoint), "desktop", undefined, "squatted-model");
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+    assert.equal(res.status, 200, "the healthy launcher must be reached even though the squatted one is registered first");
+    assert.deepEqual(await res.json(), { text: "from the healthy launcher's driver" });
+    assert.equal(healthyPipelineCalls, 1);
+    assert.equal(squattedLauncher.calls.post, 0, "no spawn may be wasted on a launcher already known to be squatted");
+    assert.equal(squattedLauncher.calls.del, 0);
+  } finally {
+    server.close();
+    squattedLauncher.server.close();
+    healthyLauncher.server.close();
+  }
+});
 
-    launcherRegistry.register(launcherEndpoint, await canonicalizeEndpoint(launcherEndpoint), ["big-model"], address.port);
+test("POST /generate makes a genuinely fresh attempt, on a healthy launcher, while a failed attempt's teardown is still in flight", async () => {
+  // Sixth whole-branch review, Important finding: round 5's detached
+  // teardown left the failed reservation's state stuck at "assembling" for
+  // as long as the detached DELETE took, and assemblePipeline()'s own gate
+  // treats ANY "assembling" entry as "an assembly is already in flight" --
+  // so a second /generate got an instant 503 without trying any launcher.
+  // Fixed by marking the reservation "failed" synchronously before
+  // detaching the teardown. Eighth review: now that a squatted launcher is
+  // skipped by the preflight, the right thing for the second call to do is
+  // reach the healthy launcher -- which a stale "assembling" reservation
+  // would still block, so this fails if markEntryFailed is removed.
+  let releaseDelete: () => void;
+  const deleteGate = new Promise<void>(resolve => { releaseDelete = resolve; });
+  let plant: (() => void) | undefined;
+  const squattedLauncher = await startSquatTestLauncher({ onPipeline: () => plant?.(), deleteGate });
+  let healthyPipelineCalls = 0;
+  const healthyLauncher = await startStubNodeAgent((body) => {
+    const candidate = body as Record<string, unknown>;
+    if (candidate.model !== undefined) {
+      healthyPipelineCalls++;
+      return { status: 200, body: { status: "ready" } };
+    }
+    return { status: 200, body: { text: "from the healthy launcher" } };
+  });
+  const squatter = await squatterFor(squattedLauncher.port);
+  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(SQUAT_CATALOG);
+  try {
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+    launcherRegistry.register(squattedLauncher.endpoint, await canonicalizeEndpoint(squattedLauncher.endpoint), ["big-model"], squattedLauncher.port);
+    launcherRegistry.register(healthyLauncher.endpoint, await canonicalizeEndpoint(healthyLauncher.endpoint), ["big-model"], Number(new URL(healthyLauncher.endpoint).port));
+    plant = () => registry.register(squatter.endpoint, squatter.key, "desktop", undefined, "squatted-model");
 
     const res1 = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
     });
-    assert.equal(res1.status, 503);
-    assert.equal(pipelineCalls, 1, "the first attempt genuinely tries the launcher and fails at registration, after spawning");
+    assert.equal(res1.status, 503, "the first attempt picks the first launcher and the squat lands mid-spawn");
+    assert.equal(squattedLauncher.calls.post, 1);
 
-    // The failed attempt's detached teardown DELETE is now genuinely
-    // in-flight and stalled on our gate -- exactly the window the review
-    // found blocked every subsequent /generate call outright.
-    await deleteGateReached;
+    // The failed attempt's detached teardown is now genuinely in flight and
+    // stalled on our gate -- the window the review found blocking every
+    // subsequent /generate outright.
+    await waitUntil(() => squattedLauncher.calls.del === 1);
 
     const res2 = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "hi again", modelId: "big-model" }),
     });
-    assert.equal(res2.status, 503, "still fails -- the squat persists -- but that must come from a genuine second attempt, not a phantom reservation blocking it outright");
-    assert.equal(pipelineCalls, 2, "a real second POST /pipeline call must have been made even while the first attempt's teardown DELETE is still pending -- before this fix, the stale 'assembling' reservation blocked this call from attempting ANY launcher at all");
+    assert.equal(res2.status, 200, "a fresh attempt must reach the healthy launcher even while the failed attempt's teardown is pending");
+    assert.deepEqual(await res2.json(), { text: "from the healthy launcher" });
+    assert.equal(healthyPipelineCalls, 1);
 
-    releaseDelete();
+    releaseDelete!();
   } finally {
     server.close();
-    launcherStub.close();
+    squattedLauncher.server.close();
+    healthyLauncher.server.close();
   }
 });
 
 test("POST /generate is not permanently blocked by accumulated 'failed' reservations counting against maxPipelines", async () => {
-  // Seventh whole-branch review, Important finding: round 6's fix left the
-  // "assembling" gate closed but the maxPipelines CEILING check
-  // (`pool.length - (tracked ? 1 : 0) >= catalog.maxPipelines(modelId)`)
-  // still counted every pool entry, "failed" ones included -- and only
-  // pool[0] is ever excluded from that count. With the default
-  // maxPipelines of 1, TWO pending "failed" reservations (each one's own
-  // detached teardown not yet settled) already meet the ceiling, so this
-  // function returned before even looking at a launcher again --
-  // live-verified by the review: from the THIRD /generate call on, every
-  // one got an instant 503 with ZERO further launcher attempts, including
-  // against a second, completely healthy, idle launcher that was never
-  // even considered. Fixed by counting only non-"failed" pool entries
-  // toward the ceiling. This test keeps TWO failed reservations pending
-  // (both DELETEs gated open) and proves a third attempt still reaches a
-  // second, healthy, non-squatted launcher instead of being blocked by
-  // the ceiling check.
-  let squattedPipelineCalls = 0;
-  let releaseDelete: () => void;
-  const deleteGate = new Promise<void>(resolve => { releaseDelete = resolve; });
-  const squattedLauncherStub = createHttpServer(async (req, res) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    if (req.method === "DELETE") {
-      await deleteGate; // held open for the whole test -- never released
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-    JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
-    squattedPipelineCalls++;
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ status: "ready" }));
-  });
-  await new Promise<void>(resolve => squattedLauncherStub.listen(0, "127.0.0.1", resolve));
-  const squattedAddress = squattedLauncherStub.address();
-  if (squattedAddress === null || typeof squattedAddress === "string") {
-    throw new Error("expected squatted launcher stub to bind to a port");
-  }
-  const squattedEndpoint = `http://127.0.0.1:${squattedAddress.port}`;
-
+  // Seventh whole-branch review, Important finding: the maxPipelines ceiling
+  // check counted every pool entry, "failed" ones pending teardown included,
+  // and only pool[0] is ever excluded. With the default maxPipelines of 1,
+  // TWO pending failed reservations already met it, so from the third
+  // /generate call on every request returned before looking at a launcher
+  // -- live-verified with zero attempts against an idle healthy launcher.
+  // Fixed by counting only non-"failed" entries toward the ceiling.
+  //
+  // Eighth review: squatted launchers are now skipped up front, so two
+  // failed reservations accumulate on two DIFFERENT launchers that each get
+  // squatted mid-spawn (DELETEs held open for the whole test), and the third
+  // call must still reach the third, healthy launcher. This also covers the
+  // success path leaving a "failed" `tracked` on another launcher alone:
+  // re-awaiting that launcher's gated DELETE there stalls this test for the
+  // full 60s PIPELINE_ASSEMBLY_TIMEOUT_MS.
+  const deleteGate = new Promise<void>(() => { /* never released: teardowns stay in flight */ });
+  const plants: Array<() => void> = [];
+  const launcherA = await startSquatTestLauncher({ onPipeline: () => plants[0]?.(), deleteGate });
+  const launcherB = await startSquatTestLauncher({ onPipeline: () => plants[1]?.(), deleteGate });
   let cleanPipelineCalls = 0;
   const cleanLauncher = await startStubNodeAgent((body) => {
     const candidate = body as Record<string, unknown>;
@@ -2081,17 +2091,16 @@ test("POST /generate is not permanently blocked by accumulated 'failed' reservat
     }
     return { status: 200, body: { text: "from the clean launcher" } };
   });
-
-  const bigCatalog = [{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }];
-  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(bigCatalog);
+  const squatterA = await squatterFor(launcherA.port);
+  const squatterB = await squatterFor(launcherB.port);
+  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(SQUAT_CATALOG);
   try {
     registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
-
-    const squatterEndpoint = `http://localhost:${squattedAddress.port}`;
-    registry.register(squatterEndpoint, await canonicalizeEndpoint(squatterEndpoint), "desktop", undefined, "squatted-model");
-
-    launcherRegistry.register(squattedEndpoint, await canonicalizeEndpoint(squattedEndpoint), ["big-model"], squattedAddress.port);
+    plants[0] = () => registry.register(squatterA.endpoint, squatterA.key, "desktop", undefined, "squatted-model");
+    plants[1] = () => registry.register(squatterB.endpoint, squatterB.key, "desktop", undefined, "squatted-model");
+    launcherRegistry.register(launcherA.endpoint, await canonicalizeEndpoint(launcherA.endpoint), ["big-model"], launcherA.port);
+    launcherRegistry.register(launcherB.endpoint, await canonicalizeEndpoint(launcherB.endpoint), ["big-model"], launcherB.port);
     launcherRegistry.register(cleanLauncher.endpoint, await canonicalizeEndpoint(cleanLauncher.endpoint), ["big-model"], Number(new URL(cleanLauncher.endpoint).port));
 
     for (let i = 0; i < 2; i++) {
@@ -2102,25 +2111,208 @@ test("POST /generate is not permanently blocked by accumulated 'failed' reservat
       });
       assert.equal(res.status, 503);
     }
-    // Two "failed" reservations for the squatted launcher are now pending
-    // in the pool, both DELETEs held open -- exactly the accumulated state
-    // the review found blocking the ceiling check.
-    assert.ok(squattedPipelineCalls >= 1, "the squatted launcher was genuinely attempted");
+    assert.equal(launcherA.calls.post, 1);
+    assert.equal(launcherB.calls.post, 1, "the second attempt must have skipped the now-squatted A and tried B");
 
     const res3 = await authFetch(`${baseUrl}/generate`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt: "attempt 2", modelId: "big-model" }),
     });
-    assert.equal(res3.status, 200, "a fresh attempt must not be blocked by accumulated 'failed' reservations counting against maxPipelines -- it must reach the healthy launcher");
+    assert.equal(res3.status, 200, "a fresh attempt must not be blocked by accumulated 'failed' reservations counting against maxPipelines");
     assert.deepEqual(await res3.json(), { text: "from the clean launcher" });
     assert.equal(cleanPipelineCalls, 1);
-
-    releaseDelete();
   } finally {
     server.close();
-    squattedLauncherStub.close();
+    launcherA.server.close();
+    launcherB.server.close();
     cleanLauncher.server.close();
+  }
+});
+
+test("POST /generate: re-assembly onto the SAME launcher after a forward failure is not killed by the background reaper", async () => {
+  // Eighth whole-branch review, Critical finding (a regression from round
+  // 7's own change): the success path left a "failed" `tracked` entry alone
+  // even when the new assembly landed on the SAME launcher. POST /pipeline
+  // had already replaced that agent in place, so the entry was stale -- and
+  // the background reaper then did its routine job for a failed entry
+  // (DELETE /pipeline on its launcher) and killed the freshly re-assembled
+  // agent. Live-reproduced: after any single forward failure, every other
+  // request failed from then on, each recovery a full model load, under
+  // steady traffic indefinitely.
+  const events: string[] = [];
+  let agentAlive = false;
+  let failNextComplete = false;
+  const agent = createHttpServer(async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    if (!agentAlive || failNextComplete) {
+      failNextComplete = false;
+      res.writeHead(500);
+      res.end("dead");
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ text: "hello from agent" }));
+  });
+  await new Promise<void>(resolve => agent.listen(0, "127.0.0.1", resolve));
+  const agentPort = (agent.address() as { port: number }).port;
+  const launcher = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}") as Record<string, unknown>;
+    if (req.url === "/identity") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: body.nonce, agentPort }));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/pipeline") {
+      agentAlive = true;
+      events.push("POST");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "ready" }));
+      return;
+    }
+    if (req.method === "DELETE") {
+      agentAlive = false;
+      events.push("DELETE");
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>(resolve => launcher.listen(0, "127.0.0.1", resolve));
+  const launcherPort = (launcher.address() as { port: number }).port;
+  const { server, baseUrl, launcherRegistry, registry, reputation, pipelineTracker, demandTracker } = await startTestServer(SQUAT_CATALOG);
+  const manager = new PipelinePoolManager(new ModelCatalog(SQUAT_CATALOG), registry, reputation, launcherRegistry, pipelineTracker, demandTracker);
+  const generate = () => authFetch(`${baseUrl}/generate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+  });
+  try {
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+    const reg = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${launcherPort}`, servesModels: ["big-model"], agentPort }),
+    });
+    assert.equal(reg.status, 200);
+
+    assert.equal((await generate()).status, 200, "cold start");
+    failNextComplete = true;
+    assert.equal((await generate()).status, 502, "a transient forward failure marks the warm entry failed");
+    assert.equal((await generate()).status, 200, "re-assembly on the same launcher");
+
+    const pool = pipelineTracker.getPool("big-model");
+    assert.equal(pool.length, 1, "the stale failed entry must be gone once the same launcher's agent was replaced in place");
+    assert.equal(pool[0].state, "warm");
+
+    await manager.runOnce();
+    assert.deepEqual(events, ["POST", "POST"], "the reaper must not DELETE a launcher whose agent was just re-assembled");
+    assert.equal((await generate()).status, 200, "the re-assembled agent is still alive after the reconciliation tick");
+    await manager.runOnce();
+    assert.equal((await generate()).status, 200);
+    assert.deepEqual(events, ["POST", "POST"]);
+  } finally {
+    server.close();
+    launcher.close();
+    agent.close();
+  }
+});
+
+test("POST /generate: concurrent cold starts for two models never both claim one hostname-registered launcher", async (t) => {
+  // Eighth whole-branch review, Critical finding: assemblePipeline() awaited
+  // canonicalizeEndpoint(driverEndpoint) between choosing a launcher and
+  // reserving it. For a launcher registered under a DNS name that await is a
+  // real lookup, and the cold-start dedup Map is keyed per MODEL, so a
+  // concurrent cold start for a different model chose the same launcher in
+  // that window: live-reproduced 3/3, both /generate calls answered 200 with
+  // model B's weights -- Phase C's headline bug. A literal-IP or `localhost`
+  // launcher never hits the lookup, which is why this uses the machine's own
+  // hostname. Skips itself where that name does not resolve.
+  const hostname = os.hostname().toLowerCase();
+  try {
+    await dns.lookup(hostname);
+  } catch {
+    t.skip(`this machine's hostname (${hostname}) does not resolve, so a DNS-registered launcher cannot be simulated`);
+    return;
+  }
+  let loadedModel: string | null = null;
+  const spawns: string[] = [];
+  const agent = createHttpServer(async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ text: `generated by weights of ${loadedModel}` }));
+  });
+  const launcher = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}") as Record<string, unknown>;
+    if (req.url === "/identity") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nonce: body.nonce, agentPort: (agent.address() as { port: number }).port }));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/pipeline") {
+      await new Promise(resolve => setTimeout(resolve, 50)); // a (tiny) model load
+      loadedModel = String(body.model);
+      spawns.push(loadedModel);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "ready" }));
+      return;
+    }
+    res.writeHead(req.method === "DELETE" ? 204 : 404);
+    res.end();
+  });
+  try {
+    // Dual-stack so the hostname works whichever address family it resolves to.
+    await new Promise<void>((resolve, reject) => { agent.once("error", reject); agent.listen(0, "::", resolve); });
+    await new Promise<void>((resolve, reject) => { launcher.once("error", reject); launcher.listen(0, "::", resolve); });
+  } catch {
+    t.skip("cannot bind a dual-stack listener here");
+    agent.close();
+    launcher.close();
+    return;
+  }
+  const agentPort = (agent.address() as { port: number }).port;
+  const launcherPort = (launcher.address() as { port: number }).port;
+  const twoModels = [
+    { id: "model-a", displayName: "A", minActiveNodes: 0, requiredNodeCount: 2 },
+    { id: "model-b", displayName: "B", minActiveNodes: 0, requiredNodeCount: 2 },
+  ];
+  const { server, baseUrl, registry, pipelineTracker } = await startTestServer(twoModels);
+  try {
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+    const reg = await authFetch(`${baseUrl}/launchers/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: `http://${hostname}:${launcherPort}`, servesModels: ["model-a", "model-b"], agentPort }),
+    });
+    assert.equal(reg.status, 200);
+
+    const results = await Promise.all(["model-a", "model-b"].map(async modelId => {
+      const res = await authFetch(`${baseUrl}/generate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompt: "hi", modelId }),
+      });
+      return { modelId, status: res.status, body: res.status === 200 ? await res.json() : undefined };
+    }));
+
+    assert.deepEqual(results.map(r => r.status).sort(), [200, 503], "one launcher can back exactly one model: exactly one of the two concurrent cold starts may succeed");
+    assert.equal(spawns.length, 1, "the launcher must be asked to spawn exactly once");
+    const winner = results.find(r => r.status === 200)!;
+    assert.deepEqual(winner.body, { text: `generated by weights of ${winner.modelId}` }, "the successful request must be served by ITS OWN model's weights, never another model's");
+    const warmPools = ["model-a", "model-b"].filter(m => pipelineTracker.getPool(m).some(e => e.state === "warm"));
+    assert.deepEqual(warmPools, [winner.modelId], "only the winning model may hold a warm entry on the launcher");
+  } finally {
+    server.close();
+    launcher.close();
+    agent.close();
   }
 });
 

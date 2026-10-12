@@ -844,69 +844,70 @@ default catalog declares one.
   and a squatter can still register an identity *first*, before the real
   launcher ever tries — proof-of-endpoint-possession, needed to close that,
   remains out of scope (see below).
-- **A squatted DRIVER identity (not the launcher's own) costs a model its
-  availability for as long as the squat persists, with real, repeated
-  resource cost, not just a one-time failure.** Canonicalization also
-  creates a NEW identity collision this phase's own internal
-  driver-registration path (a launcher-spawned agent registering itself,
-  not an operator calling the HTTP route) has to defend against — it calls
-  `registry.register()` directly, bypassing every route-level check, so it
-  guards itself with its own pre-commit check instead
-  (`assertDriverIdentityFree()`), refusing the registration rather than
-  silently inheriting a squatter's pinned endpoint the way an early version
-  of this fix did (live-verified during whole-branch review: a real
-  user's prompt handed to the squatter with a `200`, closed before merge).
-  The residual once a squat IS detected: the launcher was already told to
-  spawn a real agent (`POST /pipeline` succeeded) before the squat is
-  discovered, so refusing the registration now correctly tears that agent
-  down (`DELETE /pipeline`, detached from the caller's own `/generate`
-  response so a squat never stalls an unrelated request waiting on it —
-  round 5 fixed an earlier version of this that did) rather than leaking
-  it — but the model stays unavailable, and the *next* attempt (either the
-  background reconciliation tick, 10 seconds in production, or the very
-  next `/generate` call — see below for why that call genuinely retries
-  rather than bouncing off stale bookkeeping) tries again: spawn,
-  health-check, discover the same squat, tear down, repeat, for as long as
-  the squat persists. This is real, repeated compute/memory churn on the
-  affected launcher (a fresh multi-GB model load every retry), not a
-  one-time cost — and there is deliberately no backoff added for it,
-  matching this phase's existing disclose-rather-than-engineer-around
-  posture for a mechanism that ships dormant in production.
-  **Getting a fresh `/generate` call to actually retry, rather than
-  bouncing off stale bookkeeping from the previous failed attempt, took
-  three more review rounds to get right** — worth recording precisely,
-  since each of the first two fixes' own regression tests passed for the
-  wrong reason before a live, gated reproduction caught the gap: round 6
-  found a failed attempt's reservation stuck marking the whole model
-  `"assembling"` (an unrelated dedup gate meant for a real in-flight
-  attempt) for as long as its own teardown took, blocking every
-  subsequent call outright with **zero** launcher attempts; round 7 found
-  round 6's own fix hit a second wall two calls later — the assembly
-  ceiling (`maxPipelines`, default 1) counted PENDING, already-failed
-  reservations as if they were live pipelines, so from the third call on,
-  every one bounced off the ceiling before ever looking at a launcher
-  again, live-verified even with a second, completely idle, non-squatted
-  launcher registered and never touched — and, once that was fixed,
-  uncovered a THIRD, compounding stall in the success path's own
-  (pre-existing, Phase B) launcher-replacement logic, which redundantly
-  re-awaited the squatted launcher's already-in-flight teardown a second
-  time before returning an otherwise-already-successful response on a
-  completely different, healthy launcher. All three are now fixed
-  together. The retry does still prefer the SAME just-failed launcher for
-  its first one or two attempts (the existing "maybe the driver merely
-  died and this launcher recovered" heuristic Phase C already applies to
-  any tracked failure — reasonable for a transient death, not for a
-  squatted identity, which is a persistent property of that launcher's own
-  driver endpoint and will fail identically every time it's retried) — but
-  a registered, idle, non-squatted launcher is NOT permanently starved: it
-  gets tried once the squatted launcher's own accumulated failed
-  reservations stop qualifying it for that same-launcher preference.
-  Distinguishing a persistent squat from a transient death on the first
-  retry, rather than relying on this accumulation to eventually move on,
-  would need `PooledPipeline`'s state model to record *why* an entry
-  failed, not just that it did — judged out of proportion for this phase,
-  left as a disclosed, narrower residual than the "permanently blocked
-  outright" bugs the same review rounds also found and fixed.
+- **A squatted DRIVER identity (not the launcher's own) is skipped before any
+  spawn, but a squat that lands *during* a spawn still costs that one
+  attempt.** Canonicalization also creates a NEW identity collision this
+  phase's own internal driver-registration path (a launcher-spawned agent
+  registering itself, not an operator calling the HTTP route) has to defend
+  against — it calls `registry.register()` directly, bypassing every
+  route-level check. It is guarded twice. A **synchronous preflight**
+  (`isDriverIdentitySquatted()`, used by both `/generate`'s cold-start path
+  and the background planner) skips any launcher whose driver identity an
+  active entry already holds under a *different* endpoint, so a pre-existing
+  squat never causes a spawn at all and the next launcher registered for the
+  model gets its turn. A **commit-time check** (`assertDriverIdentityFree()`)
+  refuses the registration if a squat lands between the preflight and the
+  commit — rather than silently inheriting the squatter's pinned endpoint,
+  which an early version of this fix did (live-verified during whole-branch
+  review: a real user's prompt handed to the squatter with a `200`). That
+  race is the only way a squat still costs anything: the launcher was already
+  told to spawn a real agent (`POST /pipeline` succeeded), so the refusal
+  tears it down (`DELETE /pipeline`, detached from the caller's own
+  `/generate` response so it never stalls an unrelated request), marks the
+  reservation `"failed"` immediately, and every later attempt then skips that
+  launcher via the preflight. A model whose *only* launcher is squatted is
+  unavailable for as long as the squatter keeps heartbeating (a squat
+  registration lapses after 30 seconds without one); there is no spawn
+  churn while it lasts.
+
+  This took eight whole-branch review rounds to get right, and the history is
+  worth recording precisely because each fix's own regression test passed for
+  the wrong reason at least once before a live reproduction caught it.
+  Round 6 found a failed attempt's reservation stuck marking the whole model
+  `"assembling"` (a dedup gate meant for a real in-flight attempt) while its
+  teardown ran, blocking every call with zero launcher attempts. Round 7
+  found the `maxPipelines` ceiling counting those already-failed reservations
+  as live pipelines, and a success-path teardown that redundantly re-awaited
+  the squatted launcher's in-flight `DELETE`. Round 8 found round 7's own
+  change had left a stale `"failed"` entry in the pool when the replacement
+  landed on the *same* launcher, so the background reaper then sent
+  `DELETE /pipeline` to it and killed the freshly re-assembled agent — after
+  any single forward failure, every other request failed from then on; that
+  the retry still always picked the squatted launcher first (README had
+  claimed a healthy launcher "is NOT permanently starved" — false); and that
+  both assembly paths `await`ed a DNS lookup between choosing a launcher and
+  reserving it, which for a launcher registered by hostname reintroduced
+  Phase C's "model A's request served with model B's weights and a `200`".
+  All are fixed: stale same-launcher entries are removed on success, the
+  reaper leaves any entry whose launcher has a reservation mid-spawn alone,
+  the driver identity key is derived synchronously from the launcher's own
+  canonical identity (no await between claim and reservation — keep it that
+  way), and squatted launchers are filtered out up front.
+
+  **Residuals, deliberately not fixed here:** `DELETE /pipeline` is
+  generation-blind — it is not tied to the agent it was issued for, so a
+  teardown still in flight could kill a *newer* agent if the same launcher
+  were re-assembled in that window (needs a launcher-protocol change, e.g. a
+  spawn id); the background loop's `tryAssemble()` keeps its reservation
+  `"assembling"` during its own awaited teardown (marking it `"failed"` early
+  there would free the launcher before its old agent is confirmed stopped);
+  the success path still awaits `DELETE /pipeline` synchronously when it
+  replaces a genuinely *stale* (not failed) entry on a *different* launcher
+  (pre-existing Phase B behaviour); and the pipeline-reservation state
+  machine still infers "claimed / teardown pending / which agent generation"
+  from pool-entry states plus an "exclude `tracked`" exception rather than
+  recording them explicitly — the reviewer's recommended mechanism-level
+  follow-up, if further review rounds keep finding regressions here.
 - **A hung launcher can cost an unrelated healthy model its pipeline.** The
   reconciliation tick awaits launcher I/O sequentially with a 60-second
   timeout — twice the registry's 30-second node timeout — and the driver

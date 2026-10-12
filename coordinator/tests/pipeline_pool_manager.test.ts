@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer as createHttpServer } from "node:http";
-import { DEFAULT_INTERVAL_MS, PipelinePoolManager, claimedLauncherIds, desiredPipelineCount, isLauncherClaimed, planAllocations } from "../src/pipeline_pool_manager.ts";
+import { DEFAULT_INTERVAL_MS, PipelinePoolManager, claimedLauncherIds, desiredPipelineCount, isDriverIdentitySquatted, isLauncherClaimed, launcherDriverEndpoint, launcherDriverIdentityKey, planAllocations } from "../src/pipeline_pool_manager.ts";
 import { PipelineTracker } from "../src/pipeline_tracker.ts";
 import { DemandTracker } from "../src/demand_tracker.ts";
 import { LauncherRegistry, type LauncherInfo } from "../src/launcher_registry.ts";
@@ -14,7 +14,7 @@ import { canonicalizeEndpoint } from "../src/endpoint_identity.ts";
 // POST /pipeline with a canned success body and counts calls; responds to
 // DELETE /pipeline by counting the call and returning 204. Mirrors
 // coordinator/tests/server.test.ts's own startStubNodeAgent pattern.
-async function startStubLauncher() {
+async function startStubLauncher(opts: { onPipeline?: () => void } = {}) {
   let pipelineCalls = 0;
   let deleteCalls = 0;
   const server = createHttpServer(async (req, res) => {
@@ -27,6 +27,11 @@ async function startStubLauncher() {
       return;
     }
     pipelineCalls++;
+    // Eighth whole-branch review: lets a test land a squat WHILE the spawn is
+    // in flight, after the synchronous preflight has already approved this
+    // launcher -- the only moment a squat can still reach the commit-time
+    // assertDriverIdentityFree() guard.
+    opts.onPipeline?.();
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ status: "ready" }));
   });
@@ -183,35 +188,28 @@ test("runOnce assembles a fresh pipeline for a model with demand, an idle launch
   }
 });
 
-test("runOnce refuses to let a launcher-spawned driver silently adopt a squatter's pinned endpoint", async () => {
-  // Third whole-branch review, Critical finding: registry.register()
-  // (called directly here, bypassing POST /nodes/register's own collision
-  // check entirely) has its endpoint-pinning aimed the WRONG way for this
-  // one caller. driverEndpoint is derived from an already-verified
-  // LauncherRegistry entry, and POST /pipeline having just returned
-  // success means a real agent is listening there right now -- but an
-  // unrelated, earlier, attacker-controlled registration that happens to
-  // collide with this driver's canonical identity still kept ITS pinned
-  // endpoint before this fix, and the coordinator then treated that
-  // attacker endpoint as the freshly-spawned driver. Live-verified to hand
-  // a real user's prompt to the squatter with a 200 even though the
-  // launcher really did spawn an honest agent. Not possible on `master`
-  // (raw endpoint-string identity meant no collision could exist here at
-  // all) -- canonicalization creates the collision; the old pinning
-  // converted it into a hijack.
-  const launcherStub = await startStubLauncher();
+test("runOnce refuses to let a launcher-spawned driver silently adopt a squatter that lands during the spawn", async () => {
+  // Third whole-branch review, Critical finding: registry.register() (called
+  // directly here, bypassing POST /nodes/register's own collision check
+  // entirely) had its endpoint-pinning aimed the WRONG way for this one
+  // caller -- a squatter's endpoint stayed pinned and the coordinator then
+  // treated it as the freshly-spawned driver, live-verified to hand a real
+  // user's prompt to the squatter with a 200. Eighth whole-branch review: a
+  // squat that exists BEFORE the attempt is now skipped by the preflight
+  // (tests below), so the commit-time guard is exercised by the only case
+  // that still reaches it: a squat landing while POST /pipeline is in
+  // flight, planted here from inside the launcher stub.
+  let plant: (() => void) | undefined;
+  const launcherStub = await startStubLauncher({ onPipeline: () => plant?.() });
   try {
     const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }]);
     const registry = new NodeRegistry();
     registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
     registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
 
-    // Squat the driver's identity FIRST, under an alias colliding with what
-    // launcherDriverEndpoint() will compute for this launcher
-    // (127.0.0.1:launcherStub.port, since this stub's own port doubles as
-    // its registered agentPort, same convention the test above uses).
     const squatterEndpoint = `http://localhost:${launcherStub.port}`;
-    registry.register(squatterEndpoint, await canonicalizeEndpoint(squatterEndpoint), "desktop", undefined, "squatted-model");
+    const squatterKey = await canonicalizeEndpoint(squatterEndpoint);
+    plant = () => registry.register(squatterEndpoint, squatterKey, "desktop", undefined, "squatted-model");
 
     const launcherRegistry = new LauncherRegistry();
     launcherRegistry.register(launcherStub.endpoint, await canonicalizeEndpoint(launcherStub.endpoint), ["big-model"], launcherStub.port);
@@ -222,10 +220,7 @@ test("runOnce refuses to let a launcher-spawned driver silently adopt a squatter
     const manager = makeManager({ catalog, registry, launcherRegistry, demandTracker, pipelineTracker });
     await manager.runOnce();
 
-    // The launcher was still called -- a real agent really did spawn --
-    // but registration of that driver must now fail loudly instead of
-    // silently landing on the squatter's pinned entry.
-    assert.equal(launcherStub.getPipelineCalls(), 1, "the launcher was still called -- the failure must happen at registration, after spawning, not before");
+    assert.equal(launcherStub.getPipelineCalls(), 1, "the squat landed mid-spawn, so the launcher was genuinely asked to spawn");
     assert.equal(pipelineTracker.getPool("big-model").length, 0, "no pipeline may be tracked as warm when the driver's identity was squatted");
 
     const active = registry.listActive();
@@ -234,18 +229,166 @@ test("runOnce refuses to let a launcher-spawned driver silently adopt a squatter
     assert.ok(squatted, "the squatter's entry must still exist, completely untouched");
     assert.equal(squatted?.servesModel, "squatted-model", "the squatter's entry must NOT have acquired the driver's servesModel");
 
-    // Fourth whole-branch review, Important finding: the real agent the
-    // launcher just spawned must not be left running, orphaned, forever --
-    // never registered anywhere, holding the launcher's fixed agent port
-    // and real model weights in RAM. Live-verified before this fix: the
-    // launcher was left with a live, unregistered agent, and every
-    // subsequent tick found this same launcher "idle" and respawned over
-    // it again -- a fresh multi-GB load per tick, indefinitely, for as
-    // long as the squat persists.
-    assert.equal(launcherStub.getDeleteCalls(), 1, "the orphaned agent must be torn down immediately when the driver's registration is refused, not left running");
+    // Fourth whole-branch review, Important finding: the just-spawned agent
+    // must not be left running orphaned -- never registered anywhere,
+    // holding the launcher's agent port and the model's weights in RAM.
+    assert.equal(launcherStub.getDeleteCalls(), 1, "the orphaned agent must be torn down when the driver's registration is refused");
   } finally {
     launcherStub.server.close();
   }
+});
+
+test("runOnce skips a launcher whose driver identity is already squatted and assembles on the next one", async () => {
+  // Eighth whole-branch review, Important finding: planAllocations() walks
+  // launchers in registration order and allocate() drops a model for the
+  // rest of the tick on its first failed assembly, so a squatted launcher
+  // registered first was re-picked, spawned on and torn down EVERY tick
+  // while a healthy launcher behind it was never reached.
+  const squatted = await startStubLauncher();
+  const healthy = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 }]);
+    const registry = new NodeRegistry();
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+    const squatterEndpoint = `http://localhost:${squatted.port}`;
+    registry.register(squatterEndpoint, await canonicalizeEndpoint(squatterEndpoint), "desktop", undefined, "squatted-model");
+
+    const launcherRegistry = new LauncherRegistry();
+    launcherRegistry.register(squatted.endpoint, await canonicalizeEndpoint(squatted.endpoint), ["big-model"], squatted.port);
+    launcherRegistry.register(healthy.endpoint, await canonicalizeEndpoint(healthy.endpoint), ["big-model"], healthy.port);
+    const demandTracker = new DemandTracker();
+    demandTracker.recordRequest("big-model");
+    const pipelineTracker = new PipelineTracker();
+
+    await makeManager({ catalog, registry, launcherRegistry, demandTracker, pipelineTracker }).runOnce();
+
+    assert.equal(squatted.getPipelineCalls(), 0, "no spawn may be wasted on a launcher already known to be squatted");
+    assert.equal(squatted.getDeleteCalls(), 0);
+    assert.equal(healthy.getPipelineCalls(), 1, "the healthy launcher behind it must get its turn");
+    assert.equal(pipelineTracker.getPool("big-model").length, 1);
+    assert.equal(pipelineTracker.getPool("big-model")[0].state, "warm");
+  } finally {
+    squatted.server.close();
+    healthy.server.close();
+  }
+});
+
+test("runOnce does not reap a stale entry whose launcher has an assembly in flight", async () => {
+  // Eighth whole-branch review: the request path lets a replacement reuse
+  // the launcher of the entry it replaces (`tracked` is excluded from the
+  // claimed tally), and POST /pipeline replaces that launcher's agent IN
+  // PLACE. Reaping the stale entry meanwhile sends DELETE /pipeline to a
+  // launcher that is mid-spawn; the real launcher is single-threaded, so the
+  // DELETE queues behind the POST and kills the agent it just built. State
+  // is constructed directly: a "failed" entry plus an "assembling"
+  // reservation on the same launcher.
+  const launcherStub = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }]);
+    const launcherRegistry = new LauncherRegistry();
+    const identityKey = await canonicalizeEndpoint(launcherStub.endpoint);
+    const launcherId = launcherRegistry.register(launcherStub.endpoint, identityKey, ["big-model"], launcherStub.port);
+    const pipelineTracker = new PipelineTracker();
+    pipelineTracker.addEntry("big-model", {
+      pipelineId: "stale",
+      driverNodeId: "dead-driver",
+      computeNodeIds: [],
+      launcherId,
+      launcherEndpoint: launcherStub.endpoint,
+      launcherIdentityKey: identityKey,
+      state: "failed",
+      lastUsedAt: Date.now(),
+    });
+    pipelineTracker.addEntry("big-model", {
+      pipelineId: "reservation",
+      driverNodeId: "",
+      computeNodeIds: [],
+      launcherId,
+      launcherEndpoint: launcherStub.endpoint,
+      launcherIdentityKey: identityKey,
+      state: "assembling",
+      lastUsedAt: Date.now(),
+    });
+
+    const manager = makeManager({ catalog, launcherRegistry, pipelineTracker });
+    await manager.runOnce();
+    assert.equal(launcherStub.getDeleteCalls(), 0, "no DELETE may be sent to a launcher while a reservation on it is mid-spawn");
+    assert.equal(pipelineTracker.getPool("big-model").length, 2, "both entries are left for the assembly's own success path to resolve");
+
+    // Once the reservation is gone the stale entry is an ordinary failed
+    // entry again and is reaped as before.
+    pipelineTracker.removeEntry("big-model", "reservation");
+    await manager.runOnce();
+    assert.equal(launcherStub.getDeleteCalls(), 1);
+    assert.equal(pipelineTracker.getPool("big-model").length, 0);
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
+test("launcherDriverIdentityKey equals the canonicalized driver endpoint's key, with no DNS lookup", async () => {
+  // Eighth whole-branch review, Critical finding: both assembly paths used
+  // to `await canonicalizeEndpoint(driverEndpoint)` between choosing a
+  // launcher and reserving it. The synchronous replacement must agree with
+  // it exactly, or the preflight, the reputation check and the registration
+  // would each derive a different identity for the same driver.
+  const cases: Array<{ endpoint: string; agentPort: number }> = [
+    { endpoint: "http://127.0.0.1:9000", agentPort: 8091 },
+    { endpoint: "http://localhost:9000", agentPort: 8091 },
+    { endpoint: "http://[::1]:9000", agentPort: 8091 },
+    { endpoint: "https://127.0.0.1:9443", agentPort: 443 },
+    { endpoint: "http://192.168.1.5:9000", agentPort: 80 },
+    { endpoint: "http://192.168.1.5:9000", agentPort: 8091 },
+    { endpoint: "http://[2001:db8::1]:9000", agentPort: 8091 },
+  ];
+  for (const { endpoint, agentPort } of cases) {
+    const launcher: LauncherInfo = {
+      launcherId: "L",
+      endpoint,
+      identityKey: await canonicalizeEndpoint(endpoint),
+      servesModels: ["m"],
+      agentPort,
+    };
+    assert.equal(
+      launcherDriverIdentityKey(launcher),
+      await canonicalizeEndpoint(launcherDriverEndpoint(launcher)),
+      `driver identity key for launcher ${endpoint} with agentPort ${agentPort}`,
+    );
+  }
+});
+
+test("launcherDriverEndpoint drops a default port exactly like POST /nodes/register's normalization", async () => {
+  // Eighth whole-branch review, Minor finding: a bare template string kept
+  // ":80", and assertDriverIdentityFree()'s string comparison then saw
+  // "http://h:80" vs the route's "http://h" as two different endpoints.
+  const mk = (endpoint: string, agentPort: number): LauncherInfo =>
+    ({ launcherId: "L", endpoint, identityKey: "k:1", servesModels: ["m"], agentPort });
+  assert.equal(launcherDriverEndpoint(mk("http://10.0.0.7:9000", 80)), "http://10.0.0.7");
+  assert.equal(launcherDriverEndpoint(mk("https://10.0.0.7:9000", 443)), "https://10.0.0.7");
+  assert.equal(launcherDriverEndpoint(mk("http://10.0.0.7:9000", 8091)), "http://10.0.0.7:8091");
+  assert.equal(launcherDriverEndpoint(mk("http://[::1]:9000", 8091)), "http://[::1]:8091");
+});
+
+test("isDriverIdentitySquatted is true only when a DIFFERENT endpoint holds the driver's identity", async () => {
+  const launcherEndpoint = "http://127.0.0.1:9000";
+  const launcher: LauncherInfo = {
+    launcherId: "L",
+    endpoint: launcherEndpoint,
+    identityKey: await canonicalizeEndpoint(launcherEndpoint),
+    servesModels: ["m"],
+    agentPort: 8091,
+  };
+  const registry = new NodeRegistry();
+  assert.equal(isDriverIdentitySquatted(registry, launcher), false, "nothing registered: free");
+
+  const driverEndpoint = launcherDriverEndpoint(launcher);
+  registry.register(driverEndpoint, await canonicalizeEndpoint(driverEndpoint), "desktop", undefined, "m");
+  assert.equal(isDriverIdentitySquatted(registry, launcher), false, "the driver's own earlier registration is not a squat");
+
+  const other = new NodeRegistry();
+  other.register("http://localhost:8091", await canonicalizeEndpoint("http://localhost:8091"), "desktop");
+  assert.equal(isDriverIdentitySquatted(other, launcher), true, "an alias holding the identity under a different endpoint string is a squat");
 });
 
 test("runOnce does nothing for a model with requiredNodeCount 1", async () => {
