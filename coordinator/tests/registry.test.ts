@@ -356,3 +356,45 @@ test("re-registering the same endpoint updates availableMemoryMb", async () => {
   const [node] = registry.listActive();
   assert.equal(node.availableMemoryMb, 32000);
 });
+
+test("heartbeat with an expected endpoint refreshes only that exact registration", async () => {
+  // Ninth whole-branch review: the pool reaper heartbeated a launcher-spawned
+  // driver by nodeId alone, so after the driver's registration lapsed it kept
+  // alive whatever registration had since taken that identity -- including one
+  // this coordinator did not write.
+  let now = 1_000_000;
+  const registry = new NodeRegistry(() => now, 30000);
+  const key = await canonicalizeEndpoint("http://127.0.0.1:50052");
+  const nodeId = registry.register("http://squatter.example:1", key, "desktop");
+
+  now += 20000;
+  assert.equal(registry.heartbeat(nodeId, "http://127.0.0.1:50052"), false, "a different endpoint holds this identity: not ours to keep alive");
+  now += 15000; // 35s after registration: expired, because the heartbeat above refreshed nothing
+  assert.equal(registry.listActive().length, 0);
+
+  const second = registry.register("http://127.0.0.1:50052", key, "desktop");
+  now += 20000;
+  assert.equal(registry.heartbeat(second, "http://127.0.0.1:50052"), true);
+  now += 15000;
+  assert.equal(registry.listActive().length, 1, "the matching heartbeat did refresh it");
+});
+
+test("remove deregisters a node, and with an expected endpoint only that exact registration", async () => {
+  // Ninth whole-branch review: tearing down a launcher-spawned pipeline never
+  // deregistered its driver, which stayed active with its old servesModel for
+  // up to 30s -- long enough for the launcher to be handed to another model
+  // and for the old model's requests to be answered with the new model's
+  // weights (reproduces identically on master).
+  const registry = new NodeRegistry();
+  const key = await canonicalizeEndpoint("http://127.0.0.1:50052");
+  const nodeId = registry.register("http://127.0.0.1:50052", key, "desktop", undefined, "m");
+
+  assert.equal(registry.remove(nodeId, "http://elsewhere.example:1"), false, "someone else's registration is left alone");
+  assert.equal(registry.listActive().length, 1);
+  assert.equal(registry.remove(nodeId, "http://127.0.0.1:50052"), true);
+  assert.equal(registry.listActive().length, 0);
+  assert.equal(registry.remove(nodeId), false, "removing an unknown node is a no-op");
+
+  const again = registry.register("http://127.0.0.1:50052", key, "desktop");
+  assert.equal(registry.remove(again), true, "without an expected endpoint, removal is unconditional");
+});

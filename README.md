@@ -540,7 +540,12 @@ Endpoints:
   already-active entry for the same identity is rejected with `409` naming
   the endpoint that's actually pinned, rather than silently reassigning
   it — closing the alias-based reputation-reset and identity-hijack vectors
-  documented in "Known gaming vectors" below. Accepts an
+  documented in "Known gaming vectors" below. An identity that an active
+  launcher would spawn its **driver** on (its host and fixed `--agent-port`)
+  is reserved for the coordinator: registering it here is refused with
+  `409`, because a launcher swaps its agent whenever the pool manager
+  reassigns it, so a registration verified against the current agent cannot
+  stay true — the pool registers and retires the driver itself. Accepts an
   optional `localityGroup` string field (must be non-empty when provided) —
   see the locality-grouping note below. `localityGroup` and the
   `availableMemoryMb` field below **remain self-reported and unverified** —
@@ -894,6 +899,55 @@ default catalog declares one.
   canonical identity (no await between claim and reservation — keep it that
   way), and squatted launchers are filtered out up front.
 
+  **Round 9 stopped reading diffs.** The first eight rounds each reviewed a
+  change and, in seven of them, found a real bug — several introduced by the
+  previous round's own fix. Round 9 instead built a deterministic randomized
+  interleaving test (`coordinator/tests/pipeline_state_machine.test.ts`: a
+  virtual clock, a fake network and stub single-threaded launchers around the
+  real request handler and the real pool manager, checking invariants after
+  every step) and it found, within seconds, defects eight rounds of reading
+  had missed — most of them in pre-existing Phase B/C code that this phase had
+  merely made reachable more often, and one that reproduces identically on
+  `master`:
+
+  - **A request answered `200` with another model's weights.** Tearing a
+    pipeline down never deregistered its launcher-spawned driver, which stayed
+    active with its old `servesModel` for up to 30 seconds — long enough for
+    the launcher to be handed to a different model, after which the
+    cold-start fallback and `/v1/chat/completions` routed the old model's
+    requests to the new model's agent. Teardown now goes through one path
+    (`retireEntry`) that stops routing, deregisters the driver it spawned
+    (only if the registry still binds it to the spawned endpoint), confirms
+    the entry still holds its launcher claim, and only then sends `DELETE`;
+    a launcher's driver endpoint is also cleared the moment the launcher is
+    reserved for a new spawn, and the public route refuses to register an
+    identity an active launcher would spawn its driver on.
+  - **A prompt handed to an endpoint this coordinator never spawned.** Pooled
+    entries stored only `driverNodeId`, a hash of the driver's canonical
+    *identity*, so once the driver's registration lapsed, a registration of the
+    same identity under a different endpoint was adopted by the still-warm entry
+    and kept alive by the reaper's heartbeats. Entries now record the endpoint
+    they spawned (`driverEndpoint`), and routing, heartbeating and the liveness
+    check all require the registry to still bind the identity to it. (Reaching
+    it still takes a name or alias that canonicalizes to the driver's identity
+    — the disclosed DNS/alias residual — which is why the binding is checked
+    rather than assumed.)
+  - **A launcher starved by one reputation-ejected driver** (the same class as
+    the squat starvation, for ejection): every reason a launcher may be
+    ineligible now lives in one predicate, `launcherSkipReason()`, used by both
+    the request path and the background planner *before* choosing.
+  - **A `DELETE` killing a freshly spawned agent**, and **`maxPipelines`
+    exceeded by a stale plan**: the reaper acted on a pool snapshot taken
+    before an `await`, and `tryAssemble()` re-checked the launcher but not the
+    model's own ceiling at commit time. Both now re-confirm at the moment of
+    commitment.
+
+  The test is the standing guard: run it scaled up
+  (`STATE_MACHINE_SEED_SCALE=40 npm test`) after any change to the cold-start
+  assembly or the pool manager. Against the code as it stood before round 9 it
+  fails on the original seeds; the final code ran clean across tens of
+  thousands of seeds in five configurations.
+
   **Residuals, deliberately not fixed here:** `DELETE /pipeline` is
   generation-blind — it is not tied to the agent it was issued for, so a
   teardown still in flight could kill a *newer* agent if the same launcher
@@ -903,11 +957,16 @@ default catalog declares one.
   there would free the launcher before its old agent is confirmed stopped);
   the success path still awaits `DELETE /pipeline` synchronously when it
   replaces a genuinely *stale* (not failed) entry on a *different* launcher
-  (pre-existing Phase B behaviour); and the pipeline-reservation state
-  machine still infers "claimed / teardown pending / which agent generation"
-  from pool-entry states plus an "exclude `tracked`" exception rather than
-  recording them explicitly — the reviewer's recommended mechanism-level
-  follow-up, if further review rounds keep finding regressions here.
+  (pre-existing Phase B behaviour); a launcher whose registration lapses and
+  re-registers under the other loopback alias can see its own previous driver
+  registration (the old spelling) treated as a squat until that registration
+  lapses; and the machine still infers "claimed / teardown pending / which
+  agent generation" from pool-entry states plus an "exclude `tracked`"
+  exception rather than recording them explicitly. The ninth reviewer's
+  recommended mechanism-level follow-up — an explicit per-launcher claim with
+  a spawn generation, and recording "endpoint-verified" on the registry entry
+  itself — was *not* needed to reach a clean randomized run, but remains the
+  right move if that test ever starts finding regressions again.
 - **A hung launcher can cost an unrelated healthy model its pipeline.** The
   reconciliation tick awaits launcher I/O sequentially with a 60-second
   timeout — twice the registry's 30-second node timeout — and the driver
@@ -925,8 +984,14 @@ default catalog declares one.
   bounded by the same 60-second ceiling, not touched by this phase's own
   fix rounds since it's a different code path than the one those rounds
   were scoped to.
-- Scale-down does not deregister the torn-down driver from `NodeRegistry`,
-  so it stays selectable for up to 30 seconds and can yield a `502`.
+- **Idle churn.** `desiredPipelineCount` floors at one warm pipeline per
+  multi-node model even with zero demand, so a model that sees no traffic is
+  torn down once its pipeline has been idle past the grace period and then
+  re-spawned on the next tick — a full model load every grace period for
+  nothing. A Phase C design choice found by the ninth review, not yet fixed.
+  (Scale-down now does deregister the torn-down driver; it used to stay
+  selectable for up to 30 seconds and could answer with the wrong model's
+  weights.)
 - The demand-to-pipeline-count function and both constants (10s interval,
   5-minute idle grace, 10 requests/minute per pipeline) are starting points
   chosen without real load data, not tuned figures.

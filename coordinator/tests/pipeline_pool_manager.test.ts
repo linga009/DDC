@@ -1,14 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer as createHttpServer } from "node:http";
-import { DEFAULT_INTERVAL_MS, PipelinePoolManager, claimedLauncherIds, desiredPipelineCount, isDriverIdentitySquatted, isLauncherClaimed, launcherDriverEndpoint, launcherDriverIdentityKey, planAllocations } from "../src/pipeline_pool_manager.ts";
-import { PipelineTracker } from "../src/pipeline_tracker.ts";
+import { DEFAULT_INTERVAL_MS, PipelinePoolManager, claimedLauncherIds, desiredPipelineCount, isDriverIdentitySquatted, isLauncherClaimed, launcherDriverEndpoint, launcherDriverIdentityKey, launcherSkipReason, planAllocations, retireEntry } from "../src/pipeline_pool_manager.ts";
+import { PipelineTracker, type PooledPipeline } from "../src/pipeline_tracker.ts";
 import { DemandTracker } from "../src/demand_tracker.ts";
 import { LauncherRegistry, type LauncherInfo } from "../src/launcher_registry.ts";
 import { NodeRegistry, stableNodeId } from "../src/registry.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
 import { ModelCatalog } from "../src/catalog.ts";
 import { canonicalizeEndpoint } from "../src/endpoint_identity.ts";
+
+// Polls an observable side effect instead of sleeping a fixed time.
+async function waitUntil(check: () => boolean, timeoutMs = 2000, intervalMs = 10): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() > deadline) {
+      throw new Error(`condition did not become true within ${timeoutMs}ms`);
+    }
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  }
+}
 
 // A minimal stand-in for a swarm-launcher's HTTP interface: responds to
 // POST /pipeline with a canned success body and counts calls; responds to
@@ -1025,5 +1036,375 @@ test("a plan that goes stale across an await does not claim a launcher the reque
     releaseL1();
     l1.close();
     l2.server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Ninth whole-branch review: the launcher/pipeline reservation state machine.
+// The randomized interleaving test (pipeline_state_machine.test.ts) is the
+// broad net; these pin each specific defect it and the review found.
+// ---------------------------------------------------------------------------
+
+// A launcher stub whose DELETE /pipeline can be held open, to keep a teardown
+// genuinely in flight.
+async function startGatedDeleteLauncher() {
+  let posts = 0;
+  let deletes = 0;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const server = createHttpServer(async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    if (req.method === "DELETE") {
+      deletes++;
+      await gate;
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    posts++;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "ready" }));
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected gated-delete launcher stub to bind to a port");
+  }
+  return {
+    server,
+    endpoint: `http://127.0.0.1:${address.port}`,
+    port: address.port,
+    getPosts: () => posts,
+    getDeletes: () => deletes,
+    release,
+  };
+}
+
+function warmEntryFixture(launcher: { launcherId: string; endpoint: string; identityKey: string }, driverNodeId: string, driverEndpoint?: string): PooledPipeline {
+  return {
+    pipelineId: `entry-${driverNodeId.slice(0, 6)}`,
+    driverNodeId,
+    ...(driverEndpoint !== undefined ? { driverEndpoint } : {}),
+    computeNodeIds: [],
+    launcherId: launcher.launcherId,
+    launcherEndpoint: launcher.endpoint,
+    launcherIdentityKey: launcher.identityKey,
+    state: "warm",
+    lastUsedAt: Date.now(),
+  };
+}
+
+test("retireEntry stops routing first, deregisters only the driver it spawned, and holds the launcher claim until the DELETE settles", async () => {
+  // Ninth whole-branch review. Tearing a pipeline down never deregistered its
+  // launcher-spawned driver, which stayed active with its old servesModel for
+  // up to 30s -- long enough for the launcher to be handed to another model,
+  // after which the cold-start fallback routed the OLD model's requests to the
+  // NEW model's agent and answered 200 with the wrong weights (reproduces
+  // identically on master). It also marked nothing failed, so the entry stayed
+  // "warm" and routable for the whole DELETE.
+  const launcherStub = await startGatedDeleteLauncher();
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }]);
+    const registry = new NodeRegistry();
+    const launcherRegistry = new LauncherRegistry();
+    const identityKey = await canonicalizeEndpoint(launcherStub.endpoint);
+    const launcherId = launcherRegistry.register(launcherStub.endpoint, identityKey, ["big-model"], launcherStub.port);
+    const launcher = { launcherId, endpoint: launcherStub.endpoint, identityKey, servesModels: ["big-model"], agentPort: launcherStub.port };
+    const driverEndpoint = launcherDriverEndpoint(launcher);
+    const driverKey = launcherDriverIdentityKey(launcher);
+    const driverNodeId = registry.register(driverEndpoint, driverKey, "desktop", undefined, "big-model");
+    const pipelineTracker = new PipelineTracker();
+    const entry = warmEntryFixture(launcher, driverNodeId, driverEndpoint);
+    pipelineTracker.addEntry("big-model", entry);
+
+    const retiring = retireEntry(pipelineTracker, registry, launcherRegistry, "big-model", entry);
+    // Synchronously, before any await: not routable, driver deregistered.
+    assert.equal(entry.state, "failed", "the entry must stop being routable the moment teardown begins");
+    assert.equal(registry.listActive().some(n => n.nodeId === driverNodeId), false, "the old driver registration must be gone before the launcher can be handed to another model");
+
+    await waitUntil(() => launcherStub.getDeletes() === 1);
+    assert.ok(claimedLauncherIds(catalog, pipelineTracker).has(launcherId), "the launcher stays claimed while its old agent may still be running");
+
+    launcherStub.release();
+    await retiring;
+    assert.equal(pipelineTracker.getPool("big-model").length, 0);
+    assert.equal(claimedLauncherIds(catalog, pipelineTracker).has(launcherId), false, "released only after the DELETE settled");
+  } finally {
+    launcherStub.release();
+    launcherStub.server.close();
+  }
+});
+
+test("retireEntry leaves a registration it did not write alone, and sends no DELETE for an entry someone else already retired", async () => {
+  // Ninth whole-branch review (harness seed 1196): the request path's
+  // success-path teardown awaited a bare stopLauncherPipeline() for `tracked`
+  // without re-checking that `tracked` was still in the pool. The reaper had
+  // already removed it and the planner had re-claimed that launcher, so the
+  // DELETE killed the freshly spawned agent. Ownership of the claim is now
+  // re-confirmed synchronously immediately before the DELETE.
+  const launcherStub = await startStubLauncher();
+  try {
+    const registry = new NodeRegistry();
+    const launcherRegistry = new LauncherRegistry();
+    const identityKey = await canonicalizeEndpoint(launcherStub.endpoint);
+    const launcherId = launcherRegistry.register(launcherStub.endpoint, identityKey, ["big-model"], launcherStub.port);
+    const launcher = { launcherId, endpoint: launcherStub.endpoint, identityKey, servesModels: ["big-model"], agentPort: launcherStub.port };
+    const driverEndpoint = launcherDriverEndpoint(launcher);
+    const driverKey = launcherDriverIdentityKey(launcher);
+    // A DIFFERENT endpoint now holds the driver's identity (it lapsed and was
+    // re-registered elsewhere): retiring the pipeline must not deregister it.
+    const squatterNodeId = registry.register("http://squatter.example:9", driverKey, "desktop", undefined, "squatted-model");
+    const pipelineTracker = new PipelineTracker();
+    const entry = warmEntryFixture(launcher, squatterNodeId, driverEndpoint);
+    pipelineTracker.addEntry("big-model", entry);
+
+    pipelineTracker.removeEntry("big-model", entry.pipelineId); // someone else already retired it
+    await retireEntry(pipelineTracker, registry, launcherRegistry, "big-model", entry);
+    assert.equal(launcherStub.getDeleteCalls(), 0, "no DELETE may be sent for an entry that no longer holds the claim");
+    assert.equal(registry.listActive().some(n => n.nodeId === squatterNodeId), true, "a registration retireEntry did not write must be left alone");
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
+test("retireEntry for an already-retired entry does not deregister the NEW pipeline's driver at the same endpoint", async () => {
+  // Found while mutation-checking the ninth review's fixes: retireEntry first
+  // marked the entry failed and deregistered its driver, and only THEN checked
+  // whether it still held the claim. One launcher always spawns on the same
+  // host:agentPort, so once a stale entry had been retired and the launcher
+  // re-claimed, the new pipeline's driver sits at the very same endpoint and
+  // nodeId -- and the stale retire removed it, leaving the new warm entry
+  // unroutable. The ownership check now precedes every side effect.
+  const registry = new NodeRegistry();
+  const launcherRegistry = new LauncherRegistry();
+  const identityKey = await canonicalizeEndpoint("http://127.0.0.1:9000");
+  const launcherId = launcherRegistry.register("http://127.0.0.1:9000", identityKey, ["big-model"], 8091);
+  const launcher = { launcherId, endpoint: "http://127.0.0.1:9000", identityKey, servesModels: ["big-model"], agentPort: 8091 };
+  const driverEndpoint = launcherDriverEndpoint(launcher);
+  const driverNodeId = registry.register(driverEndpoint, launcherDriverIdentityKey(launcher), "desktop", undefined, "big-model");
+  const pipelineTracker = new PipelineTracker();
+  const stale = warmEntryFixture(launcher, driverNodeId, driverEndpoint); // not in the pool: already retired
+
+  await retireEntry(pipelineTracker, registry, launcherRegistry, "big-model", stale);
+
+  assert.equal(registry.listActive().some(n => n.nodeId === driverNodeId), true, "the new pipeline's driver registration must survive a stale retire");
+});
+
+test("launcherSkipReason: a squatted driver identity and a reputation-ejected driver are both ineligible, a healthy one is not", async () => {
+  const endpoint = "http://127.0.0.1:9000";
+  const launcher: LauncherInfo = { launcherId: "L", endpoint, identityKey: await canonicalizeEndpoint(endpoint), servesModels: ["m"], agentPort: 8091 };
+  const reputation = new ReputationTracker();
+  const registry = new NodeRegistry();
+  assert.equal(launcherSkipReason(registry, reputation, launcher), undefined);
+
+  const driverId = stableNodeId(launcherDriverIdentityKey(launcher));
+  for (let i = 0; i < 6; i++) reputation.recordDisagreement(driverId);
+  assert.match(launcherSkipReason(registry, reputation, launcher) ?? "", /reputation-ejected/);
+
+  const rehabbed = new ReputationTracker();
+  registry.register("http://localhost:8091", await canonicalizeEndpoint("http://localhost:8091"), "desktop");
+  assert.match(launcherSkipReason(registry, rehabbed, launcher) ?? "", /already registered under a different endpoint/);
+});
+
+test("runOnce reaches a healthy launcher even when the first-listed launcher's driver is reputation-ejected", async () => {
+  // Ninth whole-branch review: the ejected-driver check ran AFTER a launcher
+  // had been chosen and simply gave up, so one ejected driver on the
+  // first-listed launcher ended the attempt -- and, in the planner, dropped the
+  // model for the whole tick -- while an idle healthy launcher behind it was
+  // never tried (live: 18 straight 503s). Same class as the squat starvation
+  // round 8 fixed for squats only.
+  const ejectedLauncher = await startStubLauncher();
+  const healthy = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }]);
+    const registry = new NodeRegistry();
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+    const reputation = new ReputationTracker();
+    const launcherRegistry = new LauncherRegistry();
+    const key1 = await canonicalizeEndpoint(ejectedLauncher.endpoint);
+    launcherRegistry.register(ejectedLauncher.endpoint, key1, ["big-model"], ejectedLauncher.port);
+    launcherRegistry.register(healthy.endpoint, await canonicalizeEndpoint(healthy.endpoint), ["big-model"], healthy.port);
+    const ejectedDriverId = stableNodeId(launcherDriverIdentityKey({ identityKey: key1, agentPort: ejectedLauncher.port } as LauncherInfo));
+    for (let i = 0; i < 6; i++) reputation.recordDisagreement(ejectedDriverId);
+    const demandTracker = new DemandTracker();
+    demandTracker.recordRequest("big-model");
+    const pipelineTracker = new PipelineTracker();
+
+    await makeManager({ catalog, registry, reputation, launcherRegistry, demandTracker, pipelineTracker }).runOnce();
+
+    assert.equal(ejectedLauncher.getPipelineCalls(), 0, "no spawn on a launcher whose driver would be ejected on arrival");
+    assert.equal(healthy.getPipelineCalls(), 1, "the healthy launcher behind it must get its turn");
+    assert.equal(pipelineTracker.getPool("big-model")[0]?.state, "warm");
+  } finally {
+    ejectedLauncher.server.close();
+    healthy.server.close();
+  }
+});
+
+test("runOnce retires a pipeline whose driver identity was re-registered under a different endpoint, and never heartbeats that registration", async () => {
+  // Ninth whole-branch review (harness seed 62): entries stored only
+  // `driverNodeId` -- a hash of the driver's canonical IDENTITY -- and routing
+  // resolved it through the registry's CURRENT binding. Once the driver's
+  // registration lapsed, a registration of the same identity under a different
+  // endpoint was adopted by the still-warm entry, and the reaper's pre-pass
+  // then heartbeated it on every tick, so prompts went to an endpoint this
+  // coordinator never spawned.
+  const launcherStub = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }]);
+    let now = 1_000_000;
+    const registry = new NodeRegistry(() => now, 30000);
+    const launcherRegistry = new LauncherRegistry();
+    const identityKey = await canonicalizeEndpoint(launcherStub.endpoint);
+    const launcherId = launcherRegistry.register(launcherStub.endpoint, identityKey, ["big-model"], launcherStub.port);
+    const launcher = { launcherId, endpoint: launcherStub.endpoint, identityKey, servesModels: ["big-model"], agentPort: launcherStub.port };
+    const spawnedEndpoint = launcherDriverEndpoint(launcher);
+    const driverKey = launcherDriverIdentityKey(launcher);
+
+    // The squatter holds the driver's identity under a DIFFERENT endpoint.
+    const driverNodeId = registry.register("http://squatter.example:9", driverKey, "desktop", undefined, undefined);
+    const pipelineTracker = new PipelineTracker();
+    pipelineTracker.addEntry("big-model", warmEntryFixture(launcher, driverNodeId, spawnedEndpoint));
+
+    // 20s have passed since the squatter registered (still active, 30s
+    // timeout) when the tick runs: a heartbeat would refresh it to "now".
+    now += 20000;
+    const manager = makeManager({ catalog, registry, launcherRegistry, pipelineTracker });
+    await manager.runOnce();
+
+    assert.equal(pipelineTracker.getPool("big-model").filter(e => e.driverNodeId === driverNodeId).length, 0, "an entry whose driver identity moved to another endpoint is not the pipeline we spawned and must be retired");
+    // 35s after registration: expired -- unless the reaper heartbeated it at
+    // the 20s mark, which would have kept it alive until 50s.
+    now += 15000;
+    assert.equal(registry.listActive().some(n => n.nodeId === driverNodeId), false, "the reaper must not have heartbeated a registration it did not write");
+  } finally {
+    launcherStub.server.close();
+  }
+});
+
+test("runOnce does not DELETE a launcher for an entry another path already retired during the tick", async () => {
+  // Ninth whole-branch review (harness seed 20638): the reaper iterated a copy
+  // of the pool across awaits and never re-checked membership, so after a slow
+  // DELETE it acted on an entry a detached teardown had already removed -- and
+  // the launcher had meanwhile been re-claimed -- killing a fresh agent.
+  const first = await startGatedDeleteLauncher();
+  const second = await startStubLauncher();
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 2 }]);
+    const launcherRegistry = new LauncherRegistry();
+    const k1 = await canonicalizeEndpoint(first.endpoint);
+    const k2 = await canonicalizeEndpoint(second.endpoint);
+    const id1 = launcherRegistry.register(first.endpoint, k1, ["big-model"], first.port);
+    const id2 = launcherRegistry.register(second.endpoint, k2, ["big-model"], second.port);
+    const pipelineTracker = new PipelineTracker();
+    const e1: PooledPipeline = { ...warmEntryFixture({ launcherId: id1, endpoint: first.endpoint, identityKey: k1 }, "driver-1"), pipelineId: "e1", state: "failed" };
+    const e2: PooledPipeline = { ...warmEntryFixture({ launcherId: id2, endpoint: second.endpoint, identityKey: k2 }, "driver-2"), pipelineId: "e2", state: "failed" };
+    pipelineTracker.addEntry("big-model", e1);
+    pipelineTracker.addEntry("big-model", e2);
+
+    const ticking = makeManager({ catalog, launcherRegistry, pipelineTracker }).runOnce();
+    await waitUntil(() => first.getDeletes() === 1); // the reaper is now blocked on e1's DELETE
+    pipelineTracker.removeEntry("big-model", "e2"); // another path retires e2 meanwhile
+    first.release();
+    await ticking;
+
+    assert.equal(second.getDeleteCalls(), 0, "e2 was no longer in the pool, so its launcher must not be DELETEd");
+  } finally {
+    first.release();
+    first.server.close();
+    second.server.close();
+  }
+});
+
+test("runOnce never lets a stale plan push a model past maxPipelines", async () => {
+  // Ninth whole-branch review (harness seeds 3 and 1457): tryAssemble()
+  // re-checked the LAUNCHER at commit time but not the model's live count, so a
+  // plan built before an earlier `await tryAssemble(...)` in the same tick
+  // added a second pipeline after the request path had already filled the
+  // ceiling -- and nothing but idleness ever scaled it back down.
+  const forB = await startStubLauncher();
+  let releaseA!: () => void;
+  const gateA = new Promise<void>(resolve => { releaseA = resolve; });
+  const slowPost = createHttpServer(async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    if (req.method === "POST") await gateA;
+    res.writeHead(req.method === "DELETE" ? 204 : 200, { "content-type": "application/json" });
+    res.end(req.method === "DELETE" ? undefined : JSON.stringify({ status: "ready" }));
+  });
+  await new Promise<void>(resolve => slowPost.listen(0, "127.0.0.1", resolve));
+  const slowPort = (slowPost.address() as { port: number }).port;
+  try {
+    const catalog = new ModelCatalog([
+      { id: "model-a", displayName: "A", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+      { id: "model-b", displayName: "B", minActiveNodes: 0, requiredNodeCount: 2, maxPipelines: 1 },
+    ]);
+    const registry = new NodeRegistry();
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+    const launcherRegistry = new LauncherRegistry();
+    const slowEndpoint = `http://127.0.0.1:${slowPort}`;
+    launcherRegistry.register(slowEndpoint, await canonicalizeEndpoint(slowEndpoint), ["model-a"], slowPort);
+    launcherRegistry.register(forB.endpoint, await canonicalizeEndpoint(forB.endpoint), ["model-b"], forB.port);
+    const demandTracker = new DemandTracker();
+    for (let i = 0; i < 20; i++) demandTracker.recordRequest("model-a"); // model-a is planned first (busier)
+    demandTracker.recordRequest("model-b");
+    const pipelineTracker = new PipelineTracker();
+
+    const ticking = makeManager({ catalog, registry, launcherRegistry, demandTracker, pipelineTracker }).runOnce();
+    await waitUntil(() => pipelineTracker.getPool("model-a").some(e => e.state === "assembling"));
+    // While model-a's assembly is in flight, the request path fills model-b's pool.
+    pipelineTracker.addEntry("model-b", {
+      pipelineId: "request-path-fill",
+      driverNodeId: "driver-b",
+      computeNodeIds: [],
+      launcherId: "some-other-launcher",
+      state: "warm",
+      lastUsedAt: Date.now(),
+    });
+    releaseA();
+    await ticking;
+
+    assert.equal(forB.getPipelineCalls(), 0, "model-b is already at its ceiling: the stale plan must not spawn a second pipeline for it");
+    assert.equal(pipelineTracker.getPool("model-b").length, 1);
+  } finally {
+    releaseA();
+    forB.server.close();
+    slowPost.close();
+  }
+});
+
+test("runOnce clears a stale registration at the driver endpoint the moment it reserves the launcher for a spawn", async () => {
+  // Harness seed 31101 -- see the request-path counterpart in server.test.ts.
+  // A registration at EXACTLY the driver's endpoint is indistinguishable from
+  // a legitimate driver (the squat preflight and commit-time check only object
+  // to a different spelling), so while the pool owns the launcher it must not
+  // be left standing to answer the previous model's prompts with the new
+  // model's weights.
+  let registrationDuringSpawn: unknown = "not captured";
+  let probe: (() => unknown) | undefined;
+  const launcherStub = await startStubLauncher({ onPipeline: () => {
+    if (registrationDuringSpawn === "not captured") registrationDuringSpawn = probe?.();
+  } });
+  try {
+    const catalog = new ModelCatalog([{ id: "big-model", displayName: "Big", minActiveNodes: 0, requiredNodeCount: 2 }]);
+    const registry = new NodeRegistry();
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+    const launcherRegistry = new LauncherRegistry();
+    const identityKey = await canonicalizeEndpoint(launcherStub.endpoint);
+    const launcherId = launcherRegistry.register(launcherStub.endpoint, identityKey, ["big-model"], launcherStub.port);
+    const launcher = { launcherId, endpoint: launcherStub.endpoint, identityKey, servesModels: ["big-model"], agentPort: launcherStub.port };
+    const driverNodeId = registry.register(launcherDriverEndpoint(launcher), launcherDriverIdentityKey(launcher), "desktop", undefined, "some-other-model");
+    probe = () => registry.listActive().find(n => n.nodeId === driverNodeId);
+    const demandTracker = new DemandTracker();
+    demandTracker.recordRequest("big-model");
+
+    await makeManager({ catalog, registry, launcherRegistry, demandTracker }).runOnce();
+
+    assert.equal(launcherStub.getPipelineCalls(), 1);
+    assert.equal(registrationDuringSpawn, undefined, "the stale registration must be gone while the spawn is in flight");
+  } finally {
+    launcherStub.server.close();
   }
 });

@@ -10,7 +10,7 @@ import { LauncherRegistry } from "./launcher_registry.ts";
 import { PipelineTracker } from "./pipeline_tracker.ts";
 import { selectPipeline } from "./pipeline_selector.ts";
 import { DemandTracker } from "./demand_tracker.ts";
-import { assertDriverIdentityFree, claimedLauncherIds, DriverIdentityCollisionError, isDriverIdentitySquatted, isLauncherClaimed, launcherDriverEndpoint, launcherDriverIdentityKey, sameLauncher, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
+import { assertDriverIdentityFree, claimedLauncherIds, clearDriverRegistrationForSpawn, DriverIdentityCollisionError, driverBindingHolds, isLauncherClaimed, launcherDriverEndpoint, launcherDriverIdentityKey, launcherSkipReason, liveEntryCount, retireEntry, sameLauncher, stopLauncherPipeline } from "./pipeline_pool_manager.ts";
 import { canonicalizeEndpoint } from "./endpoint_identity.ts";
 import type { SafetyClassifier } from "./safety_classifier.ts";
 import type { ReputationTracker } from "./reputation_tracker.ts";
@@ -488,7 +488,7 @@ async function assemblePipeline(
 
   const tracked = pool[0];
   if (tracked?.state === "warm") {
-    const driverStillActive = registry.listActive(reputation).some(n => n.nodeId === tracked.driverNodeId);
+    const driverStillActive = registry.listActive(reputation).some(n => n.nodeId === tracked.driverNodeId && driverBindingHolds(tracked, n));
     if (driverStillActive) {
       // A launcher-spawned driver never self-registers/self-heartbeats
       // with the coordinator the way an operator-run swarm-node-agent can
@@ -518,7 +518,7 @@ async function assemblePipeline(
       // this tracked driver fails, which is what actually evicts a dead
       // driver from "warm" so the next request reassembles through the
       // launcher instead of retrying the same corpse.
-      registry.heartbeat(tracked.driverNodeId);
+      registry.heartbeat(tracked.driverNodeId, tracked.driverEndpoint);
       return;
     }
   }
@@ -534,9 +534,10 @@ async function assemblePipeline(
   // did for a stale pipeline.
   // Never grow the pool past the model's configured ceiling. Replacing
   // `tracked` is net-neutral (it is removed below), so it is excluded from
-  // the tally; adding alongside a full pool is what must be refused. The
-  // background pool manager already respected maxPipelines -- this path
-  // never consulted it at all.
+  // the tally; adding alongside a full pool is what must be refused. (This
+  // path originally never consulted maxPipelines at all; the background
+  // pool manager checks it at plan time AND, since the ninth review, again
+  // at commit time -- a stale plan used to overshoot it.)
   //
   // Seventh whole-branch review, Important finding, fixed here: this used
   // to count every pool ENTRY, including ones in state "failed" -- a
@@ -556,24 +557,28 @@ async function assemblePipeline(
   // count only when it is itself still live (not already "failed"), since
   // an already-failed `tracked` is already excluded by the filter and
   // subtracting it again would double-count.
-  const liveCount = pool.filter(entry => entry.state !== "failed").length;
+  const liveCount = liveEntryCount(pool);
   if (liveCount - (tracked && tracked.state !== "failed" ? 1 : 0) >= catalog.maxPipelines(modelId)) {
     return;
   }
 
   const claimed = claimedLauncherIds(catalog, pipelineTracker, tracked);
-  // Eighth whole-branch review, Important finding: a launcher whose driver
-  // identity is already squatted is skipped HERE, before any spawn, rather
-  // than discovered after one (see isDriverIdentitySquatted()). Without
-  // this, the squatted launcher stayed first in registration order and was
-  // re-picked, spawned on and torn down by every single /generate, while a
-  // healthy second launcher for the same model was never tried.
+  // Every reason a launcher may be ineligible -- claimed, squatted driver
+  // identity (eighth whole-branch review), reputation-ejected driver (ninth)
+  // -- is decided HERE, before any spawn and before choosing, through the
+  // same launcherSkipReason() the background planner uses. The ejected check
+  // used to run after a launcher had been chosen and simply gave up, so one
+  // ejected driver on the first-listed launcher left the model down while
+  // idle, healthy launchers behind it were never tried (18 straight 503s,
+  // live-reproduced), and a squatted launcher stayed first in registration
+  // order and was re-spawned on by every /generate.
   const launcher = launcherRegistry.listForModel(modelId).find(l => {
     if (isLauncherClaimed(claimed, l)) {
       return false;
     }
-    if (isDriverIdentitySquatted(registry, l)) {
-      console.warn(`skipping launcher ${l.endpoint} for model ${modelId}: the driver identity it would spawn is already registered under a different endpoint`);
+    const reason = launcherSkipReason(registry, reputation, l);
+    if (reason !== undefined) {
+      console.warn(`skipping launcher ${l.endpoint} for model ${modelId}: ${reason}`);
       return false;
     }
     return true;
@@ -597,13 +602,11 @@ async function assemblePipeline(
     return;
   }
 
-  // Same pre-flight check the background loop does: a launcher-spawned
-  // driver's endpoint is fully determined by the launcher, and nodeId is
-  // derived from that endpoint's CANONICAL identity key, so a
-  // reputation-ejected driver inherits the ejection on every respawn.
-  // Without this the request path respawned it on EVERY /generate -- a
-  // real multi-GB model load and kill per request, higher-frequency than
-  // the background loop this guard was first added to.
+  // (The reputation-ejected-driver check lives in launcherSkipReason(), above:
+  // a launcher-spawned driver's endpoint is fully determined by the launcher
+  // and nodeId derives from its canonical identity key, so an ejected driver
+  // inherits the ejection on every respawn -- respawning it per /generate is
+  // a real multi-GB model load and kill per request.)
   //
   // Computed once and reused below at actual registration time -- both
   // MUST agree on this driver's identity. Derived SYNCHRONOUSLY from the
@@ -618,11 +621,6 @@ async function assemblePipeline(
   // reservation may await.
   const driverEndpoint = launcherDriverEndpoint(launcher);
   const driverIdentityKey = launcherDriverIdentityKey(launcher);
-  const prospectiveDriverId = stableNodeId(driverIdentityKey);
-  if (!reputation.isTrusted(prospectiveDriverId)) {
-    console.warn(`skipping launcher ${launcher.endpoint} for model ${modelId}: the driver it would spawn is reputation-ejected`);
-    return;
-  }
 
   // Reserve the launcher BEFORE the network call, mirroring the background
   // loop's tryAssemble(). Without this, THIS path recorded nothing until
@@ -641,9 +639,11 @@ async function assemblePipeline(
     launcherId: launcher.launcherId,
     launcherEndpoint: launcher.endpoint,
     launcherIdentityKey: launcher.identityKey,
+    driverIdentityKey,
     state: "assembling",
     lastUsedAt: Date.now(),
   });
+  clearDriverRegistrationForSpawn(registry, launcher);
 
   try {
     // swarm-node-agent's --remote takes host:port, not a full URL --
@@ -721,8 +721,15 @@ async function assemblePipeline(
       if (sameLauncher(tracked, { launcherId: launcher.launcherId, launcherIdentityKey: launcher.identityKey })) {
         pipelineTracker.removeEntry(modelId, tracked.pipelineId);
       } else if (tracked.state !== "failed") {
-        await stopLauncherPipeline(launcherRegistry, tracked.launcherId, tracked.launcherEndpoint);
-        pipelineTracker.removeEntry(modelId, tracked.pipelineId);
+        // Through the one shared teardown path (ninth whole-branch review):
+        // it deregisters the old driver, then re-confirms -- synchronously,
+        // immediately before the DELETE -- that `tracked` is still in the
+        // pool and therefore still holds the claim on its launcher. The bare
+        // `await stopLauncherPipeline(...)` this replaces sent its DELETE even
+        // when the reaper had already removed `tracked` and the planner had
+        // re-claimed that launcher, killing the freshly spawned agent
+        // (harness seed 1196).
+        await retireEntry(pipelineTracker, registry, launcherRegistry, modelId, tracked);
       }
     }
     // Swap the reservation for the real entry: same launcher, so the claim
@@ -731,6 +738,8 @@ async function assemblePipeline(
     pipelineTracker.addEntry(modelId, {
       pipelineId: randomUUID(),
       driverNodeId,
+      driverEndpoint,
+      driverIdentityKey,
       computeNodeIds: selection.computeContributors.map(n => n.nodeId),
       launcherId: launcher.launcherId,
       launcherEndpoint: launcher.endpoint,
@@ -950,6 +959,41 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         // silent security breach: the legitimate owner gets a 409 naming
         // exactly what's pinned, rather than a 200 that quietly routes
         // their traffic elsewhere.
+        // A launcher's driver endpoint belongs to the coordinator, not to the
+        // public route. Ninth whole-branch review (harness seed 483): a third
+        // party registered a launcher-managed agent port (`localhost:8100`) as
+        // an ordinary node claiming model m0. That claim was TRUE at the
+        // instant it was verified -- the agent was running m0 -- and then the
+        // launcher was handed to m2. The registration, which no pool entry
+        // owns and nothing retires, kept routing m0's prompts to the m2
+        // agent, answered with a 200: the wrong model's weights. A
+        // registration is only verified when it is made, and a launcher swaps
+        // its agent whenever the pool manager reassigns it, so a public
+        // registration of that endpoint cannot stay true. The pool registers
+        // (and retires) the driver itself, directly, without this route; any
+        // registration here of an identity an active launcher would spawn its
+        // driver on is refused. This also closes squatting on driver
+        // identities through this route -- including via a DNS name or
+        // loopback alias that canonicalizes to the same identity -- instead of
+        // merely detecting the squat after the fact.
+        //
+        // Reserved while an ACTIVE launcher would spawn its driver there, and
+        // equally while ANY pool entry (reservation, warm or failed) holds that
+        // launcher -- even if the launcher's own registration has since
+        // lapsed. Harness seed 51483: with only the first test, a launcher
+        // that lapsed mid-assembly let a public registration take over its
+        // driver endpoint; at exactly the pool's own endpoint string it was
+        // indistinguishable from the pool's driver and revived a warm entry the
+        // request path had just judged dead, while a queued replace-in-place
+        // spawn was about to kill its agent.
+        const reservingLauncher = launcherRegistry.listActive().find(l => launcherDriverIdentityKey(l) === identityKey);
+        const reservingEntry = catalog.multiPipelineModelIds().some(m => pipelineTracker.getPool(m).some(e => e.driverIdentityKey === identityKey));
+        if (reservingLauncher !== undefined || reservingEntry) {
+          sendJson(res, 409, {
+            error: `this identity is reserved for the driver of ${reservingLauncher !== undefined ? `launcher ${reservingLauncher.endpoint}` : "a launcher with a pipeline in the pool"} (its fixed --agent-port): the coordinator spawns and registers that driver itself, so it cannot be registered here`,
+          });
+          return;
+        }
         const identityNodeId = stableNodeId(identityKey);
         const pinnedEndpoint = registry.listActive().find(n => n.nodeId === identityNodeId)?.endpoint;
         if (pinnedEndpoint !== undefined && pinnedEndpoint !== normalizedNodeEndpoint) {
@@ -1495,8 +1539,26 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
         // a reputation-ejected driver drops out of the pool's reach here
         // for free, exactly as it does from selectNode() below.
         const activeById = new Map(registry.listActive(reputation).map(n => [n.nodeId, n]));
-        const usable = pipelineTracker.getPool(candidate.modelId)
-          .filter(entry => entry.state === "warm" && activeById.has(entry.driverNodeId));
+        const usable = pipelineTracker.getPool(candidate.modelId).filter(entry => {
+          if (entry.state !== "warm") {
+            return false;
+          }
+          const driver = activeById.get(entry.driverNodeId);
+          if (driver === undefined) {
+            return false;
+          }
+          if (!driverBindingHolds(entry, driver)) {
+            // Ninth whole-branch review: the driver's registration lapsed and
+            // the same IDENTITY was re-registered under a DIFFERENT endpoint.
+            // The entry used to follow the identity to wherever it now pointed
+            // (and the reaper then kept that registration alive), so prompts
+            // went to an endpoint this coordinator never spawned. Not the
+            // pipeline we built: fail it so the reaper retires it.
+            pipelineTracker.markEntryFailed(candidate.modelId, entry.pipelineId);
+            return false;
+          }
+          return true;
+        });
         if (usable.length > 0) {
           // Least-recently-used selection: whichever usable entry has gone
           // longest without serving a request. Reuses the lastUsedAt field
@@ -1520,7 +1582,7 @@ export function createServer(registry: NodeRegistry, catalog: ModelCatalog, peer
           // ensurePipelineReady, this line is the only thing keeping any
           // pool entry past pool[0] alive between the pool manager's own
           // 30s reconciliation ticks.
-          registry.heartbeat(entry.driverNodeId);
+          registry.heartbeat(entry.driverNodeId, entry.driverEndpoint);
           selected = activeById.get(entry.driverNodeId);
         }
         if (!selected) {

@@ -132,9 +132,19 @@ export class NodeRegistry {
     return nodeId;
   }
 
-  heartbeat(nodeId: string): boolean {
+  // `expectedEndpoint`, when given, makes this a heartbeat for ONE specific
+  // registration rather than for whoever currently holds the identity:
+  // returns false (and refreshes nothing) if the entry's endpoint differs.
+  // Ninth whole-branch review: the pool reaper heartbeated a launcher-spawned
+  // driver by nodeId alone, so after a lapse it kept alive whatever
+  // registration had since taken that identity -- including one this
+  // coordinator did not write.
+  heartbeat(nodeId: string, expectedEndpoint?: string): boolean {
     const node = this.nodes.get(nodeId);
     if (!node) {
+      return false;
+    }
+    if (expectedEndpoint !== undefined && node.endpoint !== expectedEndpoint) {
       return false;
     }
     const now = this.clock();
@@ -150,6 +160,26 @@ export class NodeRegistry {
     }
     node.lastSeen = now;
     return true;
+  }
+
+  // Deregisters a node. With `expectedEndpoint`, only if that is still the
+  // endpoint the identity is registered under, so a caller that wrote a
+  // registration can retire exactly that one and never someone else's.
+  // Ninth whole-branch review: tearing down or failing a launcher-spawned
+  // pipeline never deregistered its driver, which stayed active with its old
+  // `servesModel` for up to 30s -- long enough for the launcher to be handed
+  // to a different model, after which the cold-start fallback routed the OLD
+  // model's requests to the new model's agent and answered 200 with the
+  // wrong weights. (Reproduces identically on `master`.)
+  remove(nodeId: string, expectedEndpoint?: string): boolean {
+    const node = this.nodes.get(nodeId);
+    if (!node) {
+      return false;
+    }
+    if (expectedEndpoint !== undefined && node.endpoint !== expectedEndpoint) {
+      return false;
+    }
+    return this.nodes.delete(nodeId);
   }
 
   listActive(reputation?: ReputationTracker): NodeInfo[] {

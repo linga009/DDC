@@ -338,6 +338,104 @@ export function isDriverIdentitySquatted(registry: NodeRegistry, launcher: Launc
   return findDriverIdentityConflict(registry, launcherDriverIdentityKey(launcher), launcherDriverEndpoint(launcher)) !== undefined;
 }
 
+// ONE eligibility predicate for "may this launcher be handed a new pipeline
+// right now", shared by the request path and the background planner.
+// Returns why it may not, or undefined if it may. Ninth whole-branch review:
+// the squat check (round 8) and the reputation-ejected check each lived at a
+// different point in each path -- the ejected check AFTER a launcher had
+// been chosen, so one ejected driver on the first-listed launcher ended the
+// attempt (and, in the planner, dropped the model for the whole tick) while
+// idle, healthy launchers behind it were never tried: 18 straight 503s with
+// two idle launchers, live-reproduced. Every reason a launcher can be
+// ineligible belongs here, evaluated before choosing, so the next launcher
+// always gets its turn.
+export function launcherSkipReason(registry: NodeRegistry, reputation: ReputationTracker, launcher: LauncherInfo): string | undefined {
+  if (isDriverIdentitySquatted(registry, launcher)) {
+    return "the driver identity it would spawn is already registered under a different endpoint";
+  }
+  if (!reputation.isTrusted(stableNodeId(launcherDriverIdentityKey(launcher)))) {
+    return "the driver it would spawn is reputation-ejected";
+  }
+  return undefined;
+}
+
+// Called the moment a launcher is reserved for a new spawn (both assembly
+// paths). Once the pool holds the claim on a launcher it owns that launcher's
+// driver endpoint, so any registration sitting at EXACTLY that endpoint is
+// stale by definition: it was made for an agent that is about to be replaced.
+// Ninth whole-branch review (harness seed 31101): a third party registered the
+// driver endpoint while the launcher's own registration had lapsed -- so the
+// public route's reservation rule saw no active launcher -- and the claim was
+// TRUE when verified (the agent was still running m1). The launcher then
+// re-registered and was handed to m0, and during the spawn window the lingering
+// registration (indistinguishable from a legitimate driver: same endpoint
+// string, so neither the squat preflight nor the commit-time check objects)
+// routed m1's prompts to m0's agent with a 200. A registration at a DIFFERENT
+// spelling of the identity is a squat and is still handled by those checks;
+// the commit-time register() then overwrites this one's fields anyway, so the
+// only thing this removes is the stale window.
+export function clearDriverRegistrationForSpawn(registry: NodeRegistry, launcher: LauncherInfo): void {
+  registry.remove(stableNodeId(launcherDriverIdentityKey(launcher)), launcherDriverEndpoint(launcher));
+}
+
+// Does the registry still bind this pipeline's driver identity to the
+// endpoint the pipeline actually spawned? An entry with no recorded
+// driverEndpoint (hand-built by older code or tests) keeps the old
+// identity-only meaning.
+export function driverBindingHolds(entry: PooledPipeline, node: { endpoint: string }): boolean {
+  return entry.driverEndpoint === undefined || node.endpoint === entry.driverEndpoint;
+}
+
+// Number of pool entries that represent live or in-flight capacity: a
+// "failed" entry is only cleanup in progress and must not count toward
+// maxPipelines.
+export function liveEntryCount(pool: PooledPipeline[]): number {
+  return pool.filter(entry => entry.state !== "failed").length;
+}
+
+// THE teardown path for a pipeline that exists in the pool, used by both
+// the background reaper and the request path's success-path replacement.
+// Ninth whole-branch review: teardown was spread over several sites that each
+// inferred ownership from a pool snapshot taken before an await, so a
+// DELETE could be issued for an entry someone else had already removed --
+// live-reproduced as a request-path DELETE landing on a launcher the planner
+// had meanwhile re-claimed, killing the freshly spawned agent. The order
+// here is the whole point:
+//   1. confirm this exact entry is still in the pool -- i.e. it still holds
+//      the claim on its launcher, because claimedLauncherIds() counts it. If
+//      it is gone, someone else already retired it and the launcher may have
+//      been re-claimed by a new pipeline that registered its OWN driver at the
+//      very same endpoint (one launcher always spawns on the same
+//      host:agentPort), so NOTHING below may run -- not the DELETE, and not
+//      the deregistration either, which would remove the new pipeline's
+//      driver. This check comes first, before any side effect;
+//   2. stop routing to it, synchronously: mark it failed and deregister its
+//      launcher-spawned driver, so nothing can pick it (or, once the
+//      launcher is handed to another model, mistake the stale registration
+//      for that model's agent -- which answered 200 with the WRONG model's
+//      weights; reproduces identically on master);
+//   3. issue the DELETE, in the same synchronous run as the check in (1);
+//   4. only after the DELETE settles is the claim released (removeEntry), so
+//      nobody can re-claim the launcher while its old agent might still be
+//      running.
+export async function retireEntry(
+  pipelineTracker: PipelineTracker,
+  registry: NodeRegistry,
+  launcherRegistry: LauncherRegistry,
+  modelId: string,
+  entry: PooledPipeline,
+): Promise<void> {
+  if (!pipelineTracker.getPool(modelId).includes(entry)) {
+    return;
+  }
+  pipelineTracker.markEntryFailed(modelId, entry.pipelineId);
+  if (entry.driverNodeId !== "" && entry.driverEndpoint !== undefined) {
+    registry.remove(entry.driverNodeId, entry.driverEndpoint);
+  }
+  await stopLauncherPipeline(launcherRegistry, entry.launcherId, entry.launcherEndpoint);
+  pipelineTracker.removeEntry(modelId, entry.pipelineId);
+}
+
 // Background reconciliation loop: keeps each multi-node model's pool of
 // warm pipelines matched to recent demand, heals entries whose nodes have
 // died or been reputation-ejected, and tears down pipelines nobody has
@@ -493,16 +591,28 @@ export class PipelinePoolManager {
         // Only the driver: compute contributors are real registered nodes
         // that ping for themselves, and pinging them here would mask their
         // death instead of detecting it.
-        this.registry.heartbeat(entry.driverNodeId);
+        // Bound to the endpoint this pipeline spawned (ninth whole-branch
+        // review): a bare nodeId heartbeat kept alive whatever registration
+        // had taken the driver's identity after a lapse.
+        this.registry.heartbeat(entry.driverNodeId, entry.driverEndpoint);
       }
     }
 
-    const activeNodeIds = new Set(this.registry.listActive(this.reputation).map(n => n.nodeId));
+    const activeById = new Map(this.registry.listActive(this.reputation).map(n => [n.nodeId, n]));
+    const nodeUsable = (id: string, boundEndpoint?: string) => {
+      const node = activeById.get(id);
+      return node !== undefined && (boundEndpoint === undefined || node.endpoint === boundEndpoint);
+    };
     const now = Date.now();
 
     for (const modelId of modelIds) {
       // Copy: tearDown() splices the very array getPool() hands back.
       for (const entry of [...this.pipelineTracker.getPool(modelId)]) {
+        // This loop awaits real network calls, so the copy above goes stale:
+        // by the time we reach `entry`, another path may already have retired
+        // it. retireEntry() re-confirms membership before any side effect, so
+        // acting on a stale entry here is a harmless no-op (ninth whole-branch
+        // review, harness seed 20638, was a DELETE sent for such an entry).
         if (entry.state === "assembling") {
           // An in-flight tryAssemble owns this reservation and removes it
           // itself on success or failure. Its driver does not exist yet, so
@@ -523,7 +633,7 @@ export class PipelinePoolManager {
         if (this.pipelineTracker.getPool(modelId).some(other => other.state === "assembling" && sameLauncher(other, entry))) {
           continue;
         }
-        const allNodesActive = [entry.driverNodeId, ...entry.computeNodeIds].every(id => activeNodeIds.has(id));
+        const allNodesActive = nodeUsable(entry.driverNodeId, entry.driverEndpoint) && entry.computeNodeIds.every(id => nodeUsable(id));
         if (!allNodesActive) {
           // A heartbeat timeout or a reputation ejection anywhere in the
           // pipeline. This is what turns that into a background-healed
@@ -556,12 +666,7 @@ export class PipelinePoolManager {
   }
 
   private async tearDown(modelId: string, entry: PooledPipeline): Promise<void> {
-    await this.tryStopLauncher(entry.launcherId, entry.launcherEndpoint);
-    this.pipelineTracker.removeEntry(modelId, entry.pipelineId);
-  }
-
-  private async tryStopLauncher(launcherId: string, fallbackEndpoint?: string): Promise<void> {
-    await stopLauncherPipeline(this.launcherRegistry, launcherId, fallbackEndpoint);
+    await retireEntry(this.pipelineTracker, this.registry, this.launcherRegistry, modelId, entry);
   }
 
   // Step 3+4: compute every model's desired count, decide the claims
@@ -591,16 +696,16 @@ export class PipelinePoolManager {
     // Nothing is excluded: every entry standing at this point is live.
     const claims = planAllocations(
       snapshots,
-      // Squatted launchers are filtered out of the plan up front (eighth
-      // whole-branch review): planAllocations() walks launchers in
+      // Every reason a launcher may be ineligible is evaluated up front, in
+      // one place (launcherSkipReason): planAllocations() walks launchers in
       // registration order and this loop drops a model for the rest of the
-      // tick on its first failed assembly, so a squatted launcher
-      // registered first used to be re-picked, spawned on, failed and torn
-      // down every tick while a healthy launcher behind it was never
-      // reached. See isDriverIdentitySquatted().
+      // tick on its first failed assembly, so an ineligible launcher chosen
+      // first used to end the model's attempt while healthy launchers behind
+      // it were never reached (eighth review: squatted; ninth: ejected).
       modelId => this.launcherRegistry.listForModel(modelId).filter(launcher => {
-        if (isDriverIdentitySquatted(this.registry, launcher)) {
-          console.warn(`skipping launcher ${launcher.endpoint} for model ${modelId}: the driver identity it would spawn is already registered under a different endpoint`);
+        const reason = launcherSkipReason(this.registry, this.reputation, launcher);
+        if (reason !== undefined) {
+          console.warn(`skipping launcher ${launcher.endpoint} for model ${modelId}: ${reason}`);
           return false;
         }
         return true;
@@ -706,6 +811,15 @@ export class PipelinePoolManager {
     if (isLauncherClaimed(claimedLauncherIds(this.catalog, this.pipelineTracker), launcher)) {
       return false; // the plan went stale; the next tick re-derives it
     }
+    // The same staleness applies to the model's own ceiling, not just the
+    // launcher: the plan was built before earlier `await tryAssemble(...)`
+    // calls in this tick, during which the REQUEST path can legitimately
+    // fill the model's pool. Ninth whole-branch review (harness seeds 3 and
+    // 1457): without this a stale plan added a second live pipeline past
+    // maxPipelines, and nothing but idleness ever scaled it back down.
+    if (liveEntryCount(this.pipelineTracker.getPool(modelId)) >= this.catalog.maxPipelines(modelId)) {
+      return false;
+    }
 
     const reservationId = randomUUID();
     this.pipelineTracker.addEntry(modelId, {
@@ -715,9 +829,11 @@ export class PipelinePoolManager {
       launcherId: launcher.launcherId,
       launcherEndpoint: launcher.endpoint,
       launcherIdentityKey: launcher.identityKey,
+      driverIdentityKey,
       state: "assembling",
       lastUsedAt: Date.now(),
     });
+    clearDriverRegistrationForSpawn(this.registry, launcher);
 
     try {
       // swarm-node-agent's --remote takes host:port, not a full URL.
@@ -749,6 +865,8 @@ export class PipelinePoolManager {
       this.pipelineTracker.addEntry(modelId, {
         pipelineId: randomUUID(),
         driverNodeId,
+        driverEndpoint,
+        driverIdentityKey,
         computeNodeIds: selection.computeContributors.map(n => n.nodeId),
         launcherId: launcher.launcherId,
         launcherEndpoint: launcher.endpoint,

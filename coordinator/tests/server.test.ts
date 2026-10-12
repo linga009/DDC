@@ -10,7 +10,7 @@ import { ModelCatalog, type CatalogEntry } from "../src/catalog.ts";
 import { PeerRegistry } from "../src/peer_registry.ts";
 import { LauncherRegistry } from "../src/launcher_registry.ts";
 import { PipelineTracker } from "../src/pipeline_tracker.ts";
-import { PipelinePoolManager } from "../src/pipeline_pool_manager.ts";
+import { PipelinePoolManager, launcherDriverEndpoint, launcherDriverIdentityKey } from "../src/pipeline_pool_manager.ts";
 import { DemandTracker } from "../src/demand_tracker.ts";
 import { KeywordSafetyClassifier, type SafetyClassifier } from "../src/safety_classifier.ts";
 import { ReputationTracker } from "../src/reputation_tracker.ts";
@@ -2078,7 +2078,12 @@ test("POST /generate is not permanently blocked by accumulated 'failed' reservat
   // success path leaving a "failed" `tracked` on another launcher alone:
   // re-awaiting that launcher's gated DELETE there stalls this test for the
   // full 60s PIPELINE_ASSEMBLY_TIMEOUT_MS.
-  const deleteGate = new Promise<void>(() => { /* never released: teardowns stay in flight */ });
+  // Held open for the whole test so the teardowns stay genuinely in flight,
+  // then released in `finally`: left pending, the coordinator's detached
+  // DELETE requests sit on open connections until their 60s abort timers
+  // fire, and node cannot exit until then (this alone added ~55s to the file).
+  let releaseDeleteGate!: () => void;
+  const deleteGate = new Promise<void>(resolve => { releaseDeleteGate = resolve; });
   const plants: Array<() => void> = [];
   const launcherA = await startSquatTestLauncher({ onPipeline: () => plants[0]?.(), deleteGate });
   const launcherB = await startSquatTestLauncher({ onPipeline: () => plants[1]?.(), deleteGate });
@@ -2123,6 +2128,7 @@ test("POST /generate is not permanently blocked by accumulated 'failed' reservat
     assert.deepEqual(await res3.json(), { text: "from the clean launcher" });
     assert.equal(cleanPipelineCalls, 1);
   } finally {
+    releaseDeleteGate();
     server.close();
     launcherA.server.close();
     launcherB.server.close();
@@ -5436,5 +5442,251 @@ test("POST /generate does not respawn a driver that is already reputation-ejecte
   } finally {
     server.close();
     stub.server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Ninth whole-branch review: the launcher/pipeline reservation state machine.
+// The randomized interleaving test (pipeline_state_machine.test.ts) is the
+// broad net; these pin the specific defects at the HTTP layer.
+// ---------------------------------------------------------------------------
+
+test("POST /nodes/register refuses an identity an active launcher would spawn its driver on", async () => {
+  // Harness seed 483. A third party registered a launcher-managed agent port
+  // (`localhost:8100`) as an ordinary node claiming m0. The claim was TRUE at
+  // the instant it was verified -- the agent was running m0 -- and then the
+  // launcher was handed to m2. The registration, which no pool entry owns and
+  // nothing retires, kept routing m0's prompts to the m2 agent with a 200: the
+  // wrong model's weights. A registration is only verified when it is made,
+  // and a launcher swaps its agent whenever the pool manager reassigns it, so
+  // that claim cannot stay true. The pool registers (and retires) the driver
+  // itself, directly; the public route refuses the identity outright, which
+  // also closes squatting on driver identities through this route, including
+  // via a loopback alias or DNS name that canonicalizes to the same identity.
+  const unusedAgentPort = 58123; // nothing listens here
+  const { server, baseUrl, launcherRegistry } = await startTestServer(SQUAT_CATALOG);
+  try {
+    const before = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${unusedAgentPort}`, deviceTier: "desktop" }),
+    });
+    assert.equal(before.status, 200, "with no launcher registered, this is an ordinary unreachable compute contributor");
+    // (a fresh server below, so that registration does not pin the identity)
+  } finally {
+    server.close();
+  }
+
+  const fresh = await startTestServer(SQUAT_CATALOG);
+  try {
+    const launcherEndpoint = "http://127.0.0.1:9000";
+    fresh.launcherRegistry.register(launcherEndpoint, await canonicalizeEndpoint(launcherEndpoint), ["big-model"], unusedAgentPort);
+
+    for (const host of ["127.0.0.1", "localhost"]) {
+      const res = await authFetch(`${fresh.baseUrl}/nodes/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ endpoint: `http://${host}:${unusedAgentPort}`, deviceTier: "desktop", servesModel: "big-model" }),
+      });
+      assert.equal(res.status, 409, `${host} spelling of the reserved driver identity must be refused`);
+      assert.match((await res.json()).error, /reserved for the driver of launcher/);
+    }
+    assert.equal(fresh.registry.listActive().length, 0, "nothing may have been registered");
+
+    // The launcher's own endpoint is a different identity and is unaffected.
+    assert.equal(fresh.launcherRegistry.listActive().length, 1);
+  } finally {
+    fresh.server.close();
+  }
+});
+
+test("POST /generate does not follow a warm pipeline's driver identity to a different endpoint", async () => {
+  // Harness seed 62. Entries stored only `driverNodeId` -- a hash of the
+  // driver's canonical IDENTITY -- and routing resolved it through the
+  // registry's CURRENT binding. After the driver's registration lapsed (any
+  // tick longer than the 30s node timeout does it), a registration of the same
+  // identity under a different endpoint was adopted by the still-warm entry
+  // and then kept alive by the reaper's heartbeats, so real prompts went to an
+  // endpoint this coordinator never spawned. (Reaching it needs a name or
+  // alias that canonicalizes to the driver's identity -- the disclosed
+  // DNS/alias residual -- and that residual is exactly why the binding is
+  // checked rather than assumed.)
+  let squatterCompletes = 0;
+  const squatter = createHttpServer(async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    squatterCompletes++;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ text: "SQUATTER" }));
+  });
+  await new Promise<void>(resolve => squatter.listen(0, "127.0.0.1", resolve));
+  const squatterEndpoint = `http://127.0.0.1:${(squatter.address() as { port: number }).port}`;
+  const stub = await startStubNodeAgent((body) => {
+    const candidate = body as Record<string, unknown>;
+    if (candidate.model !== undefined) {
+      return { status: 200, body: { status: "ready" } };
+    }
+    return { status: 200, body: { text: "from the driver this coordinator spawned" } };
+  });
+  const { server, baseUrl, launcherRegistry, registry, pipelineTracker } = await startTestServer(SQUAT_CATALOG);
+  try {
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+    const stubPort = Number(new URL(stub.endpoint).port);
+    const launcherId = launcherRegistry.register(stub.endpoint, await canonicalizeEndpoint(stub.endpoint), ["big-model"], stubPort);
+    const generate = () => authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "secret", modelId: "big-model" }),
+    });
+
+    const first = await generate();
+    assert.equal(first.status, 200);
+    assert.deepEqual(await first.json(), { text: "from the driver this coordinator spawned" });
+    const entry = pipelineTracker.getPool("big-model")[0];
+    assert.equal(entry.driverEndpoint, stub.endpoint, "the entry records the endpoint it actually spawned");
+
+    // The driver's registration lapses; the same identity is taken over by a
+    // different endpoint (registered directly: the residual this models is
+    // one the public route cannot rule out by itself).
+    registry.remove(entry.driverNodeId);
+    const driverKey = launcherDriverIdentityKey({ launcherId, endpoint: stub.endpoint, identityKey: await canonicalizeEndpoint(stub.endpoint), servesModels: ["big-model"], agentPort: stubPort });
+    registry.register(squatterEndpoint, driverKey, "desktop", undefined, undefined);
+
+    const second = await generate();
+    assert.notDeepEqual(await second.json().catch(() => undefined), { text: "SQUATTER" });
+    assert.equal(squatterCompletes, 0, "the prompt must never reach an endpoint this coordinator did not spawn");
+  } finally {
+    server.close();
+    stub.server.close();
+    squatter.close();
+  }
+});
+
+test("POST /generate reaches a healthy launcher when the first-listed launcher's driver is reputation-ejected", async () => {
+  // Ninth whole-branch review: the ejected-driver check ran after a launcher
+  // had been chosen and simply returned, so one ejected driver on the
+  // first-listed launcher left the model down -- 18 straight 503s live --
+  // while an idle, healthy launcher behind it was never tried.
+  const ejected = await startSquatTestLauncher();
+  const healthy = await startStubNodeAgent((body) => {
+    const candidate = body as Record<string, unknown>;
+    if (candidate.model !== undefined) {
+      return { status: 200, body: { status: "ready" } };
+    }
+    return { status: 200, body: { text: "from the healthy launcher" } };
+  });
+  const { server, baseUrl, launcherRegistry, registry, reputation } = await startTestServer(SQUAT_CATALOG);
+  try {
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+    const ejectedKey = await canonicalizeEndpoint(ejected.endpoint);
+    launcherRegistry.register(ejected.endpoint, ejectedKey, ["big-model"], ejected.port);
+    launcherRegistry.register(healthy.endpoint, await canonicalizeEndpoint(healthy.endpoint), ["big-model"], Number(new URL(healthy.endpoint).port));
+    const ejectedDriverId = stableNodeId(launcherDriverIdentityKey({ identityKey: ejectedKey, agentPort: ejected.port } as any));
+    for (let i = 0; i < 6; i++) reputation.recordDisagreement(ejectedDriverId);
+
+    const res = await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+    assert.equal(res.status, 200, "the healthy launcher behind the ejected one must be tried");
+    assert.deepEqual(await res.json(), { text: "from the healthy launcher" });
+    assert.equal(ejected.calls.post, 0, "no spawn on a launcher whose driver would be ejected on arrival");
+  } finally {
+    server.close();
+    ejected.server.close();
+    healthy.server.close();
+  }
+});
+
+test("POST /generate clears a stale registration at the driver endpoint the moment it reserves the launcher for a spawn", async () => {
+  // Harness seed 31101. A third party registered a launcher's driver endpoint
+  // while the launcher's own registration had lapsed (so the public route's
+  // reservation rule saw no active launcher). The claim was TRUE when it was
+  // verified -- the agent was still running the old model. The launcher later
+  // re-registered and was handed to another model; during that spawn the
+  // lingering registration, at EXACTLY the driver's endpoint and therefore
+  // indistinguishable from a legitimate driver (the squat preflight and the
+  // commit-time check only object to a DIFFERENT spelling), routed the old
+  // model's prompts to the new model's agent with a 200. Once the pool holds
+  // the claim on a launcher it owns that endpoint: anything registered there
+  // is stale by definition, and is cleared at reservation time.
+  let registrationDuringSpawn: unknown = "not captured";
+  let probe: (() => unknown) | undefined;
+  const launcher = await startSquatTestLauncher({ onPipeline: () => {
+    // First invocation only: this stub also fields the later /complete POST
+    // (driver and launcher share its port here), by which time the driver is
+    // legitimately registered.
+    if (registrationDuringSpawn === "not captured") registrationDuringSpawn = probe?.();
+  } });
+  const { server, baseUrl, launcherRegistry, registry } = await startTestServer(SQUAT_CATALOG);
+  try {
+    registry.register("http://127.0.0.1:1", await canonicalizeEndpoint("http://127.0.0.1:1"), "desktop");
+    registry.register("http://127.0.0.1:2", await canonicalizeEndpoint("http://127.0.0.1:2"), "desktop");
+    const launcherInfo = { launcherId: "l", endpoint: launcher.endpoint, identityKey: await canonicalizeEndpoint(launcher.endpoint), servesModels: ["big-model"], agentPort: launcher.port };
+    launcherRegistry.register(launcher.endpoint, launcherInfo.identityKey, ["big-model"], launcher.port);
+    const driverEndpoint = launcherDriverEndpoint(launcherInfo);
+    const driverNodeId = registry.register(driverEndpoint, launcherDriverIdentityKey(launcherInfo), "desktop", undefined, "some-other-model");
+    probe = () => registry.listActive().find(n => n.nodeId === driverNodeId);
+
+    await authFetch(`${baseUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", modelId: "big-model" }),
+    });
+    // (This stub answers every POST, /complete included, with a bare
+    // {"status":"ready"}, so the request's own status is not the point --
+    // the registry state at the moment the spawn was in flight is.)
+    assert.ok(launcher.calls.post >= 1, "the launcher was asked to spawn");
+    assert.equal(registrationDuringSpawn, undefined, "the stale registration must be gone while the spawn is in flight, not merely overwritten afterwards");
+  } finally {
+    server.close();
+    launcher.server.close();
+  }
+});
+
+test("POST /nodes/register keeps a driver identity reserved while a pool entry holds it, even after the launcher's own registration lapsed", async () => {
+  // Harness seed 51483. The reservation rule only looked at ACTIVE launchers,
+  // so a launcher that lapsed mid-assembly let a public registration take over
+  // its driver endpoint. At exactly the pool's own endpoint string that
+  // registration is indistinguishable from the pool's driver: it revived a warm
+  // entry the request path had just judged dead, while a replace-in-place spawn
+  // was already queued to kill that entry's agent. The identity stays reserved
+  // for as long as any pool entry (reservation, warm or failed) holds it.
+  const heldAgentPort = 58124; // nothing listens here
+  const { server, baseUrl, pipelineTracker, launcherRegistry } = await startTestServer(SQUAT_CATALOG);
+  try {
+    assert.equal(launcherRegistry.listActive().length, 0, "the launcher's registration has lapsed: no active launcher");
+    const heldKey = await canonicalizeEndpoint(`http://127.0.0.1:${heldAgentPort}`);
+    pipelineTracker.addEntry("big-model", {
+      pipelineId: "reservation",
+      driverNodeId: "",
+      computeNodeIds: [],
+      launcherId: "lapsed-launcher",
+      driverIdentityKey: heldKey,
+      state: "assembling",
+      lastUsedAt: Date.now(),
+    });
+
+    for (const host of ["127.0.0.1", "localhost"]) {
+      const res = await authFetch(`${baseUrl}/nodes/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ endpoint: `http://${host}:${heldAgentPort}`, deviceTier: "desktop" }),
+      });
+      assert.equal(res.status, 409, `${host}: the pool still holds this driver identity`);
+      assert.match((await res.json()).error, /reserved for the driver of a launcher with a pipeline in the pool/);
+    }
+
+    pipelineTracker.removeEntry("big-model", "reservation");
+    const released = await authFetch(`${baseUrl}/nodes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${heldAgentPort}`, deviceTier: "desktop" }),
+    });
+    assert.equal(released.status, 200, "once nothing holds the identity it is an ordinary unreachable compute contributor again");
+  } finally {
+    server.close();
   }
 });
