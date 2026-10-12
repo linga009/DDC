@@ -86,7 +86,12 @@ with lots of commits and passing tests is close to done.
 - **The explicit next step is another whole-branch review**, not a docs
   pass or a merge — re-read this skill's own live-adversarial-probing
   requirement below and dispatch it before writing any more code, unless
-  the user has asked for something else specifically.
+  the user has asked for something else specifically. **But if the last
+  two rounds each found a regression, do not just dispatch another
+  read-through round: brief the reviewer to BUILD OR EXTEND AN EXECUTABLE
+  INVARIANT HARNESS** (see "Common Mistakes" below). Endpoint Identity
+  Hardening needed 9 rounds; the ninth, which built a harness instead of
+  reading, found in seconds what the first eight missed.
 - **Do not merge** a phase whose CLAUDE.md paragraph says it's paused
   mid-cycle, even if all tests currently pass — passing tests has not
   once, across this project's history, been sufficient evidence a
@@ -130,6 +135,20 @@ with lots of commits and passing tests is close to done.
 - **Every implementer and fix-subagent dispatch prompt must explicitly
   state**: "do NOT add a Co-Authored-By trailer to any commit" — this does
   not carry over automatically between dispatches.
+
+- **The pipeline state machine has a standing oracle** (it lives on the
+  `endpoint-identity-hardening` branch until that merges, so check it
+  exists in your checkout):
+  `coordinator/tests/pipeline_state_machine.test.ts` (randomized
+  interleavings over the real `createServer()` handler and the real
+  `PipelinePoolManager`, invariants checked after every step). After ANY
+  change to `server.ts`'s cold-start assembly (`ensurePipelineReady` /
+  `assemblePipeline`) or to `pipeline_pool_manager.ts`, run it scaled up —
+  `STATE_MACHINE_SEED_SCALE=40 npm test` — before trusting a review or
+  merging; a failure prints the seed and the call to reproduce it. If a
+  change adds a new way a launcher, pipeline or driver registration can be
+  created, retired or routed to, add the matching invariant to the harness
+  in the same change.
 
 ## After Merge
 
@@ -175,3 +194,44 @@ with lots of commits and passing tests is close to done.
   same review. When fixing this class of bug, explicitly ask "what ELSE
   reads or writes this same state, across an `await` or a detach point,
   that this fix doesn't touch" before considering it done.
+- Reviewing a CONCURRENT state machine by reading diffs, round after round.
+  Endpoint Identity Hardening's first eight rounds each read a change and
+  seven found a real bug (several introduced by the previous round's own
+  fix); the ninth built a deterministic randomized interleaving harness
+  and found five violations in seconds — including a request answered `200`
+  with another model's weights that reproduces on `master`. Code with
+  shared mutable state and check-then-act across `await`s cannot be judged
+  by reading: each patch fixes the instance the reviewer happened to see.
+  When a second round in a row finds a regression, switch methods. Rules
+  that came out of doing it:
+  - **Verify the harness as a DETECTOR before trusting its green.** Run it
+    against the pre-fix source in a scratch copy (`git archive HEAD … | tar
+    -x`) and require it to fail on the original seeds. Reverting ONE fix at
+    a time is a weak test — overlapping fixes (defense in depth) mask each
+    other — so fixed-seed "anchor" tests are weak guards and the targeted
+    unit tests are the real regression guards.
+  - **Mutation-check with a NO-OP CONTROL mutation.** An early checker
+    silently mis-parsed its output (Python decoded `ℹ` with the Windows
+    codepage) and reported every test "not caught"; only the control
+    exposed it. Mutation-check your own tests as well: two were blind (a
+    clock that never advanced during the tick; a guard made redundant by a
+    stronger one), and one mutation run exposed a real ordering bug in the
+    fix itself (deregistering a driver BEFORE checking the entry still held
+    its launcher could remove a new pipeline's registration at the same
+    endpoint).
+  - **When the harness flags something, prove from a replayed seed whether
+    the PRODUCT or the CHECKER is wrong, and write the reasoning down.**
+    Two checker invariants did need correcting (routable must honour the
+    driver-endpoint binding; the cap is routable-warm, not warm+assembling)
+    — but "fix the failing checker" is also exactly how a real bug gets
+    hidden.
+  - **A green sweep is evidence only on seeds you did not tune against.**
+    Hold out fresh seed ranges for the final run (here: 13,000, zero
+    violations, after earlier ~10,000-seed batches had each driven a fix).
+  - **Expect the oracle to widen scope.** It surfaced pre-existing Phase B/C
+    defects, not just the phase's own; surface that scope question to the
+    user rather than quietly absorbing or ignoring it.
+  - **Test hygiene can silently cost minutes:** a stub gate held open for
+    the whole test left the coordinator's detached `DELETE` fetches pinned
+    to 60-second abort timers, so node could not exit — one file went from
+    ~13s to ~82s. Release gates in `finally`.
